@@ -1,12 +1,13 @@
 // color-light-manager-card.js
 // Color Light Manager for Home Assistant
 // Control colored lights (color temp / RGB / RGBWW) in real time, with preset creation,
-// management, and backing Color Entity (input_color) storage.
-// Version: v2026.08.09.56
+// management, and backing Color helper storage (the `color` domain as of the integration's
+// v0.2.0; legacy `input_color.*` entities are still supported for existing configs).
+// Version: v2026.08.19.57
 // Note: the custom-element type remains "color-light-manager-card" for backward compatibility
 // with existing dashboard configs — only the display name has changed to "Color Light Manager".
 
-const BUILD_NUMBER = 'v2026.08.09.56';
+const BUILD_NUMBER = 'v2026.08.19.57';
 const CARD_NAME = 'Color Light Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -301,14 +302,28 @@ function getAllLabels(hass) {
   return [...set].sort();
 }
 
-// The "Input Color" helper's entities live under the `input_color` domain
-// (e.g. input_color.theater_golden), matching the same naming convention as
-// every other storage-backed helper (input_boolean, input_text, etc.).
-const INPUT_COLOR_DOMAIN = 'input_color';
+// The Color helper's entities. As of the integration's v0.2.0, the domain is `color`
+// (e.g. color.theater_golden). Older installs used `input_color` (HA reserved input_* for
+// its YAML helpers, forcing the rename — with NO in-place migration). We therefore support
+// BOTH: new entities/creation default to `color`, while any legacy `input_color.*` entity a
+// config still references keeps working. The correct service domain is derived per-entity.
+const COLOR_DOMAIN = 'color';               // primary (v0.2.0+)
+const COLOR_HELPER_DOMAINS = ['color', 'input_color']; // recognized helper domains (new + legacy)
+// Kept for backward reference in older comments; primary domain for new work.
+const INPUT_COLOR_DOMAIN = COLOR_DOMAIN;
+
+// The service/helper domain for a given color-helper entity id (color.* or input_color.*).
+function colorEntityDomain(entityId) {
+  const dot = (entityId || '').indexOf('.');
+  const d = dot > 0 ? entityId.slice(0, dot) : '';
+  return COLOR_HELPER_DOMAINS.includes(d) ? d : COLOR_DOMAIN;
+}
 
 function getInputColorEntities(hass) {
   if (!hass || !hass.states) return [];
-  return Object.keys(hass.states).filter(id => id.startsWith(INPUT_COLOR_DOMAIN + '.')).sort();
+  return Object.keys(hass.states)
+    .filter(id => COLOR_HELPER_DOMAINS.some(d => id.startsWith(d + '.')))
+    .sort();
 }
 
 function slugify(name) {
@@ -500,8 +515,10 @@ function matchPresetsToInputColorEntities(presets, hass, excluded) {
   const claimed = new Set(presets.map(p => p.input_color_entity).filter(Boolean));
   const updated = presets.map(preset => {
     if (preset.input_color_entity) return preset;
-    const candidate = `${INPUT_COLOR_DOMAIN}.${slugify(preset.name)}`;
-    if (allEntities.includes(candidate) && !claimed.has(candidate)) {
+    const slug = slugify(preset.name);
+    // Prefer the new `color.` domain, but also match a legacy `input_color.` helper by name.
+    const candidate = COLOR_HELPER_DOMAINS.map(d => `${d}.${slug}`).find(id => allEntities.includes(id) && !claimed.has(id));
+    if (candidate) {
       claimed.add(candidate);
       return { ...preset, input_color_entity: candidate };
     }
@@ -1949,9 +1966,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
     if (preset.color_kelvin != null && !fmt) data.color_temp_kelvin = preset.color_kelvin;
     if (preset.brightness != null) data.brightness = preset.brightness;
     if (!Object.keys(data).length) return Promise.resolve(false);
-    return this._hass.callService(INPUT_COLOR_DOMAIN, 'set_color', { entity_id: preset.input_color_entity, ...data })
+    // Derive the service domain from the entity itself so legacy input_color.* links still work.
+    const domain = colorEntityDomain(preset.input_color_entity);
+    return this._hass.callService(domain, 'set_color', { entity_id: preset.input_color_entity, ...data })
       .then(() => true)
-      .catch(e => { console.warn('[ColorLightManagerCard] input_color.set_color failed', e); return false; });
+      .catch(e => { console.warn(`[ColorLightManagerCard] ${domain}.set_color failed`, e); return false; });
   }
 
   // Reads a linked Color Entity's current values back into a preset (returns a new preset
@@ -2103,7 +2122,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         console.error(`${LOG_PREFIX} Failed to create Color Entity "${name}". Reason: ${reason}`, e);
         window.alert(
           `Could not create the Color Entity "${name}".\n\nReason: ${reason}\n\n` +
-          `This card creates the helper via the "Color" integration's config flow (Home Assistant core PR #177605, or a compatible "input_color" integration). ` +
+          `This card creates the helper via the "Color" integration's config flow (the ${COLOR_DOMAIN} domain; a legacy "input_color" integration also works). ` +
           `If neither is installed, create the entity from Settings → Devices & Services → Helpers instead.`
         );
         return null;
@@ -2119,7 +2138,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       if (!this._hass) return [];
       return Object.keys(this._hass.states)
         .filter(id => !beforeKeys.has(id))
-        .filter(id => id.startsWith('color.') || id.startsWith(INPUT_COLOR_DOMAIN + '.'));
+        .filter(id => COLOR_HELPER_DOMAINS.some(d => id.startsWith(d + '.')));
     };
     return new Promise(resolve => {
       const start = Date.now();
@@ -2266,7 +2285,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           const entries = await hass.callWS({ type: 'config_entries/get' });
           const domain = entityId.split('.')[0];
           const wanted = friendlyName(hass, entityId);
-          const candidates = (entries || []).filter(en => en.domain === domain || en.domain === 'color' || en.domain === INPUT_COLOR_DOMAIN);
+          const candidates = (entries || []).filter(en => en.domain === domain || COLOR_HELPER_DOMAINS.includes(en.domain));
           console.log(`${LOG_PREFIX} config_entries/get candidates for "${entityId}":`, candidates.map(en => ({ entry_id: en.entry_id, domain: en.domain, title: en.title })));
           const match = candidates.find(en => en.title === wanted) || (candidates.length === 1 ? candidates[0] : null);
           if (match) { configEntryId = match.entry_id; console.log(`${LOG_PREFIX} Matched config entry ${configEntryId} ("${match.title}") for "${entityId}".`); }
@@ -2390,7 +2409,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // Return {entity_id, config_entry_id} so the sweep can remove BOTH the (possibly dead)
     // config entry and the registry entry — registry-remove alone isn't always enough.
     const orphans = list
-      .filter(e => e.entity_id && (e.entity_id.startsWith('color.') || e.entity_id.startsWith(INPUT_COLOR_DOMAIN + '.')))
+      .filter(e => e.entity_id && COLOR_HELPER_DOMAINS.some(d => e.entity_id.startsWith(d + '.')))
       .filter(e => {
         if (!e.config_entry_id) return true;                       // no backing entry at all
         if (validEntryIds && !validEntryIds.has(e.config_entry_id)) return true; // points at a dead entry
@@ -2967,7 +2986,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         ${linked
           ? `<div class="cpce-hint">This preset uses <code>${escapeHtml(linked)}</code>'s values. Edits here are temporary until you Save them to the entity; otherwise they revert when you close this preset.</div>
              <button class="cpce-preset-save-entity" data-index="${index}" ${this._dirtyPresets.has(preset.id) ? '' : 'disabled'}><ha-icon icon="mdi:content-save"></ha-icon> Save to Entity</button>`
-          : `<div class="cpce-hint">${allEntities.length ? 'Link this preset to a Color Entity to use its stored values.' : 'No input_color.* (Color Entity) helper entities found.'}</div>`}
+          : `<div class="cpce-hint">${allEntities.length ? 'Link this preset to a Color Entity to use its stored values.' : 'No color.* (Color helper) entities found.'}</div>`}
       </div>
     `;
   }
@@ -3933,10 +3952,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
         ${this._section('mdi:link-variant', "Manage HA's Color Entities", 'color-entities', `
           <div class="cpce-hint">
-            Presets can link to <code>input_color.*</code> (Input Color helper) entities. On load, presets are
+            Presets can link to <code>color.*</code> (Color helper) entities. On load, presets are
             auto-matched to entities whose ID matches their slugified name (e.g. preset "Sunset" ↔
-            <code>input_color.sunset</code>). Saving a linked preset also updates the entity via
-            <code>input_color.set_color</code> — deleting a preset never deletes its entity.
+            <code>color.sunset</code>). Saving a linked preset updates the entity via
+            <code>color.set_color</code> — deleting a preset never deletes its entity.
+            Legacy <code>input_color.*</code> helpers from older integration versions still work.
           </div>
 
           <div class="cpce-field-title">Create New Entity</div>
@@ -3944,7 +3964,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
             <input type="text" id="cpce-new-input-color-name" placeholder="Entity name (e.g. Theater Golden)">
             <button class="cpce-create-preset-btn" id="cpce-create-input-color-entity"><ha-icon icon="mdi:plus"></ha-icon> Create Entity</button>
           </div>
-          <div class="cpce-hint">Creates a new <code>input_color</code> helper entity and, once confirmed, a new preset automatically linked to it. If the entity can't be created, no preset is created.</div>
+          <div class="cpce-hint">Creates a new <code>color</code> helper entity and, once confirmed, a new preset automatically linked to it. If the entity can't be created, no preset is created.</div>
 
           <div class="cpce-field-title">Unmatched Entities</div>
           ${this._unmatchedInputColors.length
@@ -3956,12 +3976,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
                   <button class="cpce-create-preset-btn" data-entity="${escapeHtml(id)}"><ha-icon icon="mdi:plus"></ha-icon> Create Preset</button>
                 </div>
               `).join('')}</div>`
-            : `<div class="cpce-hint">${this._allInputColorEntities.length ? 'Every Color Entity is linked to a preset.' : 'No input_color.* (Color Entity) helper entities found on this system.'}</div>`}
+            : `<div class="cpce-hint">${this._allInputColorEntities.length ? 'Every Color Entity is linked to a preset.' : 'No color.* (Color helper) entities found on this system.'}</div>`}
 
           <div class="cpce-manage-entities">
             <div class="cpce-field-title">Delete Color Entities</div>
             <div class="cpce-hint">
-              This deletes the Home Assistant entity itself (the <code>input_color</code> helper), not any
+              This deletes the Home Assistant entity itself (the <code>color</code> helper), not any
               Preset. It is kept separate from Preset editing so a Preset can never accidentally delete an entity.
             </div>
             ${this._allInputColorEntities.length
@@ -3977,9 +3997,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
             <div class="cpce-field-title">Clean Up Orphans</div>
             <div class="cpce-hint">
-              The <code>input_color</code> integration's setup dialog has a bug that can leave behind
-              orphaned entities (ones "no longer provided by the integration") that Home Assistant won't
-              let you delete normally. Scan for and remove any such orphaned color entities here.
+              Older integration versions could leave behind orphaned color entities (ones "no longer
+              provided by the integration") that Home Assistant won't let you delete normally. Scan for
+              and remove any such orphaned <code>color.*</code> / <code>input_color.*</code> entities here.
             </div>
             <button class="cpce-add-btn" id="cpce-cleanup-orphans"><ha-icon icon="mdi:broom"></ha-icon> Scan &amp; Remove Orphans</button>
           </div>
@@ -4460,7 +4480,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       this._render();
     };
 
-    if (!this._hass || !window.confirm('Create a linked Color Entity (input_color helper) for this new preset?')) {
+    if (!this._hass || !window.confirm('Create a linked Color Entity (color helper) for this new preset?')) {
       finish(newPreset);
       return;
     }
