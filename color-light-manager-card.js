@@ -1,13 +1,18 @@
-// color-light-manager-card.js
+// ============================================================================
 // Color Light Manager for Home Assistant
-// Control colored lights (color temp / RGB / RGBWW) in real time, with preset creation,
-// management, and backing Color helper storage (the `color` domain as of the integration's
-// v0.2.0; legacy `input_color.*` entities are still supported for existing configs).
-// Version: v2026.08.19.57
-// Note: the custom-element type remains "color-light-manager-card" for backward compatibility
-// with existing dashboard configs — only the display name has changed to "Color Light Manager".
+//
+// Create Fixture Profiles & Dashboard controls, and manage Color entities — all from a
+// single GUI-driven UI, backed by the Color helper (the `color` domain; legacy
+// `input_color.*` entities are still supported for existing configs).
+//
+// Version: v2026.08.21.86
+//
+// Author:  LTek
+// Card:    https://github.com/Ltek/color-light-manager-card
+//
+// ============================================================================
 
-const BUILD_NUMBER = 'v2026.08.19.57';
+const BUILD_NUMBER = 'v2026.08.21.86';
 const CARD_NAME = 'Color Light Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -224,6 +229,16 @@ function getUnionColorModes(hass, entityIds) {
   (entityIds || []).forEach(id => getSupportedColorModes(hass, id).forEach(m => set.add(m)));
   return [...set];
 }
+// Union of effect names (effect_list) across several light entities, for the effect picker.
+function getUnionEffectList(hass, entityIds) {
+  const set = new Set();
+  (entityIds || []).forEach(id => {
+    const st = hass && hass.states && hass.states[id];
+    const list = st && st.attributes && st.attributes.effect_list;
+    if (Array.isArray(list)) list.forEach(e => set.add(e));
+  });
+  return [...set];
+}
 // Maps our preset/output format keys to the HA color_mode name a light advertises, so we
 // can tell whether a chosen format is actually supported by the target(s).
 const FORMAT_TO_COLOR_MODE = {
@@ -330,15 +345,38 @@ function slugify(name) {
   return String(name || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'preset';
 }
 
-// Reads an input_color.* entity's current value into our preset value shape.
-// Canonical storage is xy (+ kind/kelvin for whites) with brightness independent
-// of color; state attributes expose derived rgb_color / color_temp_kelvin so we
-// read those rather than re-deriving from xy ourselves. `kind: 'white'` means the
-// intent was a temperature target.
+// Reads a color.* / input_color.* entity's current value into our preset value shape.
+//
+// PREFERRED (Color integration v0.3.0+): the `color_params` attribute is the EXACT authored
+// input as a light.turn_on-ready dict — e.g. {xy_color:[0.154,0.168]} or {color_temp_kelvin:
+// 2000, brightness:179}. Reading it preserves the native format with NO lossy xy→rgb round-trip
+// (the old path below re-derived rgb, which drifted). color_params keys are exactly our own
+// color keys, except its temperature key is `color_temp_kelvin` while our preset key is
+// `color_kelvin` — we translate that one.
+//
+// FALLBACK (pre-0.3.0 / legacy input_color.*): derive from kind/rgb/hex/xy attributes as before.
 function inputColorStateToPresetValue(state) {
   const attrs = (state && state.attributes) || {};
   const value = {};
-  if (attrs.brightness !== undefined && attrs.brightness !== null) value.brightness = attrs.brightness;
+
+  // ---- v0.3.0 exact path: color_params ----
+  const cp = attrs.color_params;
+  if (cp && typeof cp === 'object') {
+    if (cp.brightness !== undefined && cp.brightness !== null) value.brightness = cp.brightness;
+    else if (attrs.brightness !== undefined && attrs.brightness !== null) value.brightness = attrs.brightness;
+    if (cp.color_temp_kelvin !== undefined && cp.color_temp_kelvin !== null) {
+      value.color_kelvin = cp.color_temp_kelvin;
+      return value;
+    }
+    // Copy whichever native color key is present, verbatim (rgb/xy/hs/rgbw/rgbww).
+    for (const key of ALL_PRESET_COLOR_KEYS) {
+      if (Array.isArray(cp[key])) { value[key] = cp[key].slice(); return value; }
+    }
+    // color_params present but no recognized color key — fall through to legacy derivation.
+  }
+
+  // ---- Legacy fallback ----
+  if (attrs.brightness !== undefined && attrs.brightness !== null && value.brightness === undefined) value.brightness = attrs.brightness;
   if (attrs.kind === 'white' && attrs.color_temp_kelvin) {
     value.color_kelvin = attrs.color_temp_kelvin;
     return value;
@@ -355,8 +393,9 @@ function inputColorEntitySwatch(hass, entityId) {
   const state = hass && hass.states && hass.states[entityId];
   if (!state) return '#888';
   const value = inputColorStateToPresetValue(state);
-  if (value.rgb_color) return ColorUtils.rgbToHex(...value.rgb_color);
   if (value.color_kelvin) return ColorUtils.rgbToHex(...ColorUtils.kelvinToRgb(value.color_kelvin));
+  // value may carry any native color key (rgb/xy/hs/…) — derive rgb for the swatch.
+  if (presetColorFormat(value)) return ColorUtils.rgbToHex(...presetColorToRgb(value));
   return '#888';
 }
 
@@ -370,6 +409,31 @@ const PRESET_COLOR_KEYS = {
   rgb: 'rgb_color', xy: 'xy_color', hs: 'hs_color', rgbw: 'rgbw_color', rgbww: 'rgbww_color',
 };
 const ALL_PRESET_COLOR_KEYS = Object.values(PRESET_COLOR_KEYS);
+
+// ---- Fixture Profile ----
+// A "fixture profile" is the reusable LOOK a preset applies: its color (any format) or
+// temperature, plus brightness/transition/effect, or the turn-off action. It deliberately
+// EXCLUDES button/orchestration fields (name shown on button, icon, section, target lights,
+// scenes, turn-off set, glow, link) — those stay on the button. Profiles can be saved to a
+// shared library and referenced by many buttons (see FIXTURE LIBRARY below).
+const PROFILE_LOOK_KEYS = [...ALL_PRESET_COLOR_KEYS, 'color_kelvin', 'brightness', 'transition', 'effect', 'action', 'look_none'];
+
+// Extracts just the look/profile fields from a preset (or any object). Returns a new object
+// containing only the keys present, so it round-trips cleanly through the library.
+function extractProfileLook(src) {
+  const out = {};
+  if (!src) return out;
+  PROFILE_LOOK_KEYS.forEach(k => { if (src[k] !== undefined && src[k] !== null) out[k] = src[k]; });
+  return out;
+}
+// Applies a profile look onto a preset: clears all existing look fields first (so switching
+// profiles doesn't leave stale color/temperature keys), then copies the profile's look in.
+function applyProfileLook(preset, look) {
+  const p = { ...preset };
+  PROFILE_LOOK_KEYS.forEach(k => delete p[k]);
+  Object.assign(p, extractProfileLook(look || {}));
+  return p;
+}
 
 // Which color format a preset is stored in (rgb/xy/hs/rgbw/rgbww), or null if it has no
 // color component (temp-only or off).
@@ -403,23 +467,87 @@ function presetColorToRgb(preset) {
   }
 }
 
-// Classifies a preset into one of: 'off' | 'temp' | 'color'.
+// Classifies a preset into one of: 'none' | 'off' | 'temp' | 'color'.
+//   none  = applies NO color/temp to any light (scene-only / turn-off-only button)
 //   off   = turns the color-control lights off
 //   temp  = color temperature only
 //   color = a color (any format); the default for a new preset
 // (Legacy "both" presets — a color AND a kelvin — collapse to 'color', preferring the color.)
 function presetMode(preset) {
   if (!preset) return 'color';
+  if (preset.look_none === true) return 'none';
   if (preset.action === 'turn_off') return 'off';
   if (presetColorFormat(preset) !== null) return 'color';
   if (preset.color_kelvin !== undefined && preset.color_kelvin !== null) return 'temp';
   return 'color';
+}
+// The editor-facing Button mode: 'off' | 'profile' | 'scene' | 'temp' | 'color'.
+//   off     = Light Off (turn_off action)
+//   profile = uses a Fixture Profile from the library (profile_ref)
+//   scene   = scene / orchestration only, applies no color of its own (look_none)
+//   temp    = Custom Temperature (inline color_kelvin)
+//   color   = Custom Color (inline color, any format) — default
+// A persisted `preset.mode` (set when the user picks a mode) is authoritative; older presets
+// with no `mode` are inferred from their data so nothing breaks. NOTE: this drives EDITOR
+// visibility only — the runtime look is classified by presetMode() on the effective look.
+function buttonMode(preset) {
+  if (!preset) return 'color';
+  if (['off', 'profile', 'scene', 'temp', 'color'].includes(preset.mode)) return preset.mode;
+  if (fixtureRefSlug(preset.profile_ref)) return 'profile';
+  if (preset.action === 'turn_off') return 'off';
+  if (preset.look_none === true) return 'scene';
+  if (presetColorFormat(preset) !== null) return 'color';
+  if (preset.color_kelvin !== undefined && preset.color_kelvin !== null) return 'temp';
+  return 'color';
+}
+// The default button icon for a mode (used when a preset has no explicit icon, and as the
+// seed icon when creating/switching a button). Each mode gets a recognizable glyph.
+const MODE_DEFAULT_ICON = {
+  off: 'mdi:lightbulb-off',
+  profile: 'mdi:palette-swatch',
+  scene: 'mdi:palette',
+  temp: 'mdi:thermometer',
+  color: 'mdi:palette-outline',
+};
+function modeDefaultIcon(mode) { return MODE_DEFAULT_ICON[mode] || 'mdi:lightbulb'; }
+// Icons we treat as "not user-customized" — the generic old defaults plus every mode default.
+// A preset carrying one of these gets the CURRENT mode's default at render time, so buttons
+// created before per-mode icons (all saved as mdi:lightbulb) still reflect their Mode.
+const GENERIC_DEFAULT_ICONS = new Set(['mdi:lightbulb', 'mdi:lightbulb-off', ...Object.values(MODE_DEFAULT_ICON)]);
+// The icon a button should display: the user's custom icon if they set a non-generic one,
+// otherwise the default glyph for its mode.
+function resolvePresetIcon(preset, mode) {
+  const icon = preset && preset.icon;
+  if (icon && !GENERIC_DEFAULT_ICONS.has(icon)) return icon;
+  return modeDefaultIcon(mode || buttonMode(preset));
 }
 // Resolves a preset's color-control targeting mode: 'all' | 'specific' | 'none'.
 // Back-compat: presets without target_mode use the old rule (empty target_entities = all).
 function presetTargetMode(preset) {
   if (preset && (preset.target_mode === 'all' || preset.target_mode === 'specific' || preset.target_mode === 'none')) return preset.target_mode;
   return (Array.isArray(preset && preset.target_entities) && preset.target_entities.length) ? 'specific' : 'all';
+}
+
+// A preset's color-control targeting spec, in the current model:
+//   useDefault → include the card's live Default Entities pool
+//   useCustom  → include this button's own list (target_entities), which may be ANY HA light
+// Effective targets = union of the two. Migrated on read from the legacy target_mode:
+//   'all' (or absent + empty list) → {useDefault:true,  useCustom:false}
+//   'specific'                     → {useDefault:false, useCustom:true}
+//   'none'                         → {useDefault:false, useCustom:false}
+//   legacy absent + non-empty list → {useDefault:false, useCustom:true}
+function presetTargetSpec(preset) {
+  const p = preset || {};
+  const custom = Array.isArray(p.target_entities) ? p.target_entities : [];
+  // New explicit fields take precedence when either is present.
+  if (p.use_default_entities !== undefined || p.use_custom_entities !== undefined) {
+    return { useDefault: p.use_default_entities !== false, useCustom: p.use_custom_entities === true, custom };
+  }
+  // Legacy migration.
+  const tm = presetTargetMode(p);
+  if (tm === 'none') return { useDefault: false, useCustom: false, custom };
+  if (tm === 'specific') return { useDefault: false, useCustom: true, custom };
+  return { useDefault: true, useCustom: false, custom };   // 'all'
 }
 
 // ---- Sections ----
@@ -448,6 +576,115 @@ function dedupePresetIds(presets) {
     if (!p || !p.id || seen.has(p.id)) { const np = { ...p, id: newPresetId() }; seen.add(np.id); return np; }
     seen.add(p.id); return p;
   });
+}
+
+// ============================================================================
+// FIXTURE PROFILE LIBRARY (live, shared, install-free store)
+//
+// A shared store of reusable "looks" (fixture profiles). A preset/button can reference a
+// library profile by `profile_ref: 'lib:<slug>'` instead of holding inline look values, so
+// one profile powers many buttons and editing it updates them all. Backed by Home Assistant's
+// built-in frontend key-value store (frontend/{get,set,subscribe}_{user,system}_data) — the
+// same API HA's own frontend uses — so NO custom component is required. Two scopes:
+//   'user'   -> per-user (any user may write)
+//   'system' -> shared across users (admin write)
+// Ported from the Easy Entity Styler card's proven Frame Preset Library.
+// ============================================================================
+const FIXTURE_LIB_KEY = 'color_light_manager_fixture_library';
+const FIXTURE_LIB_VERSION = 1;
+const FIXTURE_LIBRARY = {
+  user: { map: null, loaded: false, loading: false, subscribed: false },
+  system: { map: null, loaded: false, loading: false, subscribed: false },
+};
+function _fixtureLibWs(scope, verb) {
+  return `frontend/${verb}_${scope === 'system' ? 'system' : 'user'}_data`;
+}
+// A url/id-safe slug from a profile name — its library key.
+function fixtureLibSlug(name) {
+  const s = String(name || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return s || 'profile';
+}
+// Turn a raw stored value into a clean { slug: profileEntry } map. Tolerates the versioned
+// envelope, a bare map, or null/garbage. Each entry is { name, look:{...} } with a lib: id.
+function _fixtureLibParseValue(value) {
+  const map = {};
+  if (!value || typeof value !== 'object') return map;
+  const profiles = ('color_light_manager_fixtures' in value && value.profiles && typeof value.profiles === 'object')
+    ? value.profiles : value;
+  Object.keys(profiles).forEach(slug => {
+    const p = profiles[slug];
+    if (p && typeof p === 'object') {
+      const look = extractProfileLook(p.look || p);
+      map[slug] = { id: 'lib:' + slug, slug, name: p.name || slug, look };
+    }
+  });
+  return map;
+}
+// Fetch (once) + subscribe to a library scope. onChange fires on initial load and every live
+// update. Safe to call repeatedly.
+function ensureFixtureLibrary(hass, scope, onChange) {
+  scope = scope === 'system' ? 'system' : 'user';
+  const st = FIXTURE_LIBRARY[scope];
+  if (!hass || !hass.connection) return;
+  const conn = hass.connection;
+  if (st.subscribed) return;
+  if (typeof conn.subscribeMessage === 'function') {
+    st.subscribed = true; st.loading = true;
+    try {
+      conn.subscribeMessage(
+        (ev) => {
+          st.map = _fixtureLibParseValue(ev && ev.value);
+          st.loaded = true; st.loading = false;
+          if (typeof onChange === 'function') { try { onChange(); } catch (e) {} }
+        },
+        { type: _fixtureLibWs(scope, 'subscribe'), key: FIXTURE_LIB_KEY }
+      );
+    } catch (e) { st.subscribed = false; st.loading = false; }
+    return;
+  }
+  if (st.loaded || st.loading) return;
+  if (typeof conn.sendMessagePromise !== 'function') return;
+  st.loading = true;
+  conn.sendMessagePromise({ type: _fixtureLibWs(scope, 'get'), key: FIXTURE_LIB_KEY })
+    .then(res => {
+      st.map = _fixtureLibParseValue(res && res.value);
+      st.loaded = true; st.loading = false;
+      if (typeof onChange === 'function') { try { onChange(); } catch (e) {} }
+    })
+    .catch(() => { st.loading = false; st.loaded = true; st.map = {}; });
+}
+// The current cached library map for a scope (slug -> entry), or {}.
+function fixtureLibraryMap(scope) {
+  const st = FIXTURE_LIBRARY[scope === 'system' ? 'system' : 'user'];
+  return st.map || {};
+}
+// Persist the full library map back to the store. `map` is slug -> {name, look}.
+function saveFixtureLibrary(hass, scope, map) {
+  scope = scope === 'system' ? 'system' : 'user';
+  if (!hass || !hass.connection || typeof hass.connection.sendMessagePromise !== 'function') {
+    return Promise.reject(new Error('No connection'));
+  }
+  const profiles = {};
+  Object.keys(map || {}).forEach(slug => {
+    const e = map[slug] || {};
+    profiles[slug] = { name: e.name || slug, look: extractProfileLook(e.look || {}) };
+  });
+  const value = { color_light_manager_fixtures: FIXTURE_LIB_VERSION, profiles };
+  return hass.connection.sendMessagePromise({ type: _fixtureLibWs(scope, 'set'), key: FIXTURE_LIB_KEY, value });
+}
+// Is a value a library reference (lib:<slug>)? Returns the slug or null.
+function fixtureRefSlug(ref) {
+  return (typeof ref === 'string' && ref.startsWith('lib:')) ? ref.slice(4) : null;
+}
+// Resolves a preset's effective look: if it references a library profile, use the library
+// look (falling back to the preset's inline look if the ref is missing); else inline.
+function resolvePresetLook(preset, scope) {
+  const slug = fixtureRefSlug(preset && preset.profile_ref);
+  if (slug) {
+    const entry = fixtureLibraryMap(scope)[slug];
+    if (entry && entry.look) return entry.look;
+  }
+  return extractProfileLook(preset || {});
 }
 
 function buildSections(cfg) {
@@ -542,7 +779,8 @@ class ColorLightManagerCard extends HTMLElement {
       icon: 'mdi:palette',
       icon_size: 22,
       icon_color_enabled: false, // off = theme default icon color
-      icon_color_mode: 'fixed', // fixed | light (only relevant when icon_color_enabled)
+      icon_color_mode: 'fixed', // fixed | light | active (only relevant when icon_color_enabled)
+                                // light = follow the representative light; active = last-pressed button's color
       icon_color: '#2196F3',
       // When icon_color_mode is 'light', what color the icon uses while the light is OFF:
       //   theme = theme default; fixed = the icon_off_color below.
@@ -554,8 +792,15 @@ class ColorLightManagerCard extends HTMLElement {
       card_collapsible: false,
       card_show_chevron: true,
       entity: '',
+      // Default Entities: an optional shared pool. Each button can opt to include it live
+      // (use_default_entities) and/or add its own arbitrary lights (use_custom_entities +
+      // target_entities). Also the reference set for card glow/header "light" mode + per-entity
+      // send methods. May be empty. (Formerly the card's hard "entity scope".)
       entities: [],
-      scenes: [], // scene.* entities available for presets to trigger (Scene Manager)
+      // Which shared Fixture Profile Library scope this card's lib:<slug> refs resolve against.
+      // 'system' = shared across users (admin-writable), 'user' = per-user. Card editing in HA
+      // is admin-only, so system is the sensible default (one library for the whole instance).
+      fixture_library_scope: 'system',
       layout: 'columns',
       columns: 3,
       gap: 8,
@@ -663,7 +908,7 @@ class ColorLightManagerCard extends HTMLElement {
       card_border_right: true,
       card_glow_enabled: false,
       card_glow_condition: 'always', // always | when_light_on
-      card_glow_color_mode: 'fixed', // fixed | light
+      card_glow_color_mode: 'fixed', // fixed | light | active (active = last-pressed button's color)
       card_glow_color: '#2196F3',
       card_glow_intensity: 1.0,
       card_glow_borders_only: true,
@@ -705,6 +950,24 @@ class ColorLightManagerCard extends HTMLElement {
       // ---- Overall size control ----
       scale: 1.0, // overall scale multiplier for buttons/sliders/text
 
+      // ---- Light command behavior ----
+      // How a button/profile that carries BOTH a color and an effect sends them:
+      //   false (default) = one light.turn_on with color + effect together (fewer calls)
+      //   true            = color/brightness first, then the effect in a SEPARATE turn_on
+      // Some controllers (e.g. Gledopto/Zigbee via Z2M) re-trigger the effect from the color
+      // jump when bundled, adding an extra flash — splitting avoids that. Controller-dependent,
+      // so it's a per-install toggle. Only affects buttons that have a color AND an effect.
+      effect_separate_call: false,
+
+      // ---- Per-entity send-method overrides ----
+      // Send methods (white-temp format, effect timing) compensate for a specific controller's
+      // firmware, so they belong to the physical light — not the button or profile (a button can
+      // target several different fixtures at once). This maps an entity_id to its overrides:
+      //   { 'light.gledopto_strip': { temperature_output_format: 'xy', effect_separate_call: true } }
+      // Any field absent inherits the card default above. At send time the card resolves the
+      // method PER target entity and groups the service calls by resolved method.
+      entity_send_methods: {},
+
       debug: false,
     };
   }
@@ -718,6 +981,7 @@ class ColorLightManagerCard extends HTMLElement {
     this._favoritesUnsub = null;
     this._cardCollapsed = false;
     this._collapseInitialized = false;
+    this._lastPressedPresetId = null; // for glow/header "active" color mode
   }
 
   setConfig(config) {
@@ -736,9 +1000,40 @@ class ColorLightManagerCard extends HTMLElement {
   }
 
   set hass(hass) {
+    const prev = this._hass;
     this._hass = hass;
+    // Load + live-subscribe the shared Fixture Profile Library only if any preset references
+    // one (lib:<slug>) — otherwise skip the WS traffic entirely. Re-render on library updates.
+    if (this._usesFixtureLibraryRef()) {
+      ensureFixtureLibrary(hass, this._config && this._config.fixture_library_scope, () => {
+        if (this._rendered) this.renderCard();
+      });
+    }
     if (!this._rendered) { this.renderCard(); this._rendered = true; return; }
+    // Linked buttons take their color/brightness live from their Color Entity. A button's
+    // color/tint is computed at full render (not in updateStates), so when any linked entity's
+    // state changes, re-render so those buttons reflect the entity. These helper entities only
+    // change on a deliberate set_color, so this is rare and cheap.
+    if (prev && this._linkedColorEntitiesChanged(prev, hass)) { this.renderCard(); return; }
     this.updateStates();
+  }
+
+  // True if the state of any Color Entity a button links to differs between two hass snapshots.
+  _linkedColorEntitiesChanged(prevHass, hass) {
+    const ids = new Set((this._config.presets || []).map(p => p && p.input_color_entity).filter(Boolean));
+    for (const id of ids) {
+      const a = prevHass.states[id], b = hass.states[id];
+      if (a === b) continue;
+      if (!a || !b) return true;
+      if (a.state !== b.state || a.last_updated !== b.last_updated) return true;
+    }
+    return false;
+  }
+
+  // True if any preset resolves its look from a library profile (lib:<slug> ref).
+  _usesFixtureLibraryRef() {
+    const presets = this._config && this._config.presets;
+    return Array.isArray(presets) && presets.some(p => !!fixtureRefSlug(p && p.profile_ref));
   }
 
   connectedCallback() {
@@ -754,6 +1049,34 @@ class ColorLightManagerCard extends HTMLElement {
     const ids = Array.isArray(cfg.entities) && cfg.entities.length ? cfg.entities : (cfg.entity ? [cfg.entity] : []);
     return ids.filter(Boolean);
   }
+  // Returns the preset with its LOOK resolved: if it references a library profile
+  // (profile_ref: lib:<slug>), the library look replaces its inline look; otherwise the
+  // preset is returned unchanged. All look consumers (apply, swatch, button, active-state)
+  // should read through this so a referenced profile drives behavior and appearance.
+  _effectivePreset(preset) {
+    if (!preset) return preset;
+    // A Color-Entity-linked button holds NO color of its own — the entity is the single source
+    // of truth, read live. Overlay the entity's current value so behavior + appearance always
+    // follow the entity (edit it once in Color Entities, every linked button updates).
+    if (preset.input_color_entity) {
+      const st = this._hass && this._hass.states[preset.input_color_entity];
+      const value = inputColorStateToPresetValue(st);
+      if (value && Object.keys(value).length) {
+        // The entity owns the ENTIRE look: color + brightness only. Strip every other look
+        // field — including a stale effect/transition/action left from before it was linked —
+        // so a linked button never fires an old effect the entity can't store. (This is what
+        // was causing "Steel Blue" to flash: a leftover effect: breathe on a linked button.)
+        const p = { ...preset };
+        ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]);
+        delete p.color_kelvin; delete p.brightness; delete p.effect; delete p.transition;
+        delete p.action; delete p.look_none;
+        return { ...p, ...value };
+      }
+      // Entity missing/unavailable — fall through (no stored color to use).
+    }
+    if (!fixtureRefSlug(preset.profile_ref)) return preset;
+    return applyProfileLook(preset, resolvePresetLook(preset, this._config && this._config.fixture_library_scope));
+  }
   // Resolves a target spec into the actual entity ids to act on. A target_entities array
   // targets that specific subset; empty/absent targets ALL of the card's entities. The
   // result is always intersected with the card's configured entities (a target can't act
@@ -764,13 +1087,24 @@ class ColorLightManagerCard extends HTMLElement {
     const set = new Set(all);
     return targetEntities.filter(id => set.has(id));
   }
-  // Color-control target ids for a preset, honoring its target_mode: 'none' → [] (send no
-  // color), 'all' → all card entities, 'specific' → its target_entities (intersected).
-  _presetColorIds(preset) {
-    const tm = presetTargetMode(preset);
-    if (tm === 'none') return [];
-    if (tm === 'all') return this._entityIds();
-    return this._targetIds(preset.target_entities);
+  // Resolves a targeting spec (from presetTargetSpec) into actual ids = union of the Default
+  // Entities pool (if useDefault) and a custom any-light list (if useCustom). Custom entities
+  // are NOT intersected with the pool. Shared by buttons and slider/values sections.
+  _specTargetIds(spec) {
+    const ids = [];
+    if (spec.useDefault) ids.push(...this._entityIds());
+    if (spec.useCustom) spec.custom.forEach(id => { if (id) ids.push(id); });
+    return [...new Set(ids)];
+  }
+  // Color-control target ids for a preset (union of default pool + its own custom lights).
+  _presetColorIds(preset) { return this._specTargetIds(presetTargetSpec(preset)); }
+  // Target ids for a slider/values section (same model as buttons; any light allowed).
+  _sectionTargetIds(section) { return this._specTargetIds(presetTargetSpec(section)); }
+  // Representative state for a section's live readout — its first target light.
+  _sectionPrimaryState(section) {
+    const ids = this._sectionTargetIds(section);
+    if (!ids.length || !this._hass) return null;
+    return this._hass.states[ids[0]] || null;
   }
   _primaryState(targetEntities) {
     const ids = targetEntities ? this._targetIds(targetEntities) : this._entityIds();
@@ -778,7 +1112,7 @@ class ColorLightManagerCard extends HTMLElement {
     return this._hass.states[ids[0]] || null;
   }
   // The representative light state for a preset's active/glow detection — its first
-  // color-control light, or (target mode None) the card's first entity as a fallback.
+  // color-control light, or (no color targets) the card's first entity as a fallback.
   _presetPrimaryState(preset) {
     const ids = this._presetColorIds(preset);
     const use = ids.length ? ids : this._entityIds();
@@ -800,29 +1134,60 @@ class ColorLightManagerCard extends HTMLElement {
   //   1. color/temp OR off — on its Color Control Lights (unless target mode is None)
   //   2. activate any linked Scenes (scene.turn_on)
   //   3. turn off its Turn-Off entity set (light.turn_off)
-  _applyPreset(preset) {
-    if (!preset) return;
+  _applyPreset(rawPreset) {
+    if (!rawPreset) return;
+    // Resolve the look from a referenced library profile (if any) before applying. Targets,
+    // scenes, and turn-off set stay on the raw preset (button-owned); only the look resolves.
+    const preset = this._effectivePreset(rawPreset);
 
-    // 1. Color-control action on the color-control lights.
-    const colorIds = this._presetColorIds(preset);
+    // Optional profile-style extras applied alongside the color action:
+    //   transition — fade duration (s); applies to both turn_on and turn_off.
+    //   effect     — a firmware effect name; turn_on only.
+    const transition = (preset.transition !== undefined && preset.transition !== null && preset.transition !== '')
+      ? Number(preset.transition) : undefined;
+    const hasTransition = Number.isFinite(transition) && transition >= 0;
+
+    // 1. Color-control action on the color-control lights. Targeting stays on the raw preset.
+    // Send methods (white-temp format + effect timing) are resolved PER TARGET ENTITY, since a
+    // single button can drive fixtures with different controllers. We group the targets by their
+    // resolved methods and emit one set of service calls per group.
+    const colorIds = this._presetColorIds(rawPreset);
     if (colorIds.length) {
       if (preset.action === 'turn_off') {
-        this._callLightService('turn_off', {}, colorIds);
+        this._callLightService('turn_off', hasTransition ? { transition } : {}, colorIds);
       } else {
-        const data = presetValueToSetColorData(preset, this._config.temperature_output_format, this._kelvinRange());
-        if (data) this._callLightService('turn_on', data, colorIds);
+        this._groupIdsBySendMethod(colorIds).forEach(({ methods, ids }) => {
+          const data = presetValueToSetColorData(preset, methods.temperature_output_format, this._kelvinRange());
+          // A preset can carry ONLY an effect/transition (no color) — still send turn_on then.
+          const payload = data || {};
+          if (hasTransition) payload.transition = transition;
+          // Effect handling. Some controllers re-trigger the effect from the color jump when
+          // color + effect arrive together (an extra flash). When this group's effect timing is
+          // "separate" AND the button has both a color and an effect, send the color first, then
+          // the effect in its own turn_on so the controller applies them cleanly. Else bundle.
+          const hasColorData = data && Object.keys(data).length > 0;
+          if (preset.effect && methods.effect_separate_call && hasColorData) {
+            if (Object.keys(payload).length) this._callLightService('turn_on', payload, ids);
+            this._callLightService('turn_on', { effect: preset.effect }, ids);
+          } else {
+            if (preset.effect) payload.effect = preset.effect;
+            if (Object.keys(payload).length) this._callLightService('turn_on', payload, ids);
+          }
+        });
       }
     }
 
-    // 2. Activate scenes (only those still present in the card's scene list).
-    const validScenes = new Set(this._config.scenes || []);
-    (preset.scenes || []).filter(s => validScenes.has(s)).forEach(scene => {
-      this._hass && this._hass.callService('scene', 'turn_on', { entity_id: scene })
+    // 2. Activate scenes (button-owned; each button picks any scene.* directly — there's no
+    // card-level scene pool to validate against). Fire only entities that still exist.
+    (rawPreset.scenes || []).forEach(scene => {
+      if (!this._hass) return;
+      if (!this._hass.states[scene]) { console.warn(`[ColorLightManagerCard] scene ${scene} not found`); return; }
+      this._hass.callService('scene', 'turn_on', { entity_id: scene })
         .catch(e => console.warn('[ColorLightManagerCard] scene.turn_on failed', e));
     });
 
-    // 3. Turn off the preset's turn-off set (limited to the card's entities).
-    const offIds = this._targetIds(preset.turn_off_entities).filter(id => (preset.turn_off_entities || []).includes(id));
+    // 3. Turn off the preset's turn-off set (button-owned; limited to the card's entities).
+    const offIds = this._targetIds(rawPreset.turn_off_entities).filter(id => (rawPreset.turn_off_entities || []).includes(id));
     if (offIds.length) this._callLightService('turn_off', {}, offIds);
   }
 
@@ -831,8 +1196,12 @@ class ColorLightManagerCard extends HTMLElement {
     this._callLightService('turn_on', { brightness: value }, ids);
   }
   _setColorTemp(kelvin, ids) {
-    // Applies the configured white-temperature output format (kelvin/xy/hs/rgb/rgbw/rgbww).
-    this._callLightService('turn_on', kelvinToServiceData(kelvin, this._config.temperature_output_format, this._kelvinRange()), ids);
+    // Applies the white-temperature output format (kelvin/xy/hs/rgb/rgbw/rgbww), resolved PER
+    // entity so mixed fixtures each get the format their controller expects.
+    const targets = ids || this._entityIds();
+    this._groupIdsBySendMethod(targets).forEach(({ methods, ids: gids }) => {
+      this._callLightService('turn_on', kelvinToServiceData(kelvin, methods.temperature_output_format, this._kelvinRange()), gids);
+    });
   }
   _setRgb(rgb, ids) {
     this._callLightService('turn_on', { rgb_color: rgb }, ids);
@@ -840,6 +1209,30 @@ class ColorLightManagerCard extends HTMLElement {
   // The card's configured warm/cool Kelvin bounds, used for RGBWW cold/warm-white mixing.
   _kelvinRange() {
     return { warmK: Number(this._config.min_kelvin) || 2000, coolK: Number(this._config.max_kelvin) || 6500 };
+  }
+
+  // ---- Per-entity send-method resolution ----
+  // Resolves the effective send methods for one light: its per-entity override (if any) merged
+  // over the card defaults. Send methods compensate for a controller's firmware, so they're
+  // resolved per PHYSICAL light — a single button can drive several different fixtures.
+  _sendMethodsFor(entityId) {
+    const ov = (this._config.entity_send_methods || {})[entityId] || {};
+    return {
+      temperature_output_format: ov.temperature_output_format || this._config.temperature_output_format || 'kelvin',
+      effect_separate_call: ov.effect_separate_call !== undefined ? !!ov.effect_separate_call : !!this._config.effect_separate_call,
+    };
+  }
+  // Groups target ids by their resolved send methods, so a single press can send the correct
+  // format/timing to each fixture. Returns [{ methods, ids }, …]; one group when all match.
+  _groupIdsBySendMethod(ids) {
+    const groups = new Map();
+    (ids || []).forEach(id => {
+      const m = this._sendMethodsFor(id);
+      const key = `${m.temperature_output_format}|${m.effect_separate_call}`;
+      if (!groups.has(key)) groups.set(key, { methods: m, ids: [] });
+      groups.get(key).ids.push(id);
+    });
+    return [...groups.values()];
   }
 
   _brightnessEndColor(currentRgb) {
@@ -933,17 +1326,36 @@ class ColorLightManagerCard extends HTMLElement {
     return true;
   }
 
+  // The RGB of the last-pressed preset's effective look — the color the card most recently
+  // APPLIED (intent), used by the "active" glow/icon color mode. Null if nothing pressed yet
+  // or the last preset carries no color (Off/None/scene-only).
+  _activeColorRgb() {
+    const id = this._lastPressedPresetId;
+    if (!id) return null;
+    const preset = (this._config.presets || []).find(p => p.id === id);
+    if (!preset) return null;
+    const look = this._effectivePreset(preset);
+    if (look.action === 'turn_off' || look.look_none) return null;
+    if (presetColorFormat(look)) return presetColorToRgb(look);
+    if (look.color_kelvin != null) return ColorUtils.kelvinToRgb(look.color_kelvin);
+    return null;
+  }
+
   // Builds the card wrapper's glow box-shadow, matching seed-card's glow effect.
   // Glow enablement is independent of whether the border itself is drawn.
   // "Glow stronger on sides with borders" concentrates the glow onto just the
   // bordered sides (a tighter, more intense per-side glow) instead of a diffuse
   // ambient glow around the whole card; it only applies when the border is on.
+  //   color mode 'light'  → the representative light's live color (passed in as currentRgb)
+  //   color mode 'active' → the last-pressed button's color (card intent)
+  //   else (fixed)        → the configured fixed color
   _cardGlowCss(currentRgb) {
     const cfg = this._config;
     if (!this._shouldCardGlow()) return 'none';
-    const color = cfg.card_glow_color_mode === 'light' && currentRgb
+    const activeRgb = cfg.card_glow_color_mode === 'active' ? this._activeColorRgb() : null;
+    const color = (cfg.card_glow_color_mode === 'light' && currentRgb)
       ? ColorUtils.rgbToHex(...currentRgb)
-      : (cfg.card_glow_color || '#2196F3');
+      : (activeRgb ? ColorUtils.rgbToHex(...activeRgb) : (cfg.card_glow_color || '#2196F3'));
     const intensity = Number(cfg.card_glow_intensity) || 1.0;
     const bordersOnly = cfg.card_glow_borders_only !== false && cfg.card_border_enabled;
     const blur = 12 * intensity;
@@ -973,6 +1385,11 @@ class ColorLightManagerCard extends HTMLElement {
   _headerIconColorCss(state) {
     const cfg = this._config;
     if (!cfg.icon_color_enabled) return 'var(--secondary-text-color)';
+    // "active" mode: follow the last-pressed button's color (intent), independent of light state.
+    if (cfg.icon_color_mode === 'active') {
+      const rgb = this._activeColorRgb();
+      return rgb ? ColorUtils.rgbToHex(...rgb) : (cfg.icon_color || 'var(--secondary-text-color)');
+    }
     if (cfg.icon_color_mode !== 'light') return cfg.icon_color || 'var(--secondary-text-color)';
     // light mode
     const on = state && state.state === 'on';
@@ -1321,14 +1738,21 @@ class ColorLightManagerCard extends HTMLElement {
 
   _renderPresetButton(preset) {
     const cfg = this._config;
-    const isOff = preset.action === 'turn_off';
-    const rgb = presetColorToRgb(preset);
+    // Visual look (color/action) resolves through any referenced library profile; name/icon/
+    // id stay button-owned (read from `preset`).
+    const look = this._effectivePreset(preset);
+    const isOff = look.action === 'turn_off';
+    // Styling color: an explicit per-button style color overrides the look-derived color
+    // (so scene-only/None buttons can still look intentional); else derive from the look.
+    const styleOverride = preset.button_style_color ? ColorUtils.hexToRgb(preset.button_style_color) : null;
+    const rgb = styleOverride || presetColorToRgb(look);
     const bg = ColorUtils.rgbToHex(...rgb);
+    const hasStyleOverride = !!styleOverride;
     // Active-state/glow follows the preset's OWN target light, not the card's primary.
     const state = this._presetPrimaryState(preset);
-    const { border, boxShadow } = this._presetBorderAndGlowCss(preset, state);
+    const { border, boxShadow } = this._presetBorderAndGlowCss(look, state);
     const radius = Number(cfg.button_border_radius);
-    const icon = escapeHtml(preset.icon || (isOff ? 'mdi:lightbulb-off' : 'mdi:lightbulb'));
+    const icon = escapeHtml(resolvePresetIcon(preset, buttonMode(preset)));
     // Raise glowing buttons above neighbors so their halo isn't overpainted (see .cpc-glowing).
     const glowCls = boxShadow && boxShadow !== 'none' ? ' cpc-glowing' : '';
 
@@ -1339,7 +1763,7 @@ class ColorLightManagerCard extends HTMLElement {
     if (cfg.button_style === 'tinted' || cfg.button_style === 'tile') {
       const radiusCss = Number.isFinite(radius) ? `border-radius:${radius}px;` : '';
       let bgCss, iconColor;
-      if (isOff) {
+      if (isOff && !hasStyleOverride) {
         bgCss = 'background:linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));';
         iconColor = 'var(--secondary-text-color)';
       } else {
@@ -1352,7 +1776,7 @@ class ColorLightManagerCard extends HTMLElement {
     }
 
     const radiusCss = Number.isFinite(radius) ? `border-radius:${radius}px;` : '';
-    const bgCss = isOff ? '' : `background:${bg};`;
+    const bgCss = (isOff && !hasStyleOverride) ? '' : `background:${bg};`;
     const styleAttr = `style="${bgCss}${border}${radiusCss}box-shadow:${boxShadow};"`;
     return `<button class="cpc-preset-btn${glowCls} ${isOff ? 'off-style' : ''}" data-preset-id="${escapeHtml(preset.id)}" ${styleAttr}><ha-icon icon="${icon}"></ha-icon><span class="cpc-btn-label">${escapeHtml(preset.name)}</span></button>`;
   }
@@ -1512,7 +1936,12 @@ class ColorLightManagerCard extends HTMLElement {
     this.querySelectorAll('.cpc-preset-btn').forEach(btn => {
       btn.onclick = () => {
         const preset = (this._config.presets || []).find(p => p.id === btn.dataset.presetId);
+        // Remember the last-pressed preset id so glow/header "active" color mode can follow the
+        // color the card most recently applied (pure intent — independent of live light state).
+        if (preset) this._lastPressedPresetId = preset.id;
         this._applyPreset(preset);
+        // Refresh glow/header immediately so "active" color mode reflects this press.
+        if (this._config.card_glow_color_mode === 'active' || this._config.icon_color_mode === 'active') this.updateStates();
       };
     });
 
@@ -1520,7 +1949,7 @@ class ColorLightManagerCard extends HTMLElement {
 
     // Wire every slider in every slider section, each acting on its OWN section target.
     this._orderedSections().filter(s => s.type === 'sliders').forEach(section => {
-      const ids = () => this._targetIds(section.target_entities);
+      const ids = () => this._sectionTargetIds(section);
       const sid = `#cpc-slider-${section.id}`;
 
       // onCommit receives the raw pct (rAF-decoupled from onVisual); each converts pct→value.
@@ -1724,7 +2153,7 @@ class ColorLightManagerCard extends HTMLElement {
       const div = `${cfg.divider_sliders_top ? ' cpc-div-top' : ''}${cfg.divider_sliders_bottom ? ' cpc-div-bottom' : ''}`;
       const sel = section.sliders || { brightness: true, temperature: true, rgb: true };
       // This section's own target state drives its slider positions.
-      const st = this._primaryState(section.target_entities);
+      const st = this._sectionPrimaryState(section);
       const attrs = (st && st.attributes) || {};
       const briPct = attrs.brightness ? Math.round((attrs.brightness / 255) * 100) : 0;
       const kelvin = attrsToKelvin(attrs) || Math.round(((Number(cfg.min_kelvin)||2000) + (Number(cfg.max_kelvin)||6500)) / 2);
@@ -1739,7 +2168,7 @@ class ColorLightManagerCard extends HTMLElement {
       // A values section renders by virtue of existing (its presence is the enable). It reads
       // its own target's state and uses a per-section DOM id so multiple can coexist.
       const div = `${cfg.divider_values_top ? ' cpc-div-top' : ''}${cfg.divider_values_bottom ? ' cpc-div-bottom' : ''}`;
-      const st = this._primaryState(section.target_entities);
+      const st = this._sectionPrimaryState(section);
       return `<div class="cpc-section${div}" data-section-id="${section.id}">${heading}${this._currentValuesBlock(st, section.id)}</div>`;
     }
     return '';
@@ -1773,7 +2202,7 @@ class ColorLightManagerCard extends HTMLElement {
     const cfg = this._config;
     // Update each slider section from its OWN target's state.
     this._orderedSections().filter(s => s.type === 'sliders').forEach(section => {
-      const st = this._primaryState(section.target_entities);
+      const st = this._sectionPrimaryState(section);
       if (!st) return;
       const attrs = st.attributes || {};
       const sid = `#cpc-slider-${section.id}`;
@@ -1807,22 +2236,22 @@ class ColorLightManagerCard extends HTMLElement {
     // Update each values section from its own target's state.
     this._orderedSections().filter(s => s.type === 'values').forEach(section => {
       const el = this.querySelector(`#cpc-current-values-${section.id}`);
-      if (el) el.innerHTML = this._currentValuesHtml(this._primaryState(section.target_entities));
+      if (el) el.innerHTML = this._currentValuesHtml(this._sectionPrimaryState(section));
     });
 
     // Card-level state (header icon, glow) follows the card's primary entity.
     const state = this._primaryState();
-    if (!state) return;
-    const attrs = state.attributes || {};
+    const attrs = (state && state.attributes) || {};
 
-    // Keep the header title icon color in sync with the live light state (fixes lag/misses
-    // when icon color follows the light — it was previously only set at full render).
+    // Keep the header title icon color in sync — with the live light state ('light' mode) or the
+    // last-pressed color ('active' mode). Recomputed on every state change (and after a press).
     const titleIcon = this.querySelector('#cpc-title-icon');
     if (titleIcon) titleIcon.style.color = this._headerIconColorCss(state);
 
-    // Refresh the card glow live whenever its appearance could depend on state that
-    // just changed: the light's color (color mode) or on/off (when_light_on condition).
-    if (cfg.card_glow_enabled && (cfg.card_glow_color_mode === 'light' || cfg.card_glow_condition === 'when_light_on')) {
+    // Refresh the card glow live whenever its appearance could depend on what changed: the
+    // light's color ('light' mode), the last-pressed color ('active' mode), or on/off
+    // (when_light_on condition).
+    if (cfg.card_glow_enabled && (cfg.card_glow_color_mode === 'light' || cfg.card_glow_color_mode === 'active' || cfg.card_glow_condition === 'when_light_on')) {
       const cardEl = this.querySelector('.cpc-card');
       if (cardEl) {
         const glowShadow = this._cardGlowCss(attrs.rgb_color);
@@ -1841,11 +2270,12 @@ class ColorLightManagerCard extends HTMLElement {
         const preset = byId.get(btn.dataset.presetId);
         if (!preset) return;
         try {
+          const look = this._effectivePreset(preset);
           const st = this._presetPrimaryState(preset);
-          const { boxShadow } = this._presetBorderAndGlowCss(preset, st);
+          const { boxShadow } = this._presetBorderAndGlowCss(look, st);
           btn.style.boxShadow = boxShadow;
           btn.classList.toggle('cpc-glowing', !!boxShadow && boxShadow !== 'none');
-          if (rows) rows.push({ name: preset.name, mode: presetMode(preset), active: this._isPresetActive(preset, st), glow: boxShadow !== 'none' });
+          if (rows) rows.push({ name: preset.name, mode: presetMode(look), active: this._isPresetActive(look, st), glow: boxShadow !== 'none' });
         } catch (e) {
           console.warn(`${LOG_PREFIX} glow update failed for preset ${btn.dataset.presetId}:`, e);
         }
@@ -1874,6 +2304,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this._sceneSearch = '';
     this._addedEntitiesCollapsed = true; // "Added Entities" list starts collapsed
     this._addedScenesCollapsed = true;   // "Added Scenes" list starts collapsed
+    this._openProfile = null;            // slug of the library profile whose editor is open
+    this._openColorEntity = null;        // entity_id whose inline edit panel is open (Color Entities)
+    // Collapse state for the Color Entities sub-areas (they can get long with many entities).
+    this._ceCollapsed = { manage: false, create: true, orphans: true };
     this._unmatchedInputColors = [];
     // Full list of color entities, captured alongside _unmatchedInputColors in
     // _syncInputColorMatches() (which runs on every hass update). The Delete list renders
@@ -1890,6 +2324,24 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // Section objects (migrating legacy configs on the fly). The editor is a separate class
   // from the card, so it has its own copies of these helpers.
   _orderedSectionsRaw() { return buildSections(this._config); }
+  // Editor copy of the card's look resolver: overlays a linked Color Entity's live value
+  // (single source of truth for linked buttons), else a referenced library profile's look.
+  _effectivePreset(preset) {
+    if (!preset) return preset;
+    if (preset.input_color_entity) {
+      const st = this._hass && this._hass.states[preset.input_color_entity];
+      const value = inputColorStateToPresetValue(st);
+      if (value && Object.keys(value).length) {
+        const p = { ...preset };
+        ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]);
+        delete p.color_kelvin; delete p.brightness; delete p.effect; delete p.transition;
+        delete p.action; delete p.look_none;
+        return { ...p, ...value };
+      }
+    }
+    if (!fixtureRefSlug(preset.profile_ref)) return preset;
+    return applyProfileLook(preset, resolvePresetLook(preset, this._config && this._config.fixture_library_scope));
+  }
   // Ordered section objects for the ordering UI, self-healing for any missing from the order.
   _orderedSections() {
     const sections = this._orderedSectionsRaw();
@@ -1915,22 +2367,37 @@ class ColorLightManagerCardEditor extends HTMLElement {
   }
   set hass(hass) {
     this._hass = hass;
+    // The editor always loads the shared Fixture Profile Library so the manager + preset
+    // profile picker reflect it live (re-render on updates), regardless of any ref existing.
+    ensureFixtureLibrary(hass, (this._config && this._config.fixture_library_scope) || 'system', () => this._render());
     // hass updates fire on nearly every state change anywhere in Home Assistant.
     // Only rebuild the checkbox list when the actual set of light entities changes
     // (e.g. a device added) — otherwise it wipes out checkboxes the user just ticked
     // before they get a chance to click "Add Selected".
     const key = getLightEntities(hass).join(',');
-    const colorKey = getInputColorEntities(hass).join(',');
+    const colorIds = getInputColorEntities(hass);
+    const colorKey = colorIds.join(',');
+    // A value signature over all color entities — detects an entity's color/brightness
+    // changing (e.g. our own set_color, or an external edit) so the Color Entities manager
+    // list + any open edit panel refresh to the entity's live value.
+    const colorValKey = colorIds.map(id => { const s = hass.states[id]; return s ? `${id}:${s.state}:${s.last_updated}` : id; }).join('|');
     const entitiesChanged = key !== this._lastEntityKey;
     const colorEntitiesChanged = colorKey !== this._lastInputColorKey;
+    const colorValuesChanged = colorValKey !== this._lastColorValKey;
     this._lastEntityKey = key;
     this._lastInputColorKey = colorKey;
+    this._lastColorValKey = colorValKey;
     if (colorEntitiesChanged) {
       // Recompute matches whenever the set of input_color.* helpers changes (e.g. a new
       // one was created) — this also runs once on first hass assignment. Always
       // re-render here: even when no preset gets newly linked, the unmatched list
       // itself may have changed (e.g. a new unmatched entity appeared).
       this._syncInputColorMatches();
+      this._render();
+    } else if (colorValuesChanged && !this._ceWheelDragging) {
+      // An entity's value changed but the set is the same. Re-render so swatches / linked-button
+      // previews / an open entity edit panel reflect it — unless a wheel drag is in progress
+      // (re-rendering would rebuild the canvas and drop the drag).
       this._render();
     }
     if (entitiesChanged && !colorEntitiesChanged) this._updateEntityList();
@@ -1950,40 +2417,6 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this._allInputColorEntities = all;
     const changed = updated.some((p, i) => p.input_color_entity !== presets[i].input_color_entity);
     if (changed) this._updateConfig({ presets: updated });
-  }
-
-  // Writes a preset's current color/temp/brightness INTO its linked Color Entity via
-  // input_color.set_color. Used by the preset's explicit "Save to Entity" button — never
-  // automatically — so the entity only changes when the user chooses to commit edits.
-  _writePresetToInputColor(preset) {
-    if (!preset || !preset.input_color_entity || !this._hass) return Promise.resolve(false);
-    const fmt = presetColorFormat(preset);
-    const data = {};
-    if (fmt === 'xy') data.xy_color = preset.xy_color;
-    else if (fmt === 'hs') data.hs_color = preset.hs_color;
-    else if (fmt === 'rgb') data.rgb_color = preset.rgb_color;
-    else if (fmt === 'rgbw' || fmt === 'rgbww') data.rgb_color = presetColorToRgb(preset);
-    if (preset.color_kelvin != null && !fmt) data.color_temp_kelvin = preset.color_kelvin;
-    if (preset.brightness != null) data.brightness = preset.brightness;
-    if (!Object.keys(data).length) return Promise.resolve(false);
-    // Derive the service domain from the entity itself so legacy input_color.* links still work.
-    const domain = colorEntityDomain(preset.input_color_entity);
-    return this._hass.callService(domain, 'set_color', { entity_id: preset.input_color_entity, ...data })
-      .then(() => true)
-      .catch(e => { console.warn(`[ColorLightManagerCard] ${domain}.set_color failed`, e); return false; });
-  }
-
-  // Reads a linked Color Entity's current values back into a preset (returns a new preset
-  // object). Used to revert unsaved edits when leaving the editor.
-  _presetFromInputColor(preset) {
-    if (!preset || !preset.input_color_entity || !this._hass) return preset;
-    const st = this._hass.states[preset.input_color_entity];
-    const value = inputColorStateToPresetValue(st);
-    if (!value || !Object.keys(value).length) return preset;
-    const p = { ...preset };
-    ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]);
-    delete p.color_kelvin;
-    return { ...p, ...value };
   }
 
   // Creates a brand-new Color helper entity by driving its config-entry flow — the same
@@ -2484,6 +2917,53 @@ class ColorLightManagerCardEditor extends HTMLElement {
       </div>`).join('')}</div>`;
   }
 
+  // Per-light send-method overrides (in Advanced Send Methods). Each card light gets a row with
+  // a White-Temp format select and an Effect-timing select; both default to "Card default" and
+  // only write into entity_send_methods when set to a real value. Absent = inherit.
+  _renderEntitySendMethods() {
+    // Every light this card can control: the Default Entities pool ∪ any light targeted by a
+    // button's custom list. So a light used by only one button still gets a send-method row.
+    const set = new Set(this._config.entities || []);
+    (this._config.presets || []).forEach(p => {
+      const spec = presetTargetSpec(p);
+      if (spec.useCustom) spec.custom.forEach(id => { if (id) set.add(id); });
+    });
+    const ids = [...set];
+    if (!ids.length) return `<div class="cpce-hint">Add lights to Default Entities (or to a button) first — each will appear here so you can override its send methods.</div>`;
+    const map = this._config.entity_send_methods || {};
+    const cardFmt = this._config.temperature_output_format || 'kelvin';
+    const cardSep = !!this._config.effect_separate_call;
+    const fmtOpts = [['kelvin','Kelvin'],['xy','XY'],['hs','HS'],['rgb','RGB'],['rgbw','RGBW'],['rgbww','RGBWW']];
+    return `
+      <div class="cpce-hint">Leave a light on “Card default” unless its controller misbehaves. Overrides apply wherever that light receives a white temperature or an effect.</div>
+      <div class="cpce-manage-list">
+        ${ids.map(id => {
+          const ov = map[id] || {};
+          const fmtVal = ov.temperature_output_format || '';
+          const sepVal = ov.effect_separate_call === undefined ? '' : (ov.effect_separate_call ? 'separate' : 'merged');
+          return `<div class="cpce-esm-item" data-entity="${escapeHtml(id)}">
+            <div class="cpce-esm-name">${escapeHtml(friendlyName(this._hass, id))}<span class="cpce-entity-id">${escapeHtml(id)}</span></div>
+            <div class="cpce-esm-controls">
+              <label class="cpce-esm-field"><span>White Temp</span>
+                <select class="cpce-esm-temp" data-entity="${escapeHtml(id)}">
+                  <option value="" ${!fmtVal?'selected':''}>Card default (${cardFmt.toUpperCase()})</option>
+                  ${fmtOpts.map(([v,l]) => `<option value="${v}" ${fmtVal===v?'selected':''}>${l}</option>`).join('')}
+                </select>
+              </label>
+              <label class="cpce-esm-field"><span>Effect</span>
+                <select class="cpce-esm-effect" data-entity="${escapeHtml(id)}">
+                  <option value="" ${!sepVal?'selected':''}>Card default (${cardSep?'Separate':'Merged'})</option>
+                  <option value="merged" ${sepVal==='merged'?'selected':''}>Merged (one command)</option>
+                  <option value="separate" ${sepVal==='separate'?'selected':''}>Separate (two commands)</option>
+                </select>
+              </label>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    `;
+  }
+
   _renderEntityListInner() {
     if (!this._hass) return `<div class="cpce-hint">Loading…</div>`;
     const entities = this._getFilteredEntities();
@@ -2527,6 +3007,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
   _attachSelectedRemoveListeners() {
     this.querySelectorAll('.cpce-sel-remove').forEach(btn => {
       btn.onclick = () => {
+        if (!this._confirmDelete(`Remove “${friendlyName(this._hass, btn.dataset.entity)}” from this card?`)) return;
         const entities = (this._config.entities || []).filter(id => id !== btn.dataset.entity);
         this._updateConfig({ entities, entity: entities[0] || '' });
         const selEl = this.querySelector('#cpce-selected-list');
@@ -2587,6 +3068,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     });
     this.querySelectorAll('.cpce-scene-remove').forEach(btn => {
       btn.onclick = () => {
+        if (!this._confirmDelete(`Remove scene “${friendlyName(this._hass, btn.dataset.scene)}” from this card?`)) return;
         const scenes = (this._config.scenes || []).filter(id => id !== btn.dataset.scene);
         this._updateConfig({ scenes });
         this._updateSceneList();
@@ -2599,11 +3081,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // verbatim. The editor shows a format selector (defaulted from the target lights'
   // supported_color_modes), the wheel for visual picking, and the native fields for the
   // chosen format — typed values are stored as-is, so nothing drifts through a conversion.
-  _renderColorWheelEditor(preset, index) {
-    const fmt = presetColorFormat(preset) || 'rgb';
-    const rgb = presetColorToRgb(preset);              // for wheel + hex preview
+  _renderColorWheelEditor(look, index) {
+    const fmt = presetColorFormat(look) || 'rgb';
+    const rgb = presetColorToRgb(look);                // for wheel + hex preview
     const hex = ColorUtils.rgbToHex(rgb[0], rgb[1], rgb[2]);
-    const v = presetColorValue(preset) || [];
+    const v = presetColorValue(look) || [];
     // Supported-mode awareness (union across all targeted entities).
     const supported = getUnionColorModes(this._hass, this._entityIds ? this._entityIds() : (this._config.entities || []));
     const formatOptions = [
@@ -2801,26 +3283,19 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // revert when the preset editor is closed.
   }
 
-  // Marks a linked preset as having unsaved edits, and refreshes the Save button's state.
+  // Legacy no-op: linked buttons no longer store their own color (the entity is the single
+  // source of truth and is edited in the Color Entities panel), so there are no "unsaved edits"
+  // to track. Kept because inline color-edit handlers still call it for unlinked buttons, where
+  // it early-returns (no input_color_entity).
   _markPresetDirty(index) {
     const preset = (this._config.presets || [])[index];
-    if (!preset || !preset.input_color_entity) return;
-    this._dirtyPresets.add(preset.id);
-    const btn = this.querySelector(`.cpce-preset-save-entity[data-index="${index}"]`);
-    if (btn) btn.disabled = false;
+    if (!preset || !preset.input_color_entity) return;   // unlinked → nothing to track
+    // A linked button has no inline editors, so this path shouldn't be reached; guard anyway.
   }
 
-  // On closing a linked preset with unsaved edits, restore its values from the entity so the
-  // entity stays authoritative. Unlinked presets keep their edits (no entity to revert to).
-  _revertUnsavedLinkedPreset(index) {
-    const presets = [...(this._config.presets || [])];
-    const preset = presets[index];
-    if (!preset || !preset.input_color_entity) return;
-    if (!this._dirtyPresets.has(preset.id)) return;
-    presets[index] = this._presetFromInputColor(preset);
-    this._dirtyPresets.delete(preset.id);
-    this._updateConfig({ presets });
-  }
+  // Legacy no-op (see _markPresetDirty): nothing to revert now that linked buttons hold no
+  // color. Retained so the preset-close call site stays valid.
+  _revertUnsavedLinkedPreset(index) { /* linked buttons store no color; nothing to revert */ }
 
   // Live-update the swatch/wheel/hex preview after a color change (no full re-render, so
   // the field the user is typing in keeps focus). Native field values are authoritative.
@@ -2860,24 +3335,52 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
   // ----- preset editor rows -----
   _presetSwatch(preset) {
-    if (preset.action === 'turn_off') return 'transparent';
-    if (presetColorFormat(preset)) return ColorUtils.rgbToHex(...presetColorToRgb(preset));
-    if (preset.color_kelvin) return ColorUtils.rgbToHex(...ColorUtils.kelvinToRgb(preset.color_kelvin));
+    // Explicit button style color wins (used for scene-only / None buttons).
+    if (preset.button_style_color) { const rgb = ColorUtils.hexToRgb(preset.button_style_color); if (rgb) return ColorUtils.rgbToHex(...rgb); }
+    const look = this._effectivePreset(preset);
+    if (look.action === 'turn_off') return 'transparent';
+    if (presetColorFormat(look)) return ColorUtils.rgbToHex(...presetColorToRgb(look));
+    if (look.color_kelvin) return ColorUtils.rgbToHex(...ColorUtils.kelvinToRgb(look.color_kelvin));
     return '#888';
   }
 
-  // Link-status icon shown in the preset title row:
-  //   linked + entity exists  → mdi:link-variant (info color)
-  //   linked + entity missing  → mdi:link-variant-off (error color) — broken link
-  //   not linked               → nothing
+  // Linkage badges shown in the preset title row — one per association a button has, each
+  // with its own icon. NEVER shows a "not-linked" badge. A button can carry several at once
+  // (e.g. a Color Entity link AND scenes), so all applicable badges render together:
+  //   Color Entity link → mdi:link-variant (broken → mdi:link-variant-off, error color)
+  //   Fixture Profile   → mdi:palette-swatch (missing profile → warning color)
+  //   Scene(s)          → mdi:palette
   _presetLinkIcon(preset) {
+    const badges = [];
+    // Color Entity link
     const linked = preset.input_color_entity;
-    if (!linked) return '';
-    const exists = this._allInputColorEntities.includes(linked);
-    if (exists) {
-      return `<ha-icon class="cpce-link-indicator" icon="mdi:link-variant" title="Linked to ${escapeHtml(linked)}"></ha-icon>`;
+    if (linked) {
+      const exists = this._allInputColorEntities.includes(linked);
+      badges.push(exists
+        ? `<ha-icon class="cpce-link-indicator" icon="mdi:link-variant" title="Linked to Color Entity ${escapeHtml(linked)}"></ha-icon>`
+        : `<ha-icon class="cpce-link-indicator cpce-link-broken" icon="mdi:link-variant-off" title="Broken link — Color Entity ${escapeHtml(linked)} no longer exists"></ha-icon>`);
     }
-    return `<ha-icon class="cpce-link-indicator cpce-link-broken" icon="mdi:link-variant-off" title="Broken link — entity ${escapeHtml(linked)} no longer exists"></ha-icon>`;
+    // Fixture Profile reference
+    const slug = fixtureRefSlug(preset.profile_ref);
+    if (slug) {
+      const entry = fixtureLibraryMap(this._config && this._config.fixture_library_scope)[slug];
+      badges.push(entry
+        ? `<ha-icon class="cpce-link-indicator" icon="mdi:palette-swatch" title="Uses Fixture Profile “${escapeHtml(entry.name || slug)}”"></ha-icon>`
+        : `<ha-icon class="cpce-link-indicator cpce-link-broken" icon="mdi:palette-swatch" title="References missing Fixture Profile “${escapeHtml(slug)}”"></ha-icon>`);
+    }
+    // Scene(s)
+    const scenes = (preset.scenes || []).filter(s => (this._config.scenes || []).includes(s));
+    if (scenes.length) {
+      badges.push(`<ha-icon class="cpce-link-indicator" icon="mdi:palette" title="Triggers ${scenes.length} scene${scenes.length === 1 ? '' : 's'}"></ha-icon>`);
+    }
+    return badges.join('');
+  }
+
+  // Standard confirmation gate for every destructive (delete/remove) action in the editor, so
+  // a stray click can't silently destroy config. Returns true only if the user confirms.
+  // Keep the message specific ("Delete the button 'Warm'?") so it's clear what's being removed.
+  _confirmDelete(message) {
+    return window.confirm(message || 'Delete this item? This cannot be undone.');
   }
 
   // Reusable target-entities picker: "All card entities" or "Specific", and when specific,
@@ -2923,7 +3426,14 @@ class ColorLightManagerCardEditor extends HTMLElement {
   _renderChips(ids, kind, removeCls) {
     if (!ids || !ids.length) return '';
     return `<div class="cpce-chips">${ids.map(id => `
-      <span class="cpce-chip ${kind}"><span class="cpce-chip-dot"></span>${escapeHtml(friendlyName(this._hass, id))}<span class="cpce-chip-x ${removeCls}" data-id="${escapeHtml(id)}">✕</span></span>
+      <span class="cpce-chip ${kind}">${escapeHtml(friendlyName(this._hass, id))}<span class="cpce-chip-x ${removeCls}" data-id="${escapeHtml(id)}">✕</span></span>
+    `).join('')}</div>`;
+  }
+  // Read-only chips (no ✕) for a fixed set — used to show the live Default Entities pool.
+  _renderStaticChips(ids, kind) {
+    if (!ids || !ids.length) return '';
+    return `<div class="cpce-chips">${ids.map(id => `
+      <span class="cpce-chip ${kind}">${escapeHtml(friendlyName(this._hass, id))}</span>
     `).join('')}</div>`;
   }
   // A "+ add" dropdown of candidate ids not already chosen. `addCls` names the ＋ button, and
@@ -2939,23 +3449,22 @@ class ColorLightManagerCardEditor extends HTMLElement {
     </div>`;
   }
 
-  _renderTargetPicker(targetEntities, dataAttr) {
+  // Target-lights picker for a slider/values section — SAME model as buttons: two checkboxes
+  // (Default Entities pool ∪ this section's own any-light list). `section` is the section
+  // object; `dataAttr` carries data-ss-target / data-vs-target so wiring can route the update.
+  _renderTargetPicker(section, dataAttr) {
     const cardEntities = this._config.entities || [];
-    const specific = Array.isArray(targetEntities) && targetEntities.length > 0;
-    if (!cardEntities.length) {
-      return `<div class="cpce-hint">Add entities in “Card Entities Manager” first — this will then control which of them this acts on.</div>`;
-    }
+    const spec = presetTargetSpec(section);
+    const allLights = getLightEntities(this._hass);
     return `
       <div class="cpce-target-picker" ${dataAttr}>
-        <div class="cpce-row"><label class="lbl">Target Lights</label>
-          <select class="cpce-target-mode">
-            <option value="all" ${!specific?'selected':''}>All card entities</option>
-            <option value="specific" ${specific?'selected':''}>Specific entities</option>
-          </select>
-        </div>
-        ${specific ? `<div class="cpce-target-list">${cardEntities.map(id => `
-          <label class="cpce-inline-check cpce-target-entity"><input type="checkbox" value="${escapeHtml(id)}" ${targetEntities.includes(id)?'checked':''}> ${escapeHtml(friendlyName(this._hass, id))}</label>
-        `).join('')}</div>` : ''}
+        <div class="cpce-check"><input type="checkbox" class="cpce-tp-use-default" ${spec.useDefault?'checked':''}><label>Use Default Entities${cardEntities.length ? ` (${cardEntities.length})` : ' — none set'}</label></div>
+        ${spec.useDefault && cardEntities.length ? `<div style="margin-left:22px;">${this._renderStaticChips(cardEntities, 'default')}</div>` : ''}
+        <div class="cpce-check"><input type="checkbox" class="cpce-tp-use-custom" ${spec.useCustom?'checked':''}><label>Include other Entities</label></div>
+        ${spec.useCustom ? (allLights.length
+          ? `${this._renderAddPicker(allLights, spec.custom, 'on', 'cpce-tp-add', 'cpce-tp-sel', 'Add any light…')}${this._renderChips(spec.custom, 'on', 'cpce-tp-chip-x')}`
+          : `<div class="cpce-hint">No <code>light.*</code> entities found.</div>`) : ''}
+        ${!spec.useDefault && !spec.useCustom ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">No lights selected for this section.</div>` : ''}
       </div>
     `;
   }
@@ -2972,30 +3481,141 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .map(p => p.input_color_entity)
     );
     const optionIds = [...allEntities].sort();
-    const sharedIds = optionIds.filter(id => claimedByOthers.has(id));
+    const linkedExists = linked && allEntities.includes(linked);
+    const previewHex = linkedExists ? inputColorEntitySwatch(this._hass, linked) : null;
     return `
       <div class="cpce-input-color-link">
         <div class="cpce-row">
           <label class="lbl">Color Entity Link</label>
           <select class="cpce-preset-input-color" data-index="${index}">
-            <option value="">Not linked</option>
-            ${optionIds.map(id => `<option value="${escapeHtml(id)}" ${id === linked ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, id))} (${escapeHtml(id)})${claimedByOthers.has(id) ? ' — in another preset' : ''}</option>`).join('')}
+            <option value="">Not linked (use the color above)</option>
+            ${optionIds.map(id => `<option value="${escapeHtml(id)}" ${id === linked ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, id))} (${escapeHtml(id)})${claimedByOthers.has(id) ? ' — in another button' : ''}</option>`).join('')}
           </select>
-          ${claimedByOthers.has(linked) ? `<ha-icon class="cpce-shared-link" icon="mdi:link-variant-plus" title="This Color Entity is also linked to another preset"></ha-icon>` : ''}
+          ${claimedByOthers.has(linked) ? `<ha-icon class="cpce-shared-link" icon="mdi:link-variant-plus" title="This Color Entity is also linked to another button"></ha-icon>` : ''}
         </div>
-        ${linked
-          ? `<div class="cpce-hint">This preset uses <code>${escapeHtml(linked)}</code>'s values. Edits here are temporary until you Save them to the entity; otherwise they revert when you close this preset.</div>
-             <button class="cpce-preset-save-entity" data-index="${index}" ${this._dirtyPresets.has(preset.id) ? '' : 'disabled'}><ha-icon icon="mdi:content-save"></ha-icon> Save to Entity</button>`
-          : `<div class="cpce-hint">${allEntities.length ? 'Link this preset to a Color Entity to use its stored values.' : 'No color.* (Color helper) entities found.'}</div>`}
+        ${linkedExists
+          ? `<div class="cpce-row"><label class="lbl">Live Value</label><span class="cpce-preset-swatch" style="background:${previewHex}; width:26px; height:26px;"></span><span class="cpce-entity-id">follows the entity</span></div>
+             <div class="cpce-hint">This button has <strong>no color of its own</strong> — it always applies <code>${escapeHtml(linked)}</code>'s current value, in real time. To change the color or brightness, edit the entity in <strong>Color Entities</strong> (Entity &amp; Profile Management). Every button linked to it updates together.</div>`
+          : (linked
+            ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">Linked entity "${escapeHtml(linked)}" isn't available. This button applies no color until it's restored (or unlink to set an inline color).</div>`
+            : `<div class="cpce-hint">${allEntities.length ? 'Link to a Color Entity to make this button follow that entity live (its color/brightness are then edited in Color Entities, not here).' : 'No color.* (Color helper) entities found.'}</div>`)}
       </div>
     `;
   }
 
+  // The merged "Manage Entities" list (Color Entities panel): every color.* / input_color.*
+  // entity as a row with swatch · name · id · status icon · edit (per-entity color editor) ·
+  // create-preset (only when unmatched to any button) · delete. Replaces the old separate
+  // "Unmatched Entities" and "Delete Color Entities" lists.
+  _renderColorEntitiesManageList() {
+    const ids = this._allInputColorEntities;
+    if (!ids.length) return `<div class="cpce-hint">No <code>color.*</code> (Color helper) entities found on this system.</div>`;
+    // Which entities are linked to at least one button (status icon + create-preset gating).
+    const linkedCounts = {};
+    (this._config.presets || []).forEach(p => { const e = p && p.input_color_entity; if (e) linkedCounts[e] = (linkedCounts[e] || 0) + 1; });
+    return `
+      <div class="cpce-hint">Edit an entity's color/brightness with the pencil — buttons linked to it update live. The trash deletes the entity itself (never a button). Unlinked entities offer “+ Preset” to create a button that follows it.</div>
+      <div class="cpce-manage-list">
+        ${ids.map(id => {
+          const count = linkedCounts[id] || 0;
+          const open = this._openColorEntity === id;
+          const statusIcon = count
+            ? `<ha-icon class="cpce-link-indicator" icon="mdi:link-variant" title="Linked to ${count} button${count===1?'':'s'}"></ha-icon>`
+            : `<ha-icon class="cpce-link-indicator cpce-link-unused" icon="mdi:link-variant-off" title="Not linked to any button"></ha-icon>`;
+          return `<div class="cpce-manage-item" data-entity="${escapeHtml(id)}">
+              <span class="cpce-fav-swatch" style="background:${inputColorEntitySwatch(this._hass, id)};"></span>
+              <span class="cpce-ce-name">${escapeHtml(friendlyName(this._hass, id))}<span class="cpce-entity-id">${escapeHtml(id)}</span></span>
+              ${statusIcon}
+              <button class="cpce-icon-btn cpce-ce-edit${open?' active':''}" data-entity="${escapeHtml(id)}" title="Edit color / brightness" style="color:var(--primary-color);"><ha-icon icon="mdi:pencil"></ha-icon></button>
+              ${count ? '' : `<button class="cpce-create-preset-btn cpce-ce-create-preset" data-entity="${escapeHtml(id)}" title="Create a button linked to this entity"><ha-icon icon="mdi:plus"></ha-icon> Preset</button>`}
+              <button class="cpce-delete-entity-btn cpce-ce-delete" data-entity="${escapeHtml(id)}" title="Delete entity"><ha-icon icon="mdi:delete-forever"></ha-icon></button>
+            </div>${open ? `<div class="cpce-ce-edit-panel" data-entity="${escapeHtml(id)}">${this._renderEntityEditPanel(id)}</div>` : ''}`;
+        }).join('')}
+      </div>
+    `;
+  }
+
+  // Inline per-entity editor (color wheel + brightness) that writes to the entity via
+  // set_color. Reads the entity's live value; every button linked to it follows instantly.
+  _renderEntityEditPanel(id) {
+    const st = this._hass && this._hass.states[id];
+    const value = st ? inputColorStateToPresetValue(st) : {};
+    const isWhite = value.color_kelvin != null;
+    // value may now carry a native color key (rgb/xy/hs/…) from color_params — derive an rgb
+    // preview via presetColorToRgb rather than assuming rgb_color.
+    const rgb = isWhite ? ColorUtils.kelvinToRgb(value.color_kelvin) : presetColorToRgb(value);
+    const hex = ColorUtils.rgbToHex(rgb[0], rgb[1], rgb[2]);
+    const min = Number(this._config.min_kelvin) || 2000;
+    const max = Number(this._config.max_kelvin) || 6500;
+    const kelvin = clamp(value.color_kelvin || Math.round((min + max) / 2), min, max);
+    const hasBri = value.brightness !== undefined && value.brightness !== null;
+    const briPct = hasBri ? Math.round((value.brightness / 255) * 100) : 100;
+    return `
+      <div class="cpce-row"><label class="lbl">Mode</label>
+        <select class="cpce-ce-mode" data-entity="${escapeHtml(id)}">
+          <option value="color" ${!isWhite?'selected':''}>Color</option>
+          <option value="temp" ${isWhite?'selected':''}>White Temperature</option>
+        </select>
+      </div>
+      ${!isWhite ? `<div class="cpce-wheel-row">
+        <canvas class="cpce-color-wheel cpce-ce-wheel" width="150" height="150"></canvas>
+        <div class="cpce-color-fields">
+          <div class="cpce-hex-row"><div class="cpce-hex-preview" style="background:${hex};"></div><input type="text" class="cpce-hex-input cpce-ce-hex" data-entity="${escapeHtml(id)}" value="${hex}"></div>
+        </div>
+      </div>` : `<div class="cpce-temp-editor"><input type="range" class="cpce-ce-temp" data-entity="${escapeHtml(id)}" min="${min}" max="${max}" step="50" value="${kelvin}"><span class="cpce-temp-val">${kelvin}K</span></div>`}
+      <div class="cpce-field-title">Brightness</div>
+      <div class="cpce-check"><input type="checkbox" class="cpce-ce-bri-enable" data-entity="${escapeHtml(id)}" ${hasBri?'checked':''}><label>Store a brightness on this entity</label></div>
+      ${hasBri ? `<div class="cpce-temp-editor"><input type="range" class="cpce-ce-bri" data-entity="${escapeHtml(id)}" min="1" max="100" value="${briPct}"><span class="cpce-bri-val">${briPct}%</span></div>` : ''}
+      <div class="cpce-hint">Saved to <code>${escapeHtml(id)}</code> immediately. Buttons linked to it apply this value live.</div>
+    `;
+  }
+
+  // Writes a color/brightness change to a Color Entity via <domain>.set_color. The service
+  // needs a color component AND allows an independent brightness; to change just one we merge
+  // the patch over the entity's CURRENT value so the other is preserved. `patch` may carry
+  // rgb_color / color_temp_kelvin / brightness (brightness:null clears it). `silent` skips the
+  // catch alert (used during wheel drag to avoid alert spam).
+  _writeEntityColorData(id, patch, silent) {
+    if (!this._hass || !id) return Promise.resolve(false);
+    const cur = inputColorStateToPresetValue(this._hass.states[id]) || {};
+    // Resolve the color component: patch wins; else keep the entity's current color/temp in its
+    // OWN native format (rgb/xy/hs/…) so a brightness-only edit doesn't flatten an xy entity.
+    const data = {};
+    if (patch.rgb_color) data.rgb_color = patch.rgb_color;
+    else if (patch.color_temp_kelvin != null) data.color_temp_kelvin = patch.color_temp_kelvin;
+    else if (cur.color_kelvin != null) data.color_temp_kelvin = cur.color_kelvin;
+    else {
+      const fmt = presetColorFormat(cur);   // xy/hs/rgb/… preserved from color_params
+      if (fmt) data[PRESET_COLOR_KEYS[fmt]] = cur[PRESET_COLOR_KEYS[fmt]];
+      else data.rgb_color = [255, 255, 255];
+    }
+    // Brightness: patch overrides (null = clear); else preserve the entity's current brightness.
+    const bri = ('brightness' in patch) ? patch.brightness : cur.brightness;
+    if (bri != null) data.brightness = bri;
+    const domain = colorEntityDomain(id);
+    return this._hass.callService(domain, 'set_color', { entity_id: id, ...data })
+      .then(() => true)
+      .catch(e => { console.warn(`${LOG_PREFIX} ${domain}.set_color failed`, e); if (!silent) window.alert(`Could not update ${id}: ${formatWsError(e)}`); return false; });
+  }
+
   _renderPresetEditor(preset, index) {
-    const mode = presetMode(preset);
+    // The Button Mode drives which settings are relevant; everything else is hidden.
+    //   off/scene → Button Styling (appearance only, since the button sends no color of its own)
+    //   profile   → the Fixture Profile selector (the library owns the look)
+    //   temp/color → the inline look editors + Save-to-Library + Color Entity Link
+    const mode = buttonMode(preset);
+    const isProfile = mode === 'profile';
+    const isColor = mode === 'color';
+    const isTemp = mode === 'temp';
     const isOff = mode === 'off';
-    const showColor = mode === 'color';
-    const showTemp = mode === 'temp';
+    const isScene = mode === 'scene';
+    // A Color-Entity-linked button holds NO color of its own — the entity is the source of
+    // truth. So when linked we HIDE the inline look editors entirely and edit the value in the
+    // Color Entities panel instead. Only Custom Color/Temp buttons can link.
+    const isLinked = (isColor || isTemp) && !!preset.input_color_entity &&
+      this._allInputColorEntities.includes(preset.input_color_entity);
+    const showLook = (isColor || isTemp) && !isLinked;   // inline look editors live here
+    const showButtonStyle = isScene || isOff;            // custom appearance for color-less buttons
     const min = Number(this._config.min_kelvin) || 2000;
     const max = Number(this._config.max_kelvin) || 6500;
     const kelvin = clamp(preset.color_kelvin || Math.round((min + max) / 2), min, max);
@@ -3007,87 +3627,378 @@ class ColorLightManagerCardEditor extends HTMLElement {
       <div class="cpce-preset-editor${collapsed}" data-index="${index}">
         <div class="cpce-preset-summary" data-preset-toggle="${index}">
           <span class="cpce-preset-swatch" style="background:${this._presetSwatch(preset)};"></span>
-          <ha-icon icon="${escapeHtml(preset.icon || 'mdi:lightbulb')}"></ha-icon>
+          <ha-icon icon="${escapeHtml(resolvePresetIcon(preset, mode))}"></ha-icon>
           <span class="cpce-preset-summary-name">${escapeHtml(preset.name || 'Preset')}</span>
           ${this._presetLinkIcon(preset)}
           <button class="cpce-icon-btn cpce-preset-remove" title="Remove"><ha-icon icon="mdi:delete"></ha-icon></button>
           <ha-icon class="chev" icon="mdi:chevron-down"></ha-icon>
         </div>
         <div class="cpce-preset-body">
+          <div class="cpce-subgroup"><ha-icon icon="mdi:gesture-tap-button"></ha-icon>Button</div>
           <div class="cpce-preset-header">
             <input type="text" class="cpce-preset-name" value="${escapeHtml(preset.name)}" placeholder="Name">
-            <input type="text" class="cpce-preset-icon" value="${escapeHtml(preset.icon || '')}" placeholder="mdi:icon">
-            <select class="cpce-preset-mode">
-              <option value="color" ${mode === 'color' ? 'selected' : ''}>Color</option>
-              <option value="temp" ${mode === 'temp' ? 'selected' : ''}>Temperature</option>
-              <option value="off" ${mode === 'off' ? 'selected' : ''}>Turn Off</option>
-            </select>
+            <input type="text" class="cpce-preset-icon" value="${escapeHtml(preset.icon && !GENERIC_DEFAULT_ICONS.has(preset.icon) ? preset.icon : '')}" placeholder="${escapeHtml(modeDefaultIcon(mode))}">
           </div>
-          ${showColor ? this._renderColorWheelEditor(preset, index) : ''}
-          ${showTemp ? `<div class="cpce-field-title">Color Temperature</div><div class="cpce-temp-editor"><input type="range" class="cpce-preset-temp" min="${min}" max="${max}" step="50" value="${kelvin}"><span class="cpce-temp-val">${kelvin}K</span></div>` : ''}
-          ${!isOff ? `
-            <div class="cpce-field-title">Brightness</div>
-            <div class="cpce-check"><input type="checkbox" class="cpce-preset-bri-enable" ${hasBrightness ? 'checked' : ''}><label>Set brightness with this preset</label></div>
-            ${hasBrightness ? `<div class="cpce-temp-editor"><input type="range" class="cpce-preset-bri" min="1" max="100" value="${brightnessPct}"><span class="cpce-bri-val">${brightnessPct}%</span></div>` : `<div class="cpce-hint">When off, this preset leaves the light's current brightness unchanged.</div>`}
-          ` : ''}
           ${(() => {
             const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
             const firstId = buttonsSections.length ? buttonsSections[0].id : '';
             const current = buttonsSections.some(s => s.id === preset.section_id) ? preset.section_id : firstId;
-            return `<div class="cpce-row"><label class="lbl">Button Section</label>
+            return `<div class="cpce-row"><label class="lbl">In Button Section</label>
               <select class="cpce-preset-section" data-index="${index}">
                 ${buttonsSections.map(s => `<option value="${s.id}" ${s.id===current?'selected':''}>${escapeHtml(s.name || 'Buttons')}</option>`).join('')}
               </select>
             </div>`;
           })()}
-          ${this._renderPresetActions(preset, index)}
+          <div class="cpce-row"><label class="lbl">Mode</label>
+            <select class="cpce-preset-mode">
+              <option value="off" ${isOff ? 'selected' : ''}>Light Off</option>
+              <option value="profile" ${isProfile ? 'selected' : ''}>Fixture Profile</option>
+              <option value="scene" ${isScene ? 'selected' : ''}>Scene</option>
+              <option value="temp" ${isTemp ? 'selected' : ''}>Custom Temperature</option>
+              <option value="color" ${isColor ? 'selected' : ''}>Custom Color</option>
+            </select>
+          </div>
+          ${isScene ? `<div class="cpce-hint">This button applies no color of its own — use it for scene-only buttons. Set a Custom button styling color below so it still looks intentional.</div>` : ''}
+          ${showButtonStyle ? this._renderButtonStyling(preset, index) : ''}
+
+          ${isProfile ? `<div class="cpce-subgroup"><ha-icon icon="mdi:palette-swatch-outline"></ha-icon>Fixture Profile</div>
+          ${this._renderPresetProfileLink(preset, index)}` : ''}
+
+          ${(isColor || isTemp) ? `<div class="cpce-subgroup"><ha-icon icon="mdi:palette-outline"></ha-icon>Custom ${isTemp ? 'Temperature' : 'Color'} (the look)</div>` : ''}
+          ${showLook ? `
+          ${isColor ? this._renderColorWheelEditor(preset, index) : ''}
+          ${isTemp ? `<div class="cpce-field-title">Color Temperature</div><div class="cpce-temp-editor"><input type="range" class="cpce-preset-temp" min="${min}" max="${max}" step="50" value="${kelvin}"><span class="cpce-temp-val">${kelvin}K</span></div>` : ''}
+          <div class="cpce-field-title">Brightness</div>
+          <div class="cpce-check"><input type="checkbox" class="cpce-preset-bri-enable" ${hasBrightness ? 'checked' : ''}><label>Set brightness with this button</label></div>
+          ${hasBrightness ? `<div class="cpce-temp-editor"><input type="range" class="cpce-preset-bri" min="1" max="100" value="${brightnessPct}"><span class="cpce-bri-val">${brightnessPct}%</span></div>` : `<div class="cpce-hint">When off, this button leaves the light's current brightness unchanged.</div>`}
+          ${this._renderPresetExtras(preset, index, false)}
+          ` : ''}
+          ${(isColor || isTemp) ? this._renderInputColorLink(preset, index) : ''}
+
+          <div class="cpce-subgroup"><ha-icon icon="mdi:cog-outline"></ha-icon>Actions &amp; Targets</div>
+          ${this._renderPresetActions(preset, index, mode)}
         </div>
       </div>
     `;
   }
 
-  // The additive-actions block for a preset: Color Control Lights (All/Specific/None),
-  // Scenes to trigger, and a Turn-Off entity set — the last two shown as removable chips.
-  _renderPresetActions(preset, index) {
+  // Optional Button Styling: an explicit color used ONLY for how the button looks
+  // (swatch/tint/glow/icon), independent of what it does — so scene-only / None-target /
+  // Off buttons can still look intentional. When unset, styling derives from the look.
+  // "Copy From…" clones another button's style color for quick consistency.
+  _renderButtonStyling(preset, index) {
+    const enabled = !!preset.button_style_color;
+    const others = (this._config.presets || [])
+      .map((p, i) => ({ p, i }))
+      .filter(o => o.i !== index && o.p.button_style_color);
+    return `
+      <div class="cpce-check"><input type="checkbox" class="cpce-btnstyle-enable" data-index="${index}" ${enabled?'checked':''}><label>Custom button styling color</label></div>
+      ${enabled ? `
+        <div class="cpce-row"><label class="lbl">Style Color</label><input type="color" class="cpce-btnstyle-color" data-index="${index}" value="${preset.button_style_color}"></div>
+        ${others.length ? `<div class="cpce-row"><label class="lbl">Copy From…</label>
+          <select class="cpce-btnstyle-copy" data-index="${index}">
+            <option value="">Choose a button…</option>
+            ${others.map(o => `<option value="${o.p.button_style_color}">${escapeHtml(o.p.name || 'Button')}</option>`).join('')}
+          </select></div>` : ''}
+        <div class="cpce-hint">Overrides the look-derived color for this button's appearance only (not what it sends).</div>
+      ` : `<div class="cpce-hint">Off: the button's appearance follows its profile/look color.</div>`}
+    `;
+  }
+
+  // The Fixture Profile selector (shown only in Mode = Fixture Profile). Picks a shared
+  // library profile whose look this button applies. The look itself is edited in the Fixture
+  // Profile Library — a change there updates every button referencing it.
+  _renderPresetProfileLink(preset, index) {
+    const scope = this._config && this._config.fixture_library_scope;
+    const lib = fixtureLibraryMap(scope);
+    const slugs = Object.keys(lib).sort((a, b) => (lib[a].name || a).localeCompare(lib[b].name || b));
+    const curSlug = fixtureRefSlug(preset.profile_ref);
+    const linked = curSlug && lib[curSlug];
+    return `
+      <div class="cpce-profile-link">
+        <div class="cpce-row"><label class="lbl">Profile</label>
+          <select class="cpce-preset-profile" data-index="${index}">
+            <option value="" ${!curSlug?'selected':''}>Choose a profile…</option>
+            ${slugs.map(s => `<option value="lib:${escapeHtml(s)}" ${curSlug===s?'selected':''}>${escapeHtml(lib[s].name || s)}</option>`).join('')}
+            ${curSlug && !linked ? `<option value="lib:${escapeHtml(curSlug)}" selected>${escapeHtml(curSlug)} (missing)</option>` : ''}
+          </select>
+        </div>
+        ${linked
+          ? `<div class="cpce-hint">This button uses the shared profile <strong>${escapeHtml(lib[curSlug].name || curSlug)}</strong>. Edit it in the Fixture Profile Library; changes apply to every button using it.</div>`
+          : (curSlug
+            ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">Referenced profile "${escapeHtml(curSlug)}" isn't in the Library.</div>`
+            : `<div class="cpce-hint">${slugs.length ? 'Pick a saved profile above.' : 'No profiles yet — create one in the Fixture Profile Library (Entity &amp; Profile Management), then select it here.'}</div>`)}
+      </div>
+    `;
+  }
+
+  // The Fixture Profile Library manager: lists saved profiles with rename/delete, a scope
+  // toggle, and a swatch. Profiles are shared across all Color Light Manager cards.
+  _renderProfileLibrarySection() {
+    const lib = fixtureLibraryMap('system');
+    const slugs = Object.keys(lib).sort((a, b) => (lib[a].name || a).localeCompare(lib[b].name || b));
+    // Which library slugs are referenced by this card's presets (usage badge).
+    const usedSlugs = new Set((this._config.presets || []).map(p => fixtureRefSlug(p && p.profile_ref)).filter(Boolean));
+    return `
+      <div class="cpce-hint">Reusable fixture profiles (color/brightness/transition/effect) shared across all Color Light Manager cards via Home Assistant's built-in store. Create and edit profiles here; a button uses one by setting Mode = Fixture Profile — one edit updates every button referencing it.</div>
+      ${slugs.length
+        ? `<div class="cpce-manage-list">${slugs.map(s => {
+            const e = lib[s];
+            const rgb = presetColorToRgb(e.look || {});
+            const sw = (e.look && e.look.action === 'turn_off') ? 'transparent' : ColorUtils.rgbToHex(rgb[0], rgb[1], rgb[2]);
+            const open = this._openProfile === s;
+            return `<div class="cpce-manage-item" data-slug="${escapeHtml(s)}">
+              <span class="cpce-fav-swatch" style="background:${sw};"></span>
+              <span class="cpce-ce-name">${escapeHtml(e.name || s)}</span>
+              ${usedSlugs.has(s) ? '<span class="cpce-order-type">in use</span>' : ''}
+              <button class="cpce-icon-btn cpce-profile-edit${open?' active':''}" data-slug="${escapeHtml(s)}" title="Edit profile" style="color:var(--primary-color);"><ha-icon icon="mdi:pencil"></ha-icon></button>
+              <button class="cpce-delete-entity-btn cpce-profile-lib-delete" data-slug="${escapeHtml(s)}" title="Delete profile from library"><ha-icon icon="mdi:delete-forever"></ha-icon></button>
+            </div>${open ? `<div class="cpce-profile-edit-panel" data-slug="${escapeHtml(s)}">${this._renderProfileEditPanel(s, e)}</div>` : ''}`;
+          }).join('')}</div>`
+        : `<div class="cpce-hint">No profiles yet. Click “Add Profile” to create one.</div>`}
+      <button class="cpce-add-btn" id="cpce-add-profile"><ha-icon icon="mdi:plus"></ha-icon> Add Profile</button>
+    `;
+  }
+
+  // Inline editor for a library profile's LOOK — the SAME UI as a Custom Color/Temperature
+  // button (real color wheel, brightness, transition & effect). Edits write straight to the
+  // library, so every button referencing this profile updates live. A profile is always a
+  // color OR a temperature — never Off/None (those are button behaviors, not looks).
+  _renderProfileEditPanel(slug, entry) {
+    const look = (entry && entry.look) || {};
+    const mode = presetMode(look) === 'temp' ? 'temp' : 'color';   // profiles are color|temp only
+    const min = Number(this._config.min_kelvin) || 2000;
+    const max = Number(this._config.max_kelvin) || 6500;
+    const kelvin = clamp(look.color_kelvin || Math.round((min + max) / 2), min, max);
+    const hasBri = look.brightness !== undefined && look.brightness !== null;
+    const briPct = hasBri ? Math.round((look.brightness / 255) * 100) : 100;
+    const hasTrans = look.transition !== undefined && look.transition !== null && look.transition !== '';
+    const tVal = hasTrans ? Number(look.transition) : 0;
+    const effects = getUnionEffectList(this._hass, this._config.entities || []);
+    const curEffect = look.effect || '';
+    return `
+      <div class="cpce-row"><label class="lbl">Name</label>
+        <input type="text" class="cpce-profile-rename" data-slug="${escapeHtml(slug)}" value="${escapeHtml((entry && entry.name) || slug)}" placeholder="Profile name">
+      </div>
+      <div class="cpce-row"><label class="lbl">Mode</label>
+        <select class="cpce-pe-mode" data-slug="${escapeHtml(slug)}">
+          <option value="color" ${mode==='color'?'selected':''}>Custom Color</option>
+          <option value="temp" ${mode==='temp'?'selected':''}>Custom Temperature</option>
+        </select>
+      </div>
+      ${mode === 'color' ? this._renderColorWheelEditor(look, -1) : ''}
+      ${mode === 'temp' ? `<div class="cpce-field-title">Color Temperature</div><div class="cpce-temp-editor"><input type="range" class="cpce-pe-temp" data-slug="${escapeHtml(slug)}" min="${min}" max="${max}" step="50" value="${kelvin}"><span class="cpce-temp-val">${kelvin}K</span></div>` : ''}
+      <div class="cpce-field-title">Brightness</div>
+      <div class="cpce-check"><input type="checkbox" class="cpce-pe-bri-enable" data-slug="${escapeHtml(slug)}" ${hasBri?'checked':''}><label>Set brightness with this profile</label></div>
+      ${hasBri ? `<div class="cpce-temp-editor"><input type="range" class="cpce-pe-bri" data-slug="${escapeHtml(slug)}" min="1" max="100" value="${briPct}"><span class="cpce-bri-val">${briPct}%</span></div>` : `<div class="cpce-hint">When off, the profile leaves the light's current brightness unchanged.</div>`}
+      <div class="cpce-field-title">Transition &amp; Effect</div>
+      <div class="cpce-check"><input type="checkbox" class="cpce-pe-trans-enable" data-slug="${escapeHtml(slug)}" ${hasTrans?'checked':''}><label>Fade with a transition</label></div>
+      ${hasTrans ? `<div class="cpce-temp-editor"><input type="range" class="cpce-pe-trans" data-slug="${escapeHtml(slug)}" min="0" max="10" step="0.1" value="${tVal}"><span class="cpce-transition-val">${tVal}s</span></div>` : `<div class="cpce-hint">When off, the light changes instantly.</div>`}
+      ${effects.length
+        ? `<div class="cpce-row"><label class="lbl">Effect</label>
+            <select class="cpce-pe-effect" data-slug="${escapeHtml(slug)}">
+              <option value="" ${!curEffect?'selected':''}>None</option>
+              ${effects.map(e => `<option value="${escapeHtml(e)}" ${curEffect===e?'selected':''}>${escapeHtml(e)}</option>`).join('')}
+            </select>
+          </div>${curEffect && !effects.includes(curEffect) ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">Saved effect "${escapeHtml(curEffect)}" isn't offered by the card's light(s).</div>` : ''}${curEffect ? `<div class="cpce-hint">Effects run on the bulb's firmware; their speed isn't adjustable and most override the color. If it flashes with a color, try “Send effect in a separate command” under Advanced Send Methods.</div>` : ''}`
+        : `<div class="cpce-hint">The card's light(s) report no effects (<code>effect_list</code>), so none can be chosen.</div>`}
+      <div class="cpce-hint">Editing here updates every button that references this profile.</div>
+    `;
+  }
+
+  // Merge a partial look change into a library profile and persist it.
+  _patchProfileLook(slug, patch) {
+    const map = { ...fixtureLibraryMap('system') };
+    const e = map[slug];
+    if (!e) return;
+    const look = { ...(e.look || {}), ...patch };
+    // Drop empty keys so a cleared effect/transition doesn't linger.
+    Object.keys(look).forEach(k => { if (look[k] === null || look[k] === undefined || look[k] === '') delete look[k]; });
+    map[slug] = { ...e, look };
+    saveFixtureLibrary(this._hass, 'system', map).catch(err => console.warn(`${LOG_PREFIX} profile edit save failed`, err));
+  }
+
+  // Stores a library profile's color under a specific native format+value (clearing other
+  // color keys and kelvin/action), mirroring _storePresetColor but for the shared library.
+  _storeProfileColor(slug, fmt, value) {
+    const map = { ...fixtureLibraryMap('system') };
+    const e = map[slug]; if (!e) return;
+    const look = { ...(e.look || {}) };
+    ALL_PRESET_COLOR_KEYS.forEach(k => delete look[k]);
+    look[PRESET_COLOR_KEYS[fmt]] = value;
+    delete look.color_kelvin; delete look.action; delete look.look_none;
+    map[slug] = { ...e, look };
+    return saveFixtureLibrary(this._hass, 'system', map).catch(err => console.warn(`${LOG_PREFIX} profile color save failed`, err));
+  }
+
+  // Wheel/hex give an RGB triple; convert to the profile's current format and store.
+  _setProfileColorFromRgb(slug, rgb) {
+    const look = (fixtureLibraryMap('system')[slug] || {}).look || {};
+    const fmt = presetColorFormat(look) || 'rgb';
+    let value;
+    switch (fmt) {
+      case 'xy': value = ColorUtils.rgbToXy(rgb[0], rgb[1], rgb[2]); break;
+      case 'hs': value = ColorUtils.rgbToHs(rgb[0], rgb[1], rgb[2]); break;
+      case 'rgbw': value = [rgb[0], rgb[1], rgb[2], (look[PRESET_COLOR_KEYS.rgbw] || [])[3] || 0]; break;
+      case 'rgbww': { const cur = look[PRESET_COLOR_KEYS.rgbww] || []; value = [rgb[0], rgb[1], rgb[2], cur[3] || 0, cur[4] || 0]; break; }
+      default: value = rgb.slice(0, 3);
+    }
+    this._storeProfileColor(slug, fmt, value);
+    this._refreshProfileColorPreview(slug);
+  }
+
+  // Switches a profile's color format, converting the current color so it's preserved. Full
+  // re-render to swap the visible native fields.
+  _setProfileColorFormat(slug, fmt) {
+    const look = (fixtureLibraryMap('system')[slug] || {}).look || {};
+    const rgb = presetColorToRgb(look);
+    let value;
+    switch (fmt) {
+      case 'xy': value = ColorUtils.rgbToXy(rgb[0], rgb[1], rgb[2]); break;
+      case 'hs': value = ColorUtils.rgbToHs(rgb[0], rgb[1], rgb[2]); break;
+      case 'rgbw': value = [rgb[0], rgb[1], rgb[2], 0]; break;
+      case 'rgbww': value = [rgb[0], rgb[1], rgb[2], 0, 0]; break;
+      default: value = rgb.slice(0, 3);
+    }
+    const p = this._storeProfileColor(slug, fmt, value);
+    (p && p.then ? p : Promise.resolve()).then(() => this._render());
+  }
+
+  // Reads the native fields (cpce-c-0..4) in a profile panel and stores them verbatim.
+  _commitProfileNativeFields(slug, panel) {
+    const look = (fixtureLibraryMap('system')[slug] || {}).look || {};
+    const fmt = presetColorFormat(look) || 'rgb';
+    const read = (i, isFloat) => { const el = panel.querySelector(`.cpce-c-${i}`); if (!el) return 0; return isFloat ? (parseFloat(el.value) || 0) : (parseInt(el.value, 10) || 0); };
+    let value;
+    if (fmt === 'xy') value = [clamp(read(0, true), 0, 1), clamp(read(1, true), 0, 1)];
+    else if (fmt === 'hs') value = [clamp(read(0), 0, 360), clamp(read(1), 0, 100)];
+    else if (fmt === 'rgb') value = [0,1,2].map(i => clamp(read(i), 0, 255));
+    else if (fmt === 'rgbw') value = [0,1,2,3].map(i => clamp(read(i), 0, 255));
+    else if (fmt === 'rgbww') value = [0,1,2,3,4].map(i => clamp(read(i), 0, 255));
+    this._storeProfileColor(slug, fmt, value);
+    this._refreshProfileColorPreview(slug);
+  }
+
+  // Live-refresh the wheel/hex/swatch in a profile panel (no full re-render, so a focused
+  // native field keeps its caret). Mirrors _refreshPresetColorPreview.
+  _refreshProfileColorPreview(slug) {
+    const panel = this.querySelector(`.cpce-profile-edit-panel[data-slug="${slug}"]`);
+    if (!panel) return;
+    const look = (fixtureLibraryMap('system')[slug] || {}).look || {};
+    const rgb = presetColorToRgb(look);
+    const hs = ColorUtils.rgbToHs(rgb[0], rgb[1], rgb[2]);
+    const hex = ColorUtils.rgbToHex(rgb[0], rgb[1], rgb[2]);
+    const hexEl = panel.querySelector('.cpce-hex-input');
+    if (hexEl && document.activeElement !== hexEl) hexEl.value = hex;
+    const preview = panel.querySelector('.cpce-hex-preview');
+    if (preview) preview.style.background = hex;
+    this._drawColorWheel(panel.querySelector('.cpce-color-wheel'), hs[0], hs[1]);
+    const item = this.querySelector(`.cpce-manage-item[data-slug="${slug}"] .cpce-fav-swatch`);
+    if (item) item.style.background = hex;
+  }
+
+  // Wires the real color wheel + hex + native fields inside a library profile's edit panel.
+  _wireProfileColorWheel(panel, slug) {
+    const fmtSel = panel.querySelector('.cpce-color-format');
+    if (fmtSel) fmtSel.addEventListener('change', () => this._setProfileColorFormat(slug, fmtSel.value));
+    const canvas = panel.querySelector('.cpce-color-wheel');
+    if (canvas) {
+      const look = (fixtureLibraryMap('system')[slug] || {}).look || {};
+      const rgb = presetColorToRgb(look);
+      const hs0 = ColorUtils.rgbToHs(rgb[0], rgb[1], rgb[2]);
+      this._drawColorWheel(canvas, hs0[0], hs0[1]);
+      const cx = canvas.width / 2, cy = canvas.height / 2;
+      const radius = Math.min(cx, cy) - 4;
+      const updateFromWheel = (clientX, clientY) => {
+        const rect = canvas.getBoundingClientRect();
+        const px = (clientX - rect.left) * (canvas.width / rect.width) - cx;
+        const py = (clientY - rect.top) * (canvas.height / rect.height) - cy;
+        const dist = Math.min(Math.sqrt(px * px + py * py), radius);
+        let angle = Math.atan2(py, px) * 180 / Math.PI; if (angle < 0) angle += 360;
+        this._setProfileColorFromRgb(slug, ColorUtils.hsToRgb(Math.round(angle) % 360, Math.round((dist / radius) * 100)));
+      };
+      let dragging = false;
+      canvas.addEventListener('mousedown', (e) => { e.preventDefault(); dragging = true; updateFromWheel(e.clientX, e.clientY); });
+      window.addEventListener('mousemove', (e) => { if (dragging) updateFromWheel(e.clientX, e.clientY); });
+      window.addEventListener('mouseup', () => { dragging = false; });
+      canvas.addEventListener('touchstart', (e) => { dragging = true; updateFromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
+      window.addEventListener('touchmove', (e) => { if (dragging) updateFromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
+      window.addEventListener('touchend', () => { dragging = false; });
+    }
+    const hexEl = panel.querySelector('.cpce-hex-input');
+    if (hexEl) hexEl.addEventListener('change', () => { const rgb = ColorUtils.hexToRgb(hexEl.value); if (rgb) this._setProfileColorFromRgb(slug, rgb); });
+    [...panel.querySelectorAll('[class*="cpce-c-"]')].forEach(el => el.addEventListener('change', () => this._commitProfileNativeFields(slug, panel)));
+  }
+
+  _renderPresetExtras(preset, index, isOff) {
+    // Effects come from the union of the button's effective targets (defaults ∪ custom), falling
+    // back to the Default Entities pool so the picker still populates for a not-yet-targeted button.
+    const spec = presetTargetSpec(preset);
+    let targetIds = [];
+    if (spec.useDefault) targetIds.push(...(this._config.entities || []));
+    if (spec.useCustom) targetIds.push(...spec.custom);
+    if (!targetIds.length) targetIds = this._config.entities || [];
+    const effects = getUnionEffectList(this._hass, [...new Set(targetIds)]);
+    const curEffect = preset.effect || '';
+    const hasTransition = preset.transition !== undefined && preset.transition !== null && preset.transition !== '';
+    const tVal = hasTransition ? Number(preset.transition) : 0;
+    return `
+      <div class="cpce-field-title">Transition &amp; Effect</div>
+      <div class="cpce-check"><input type="checkbox" class="cpce-preset-transition-enable" ${hasTransition ? 'checked' : ''}><label>Fade with a transition</label></div>
+      ${hasTransition ? `<div class="cpce-temp-editor"><input type="range" class="cpce-preset-transition" min="0" max="10" step="0.1" value="${tVal}"><span class="cpce-transition-val">${tVal}s</span></div>` : `<div class="cpce-hint">When off, the light changes instantly.</div>`}
+      ${!isOff ? (effects.length
+        ? `<div class="cpce-row"><label class="lbl">Effect</label>
+            <select class="cpce-preset-effect">
+              <option value="" ${!curEffect?'selected':''}>None</option>
+              ${effects.map(e => `<option value="${escapeHtml(e)}" ${curEffect===e?'selected':''}>${escapeHtml(e)}</option>`).join('')}
+            </select>
+          </div>${curEffect && !effects.includes(curEffect) ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">Saved effect "${escapeHtml(curEffect)}" isn't offered by the target light(s).</div>` : ''}${curEffect ? `<div class="cpce-hint">Effects run on the bulb's firmware; their speed isn't adjustable and most override this button's color. If it flashes when combined with a color, try “Send effect in a separate command” under Advanced Send Methods.</div>` : ''}`
+        : `<div class="cpce-hint">The target light(s) report no effects (<code>effect_list</code>), so none can be chosen.</div>`) : ''}
+    `;
+  }
+
+  // The additive-actions block for a preset: Color Control Lights (Default Entities + custom),
+  // Scenes to trigger (any scene.*), and a Turn-Off entity set. `mode` is the button mode;
+  // color-control targeting is hidden for Scene buttons (they apply no color). The Color Entity
+  // Link is NOT here — it lives with the Custom look editor.
+  _renderPresetActions(preset, index, mode) {
     const cardEntities = this._config.entities || [];
-    const isOff = preset.action === 'turn_off';
-    const tmode = presetTargetMode(preset);
-    // Specific list defaults to all card entities when switching to Specific with none set.
-    const specificSel = Array.isArray(preset.target_entities) ? preset.target_entities : [];
-    const scenes = (preset.scenes || []).filter(s => (this._config.scenes || []).includes(s));
+    const isOff = mode === 'off';
+    const showColorControl = mode !== 'scene';
+    const spec = presetTargetSpec(preset);
+    const customSel = spec.custom;
+    const allLights = getLightEntities(this._hass);
+    const allScenes = getSceneEntities(this._hass);
+    const scenes = preset.scenes || [];   // any scene.*; no card-level pool to filter against
     const offIds = (preset.turn_off_entities || []).filter(id => cardEntities.includes(id));
 
     return `
       <div class="cpce-preset-actions" data-index="${index}">
-        <div class="cpce-action-block">
-          <div class="cpce-row"><label class="lbl">Color Control Lights</label>
-            <select class="cpce-cc-mode">
-              <option value="all" ${tmode==='all'?'selected':''}>All card entities</option>
-              <option value="specific" ${tmode==='specific'?'selected':''}>Specific entities</option>
-              <option value="none" ${tmode==='none'?'selected':''}>None</option>
-            </select>
-          </div>
-          <div class="cpce-hint">Which lights get this preset's ${isOff ? 'off command' : 'color/temperature'}. Choose None to only trigger scenes or turn other lights off.</div>
-          ${tmode === 'specific' ? (cardEntities.length
-            ? `${this._renderAddPicker(cardEntities, specificSel, 'on', 'cpce-cc-add', 'cpce-cc-sel', 'Add a light…')}${this._renderChips(specificSel, 'on', 'cpce-cc-chip-x')}`
-            : `<div class="cpce-hint">Add entities in “Card Entities Manager” first.</div>`) : ''}
-        </div>
+        ${showColorControl ? `<div class="cpce-action-block">
+          <div class="cpce-field-title">Color Control Lights</div>
+          <div class="cpce-hint">Which lights get this button's ${isOff ? 'off command' : mode === 'profile' ? "profile's look" : 'color/temperature'}. Combine the shared Default Entities pool with this button's own lights — or uncheck both for a scene/turn-off-only button.</div>
+          <div class="cpce-check"><input type="checkbox" class="cpce-cc-use-default" ${spec.useDefault?'checked':''}><label>Use Default Entities${cardEntities.length ? ` (${cardEntities.length})` : ' — none set'}</label></div>
+          ${spec.useDefault && cardEntities.length ? `<div style="margin-left:22px;">${this._renderStaticChips(cardEntities, 'default')}</div>` : ''}
+          <div class="cpce-check"><input type="checkbox" class="cpce-cc-use-custom" ${spec.useCustom?'checked':''}><label>Include other Entities</label></div>
+          ${spec.useCustom ? (allLights.length
+            ? `${this._renderAddPicker(allLights, customSel, 'on', 'cpce-cc-add', 'cpce-cc-sel', 'Add any light…')}${this._renderChips(customSel, 'on', 'cpce-cc-chip-x')}`
+            : `<div class="cpce-hint">No <code>light.*</code> entities found.</div>`) : ''}
+          ${!spec.useDefault && !spec.useCustom ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">No lights selected — this button applies no color (scene / turn-off only).</div>` : ''}
+        </div>` : ''}
 
         <div class="cpce-action-block">
           <div class="cpce-field-title">Trigger Scenes</div>
-          ${(this._config.scenes || []).length
-            ? `${this._renderAddPicker(this._config.scenes || [], scenes, 'scene', 'cpce-scene-chip-add', 'cpce-scene-chip-sel', 'Add a scene…')}${this._renderChips(scenes, 'scene', 'cpce-scene-chip-x')}`
-            : `<div class="cpce-hint">Add scenes in the “Card Scene Manager” section to trigger them here.</div>`}
+          ${allScenes.length
+            ? `${this._renderAddPicker(allScenes, scenes, 'scene', 'cpce-scene-chip-add', 'cpce-scene-chip-sel', 'Add any scene…')}${this._renderChips(scenes, 'scene', 'cpce-scene-chip-x')}`
+            : `<div class="cpce-hint">No <code>scene.*</code> entities found on this system.</div>`}
         </div>
 
         <div class="cpce-action-block">
           <div class="cpce-field-title">Turn Off These</div>
           ${cardEntities.length
             ? `${this._renderAddPicker(cardEntities, offIds, 'off', 'cpce-off-add', 'cpce-off-sel', 'Add a light to turn off…')}${this._renderChips(offIds, 'off', 'cpce-off-chip-x')}`
-            : `<div class="cpce-hint">Add entities in “Card Entities Manager” first.</div>`}
+            : `<div class="cpce-hint">Add lights to Default Entities first.</div>`}
         </div>
-
-        ${!isOff ? this._renderInputColorLink(preset, index) : ''}
       </div>
     `;
   }
@@ -3132,16 +4043,27 @@ class ColorLightManagerCardEditor extends HTMLElement {
         const supported = getUnionColorModes(this._hass, this._entityIds ? this._entityIds() : (this._config.entities || []));
         const preferFmt = ['rgb', 'xy', 'hs'].find(f => supported.includes(FORMAT_TO_COLOR_MODE[f])) || 'rgb';
         const seedColor = () => { p[PRESET_COLOR_KEYS[preferFmt]] = preferFmt === 'xy' ? ColorUtils.rgbToXy(255,0,0) : (preferFmt === 'hs' ? ColorUtils.rgbToHs(255,0,0) : [255,0,0]); };
+        // Clear every look/link field, then set only what the chosen mode needs.
         delete p.action; ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]); delete p.color_kelvin;
-        if (modeEl.value === 'off') { p.action = 'turn_off'; delete p.brightness; }
-        else if (modeEl.value === 'temp') p.color_kelvin = midKelvin;
-        else seedColor();
+        delete p.look_none; delete p.profile_ref; delete p.transition; delete p.effect;
+        const v = modeEl.value;
+        // If the icon isn't a user-customized one (empty or a generic/mode default), follow the
+        // new mode's default icon so the button glyph matches its function automatically.
+        if (!p.icon || GENERIC_DEFAULT_ICONS.has(p.icon)) p.icon = modeDefaultIcon(v);
+        p.mode = v;
+        if (v === 'off') { p.action = 'turn_off'; delete p.brightness; delete p.input_color_entity; }
+        else if (v === 'scene') { p.look_none = true; delete p.brightness; delete p.input_color_entity; }
+        else if (v === 'profile') { delete p.brightness; delete p.input_color_entity; }  // profile_ref set by the picker
+        else if (v === 'temp') p.color_kelvin = midKelvin;
+        else seedColor();  // color
         presets[index] = p;
         this._updateConfig({ presets });
         this._render();
       });
 
       if (removeBtn) removeBtn.onclick = () => {
+        const nm = (this._config.presets || [])[index];
+        if (!this._confirmDelete(`Delete the button “${(nm && nm.name) || 'Button'}”? This cannot be undone.`)) return;
         const presets = (this._config.presets || []).filter((_, i) => i !== index);
         if (this._openPreset === index) this._openPreset = null;
         else if (this._openPreset !== null && this._openPreset > index) this._openPreset -= 1;
@@ -3188,43 +4110,67 @@ class ColorLightManagerCardEditor extends HTMLElement {
         });
       }
 
+      // Transition: enable toggle (present = fade, absent = instant) + a 0-10s slider.
+      const transEnable = container.querySelector('.cpce-preset-transition-enable');
+      if (transEnable) transEnable.addEventListener('change', () => {
+        const presets = [...(this._config.presets || [])];
+        const p = { ...presets[index] };
+        if (transEnable.checked) p.transition = (p.transition ?? 1);
+        else delete p.transition;
+        presets[index] = p;
+        this._updateConfig({ presets });
+        this._render();
+      });
+      const transSlider = container.querySelector('.cpce-preset-transition');
+      const transVal = container.querySelector('.cpce-transition-val');
+      if (transSlider) {
+        transSlider.addEventListener('input', () => { if (transVal) transVal.textContent = `${parseFloat(transSlider.value)}s`; });
+        transSlider.addEventListener('change', () => {
+          const presets = [...(this._config.presets || [])];
+          presets[index] = { ...presets[index], transition: clamp(parseFloat(transSlider.value) || 0, 0, 10) };
+          this._updateConfig({ presets });
+        });
+      }
+
+      // Effect: a firmware effect name (or "" = none, which removes the key).
+      const effectSel = container.querySelector('.cpce-preset-effect');
+      if (effectSel) effectSel.addEventListener('change', () => {
+        const presets = [...(this._config.presets || [])];
+        const p = { ...presets[index] };
+        if (effectSel.value) p.effect = effectSel.value; else delete p.effect;
+        presets[index] = p;
+        this._updateConfig({ presets });
+      });
+
       const linkSelect = container.querySelector('.cpce-preset-input-color');
       if (linkSelect) {
         linkSelect.addEventListener('change', () => {
           const presets = [...(this._config.presets || [])];
           const newEntity = linkSelect.value || undefined;
-          let p = { ...presets[index], input_color_entity: newEntity };
+          let p = { ...presets[index] };
           if (!newEntity) {
+            // Unlink: the button needs an inline color again. Seed it from the entity's last
+            // value (so the color doesn't jump), then it becomes editable inline once more.
+            const prevEntity = p.input_color_entity;
             delete p.input_color_entity;
+            const st = prevEntity && this._hass && this._hass.states[prevEntity];
+            const value = st && inputColorStateToPresetValue(st);
+            ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]); delete p.color_kelvin; delete p.brightness;
+            if (value && Object.keys(value).length) p = { ...p, ...value };
+            else p.rgb_color = [255, 0, 0];
           } else {
-            // READ the entity's current values into the preset (do NOT overwrite the entity).
-            // This preserves the entity as the source of truth — if the button is later
-            // deleted and recreated, its values still live in the entity.
-            const st = this._hass && this._hass.states[newEntity];
-            const value = inputColorStateToPresetValue(st);
-            if (value && Object.keys(value).length) {
-              // Replace this preset's color/temp/brightness with the entity's, keeping name/icon/etc.
-              ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]);
-              delete p.color_kelvin;
-              p = { ...p, ...value };
-            }
+            // Link: the entity is now the single source of truth. The button stores NO look of
+            // its own — strip color/temp/brightness AND effect/transition (the entity can't
+            // store those) so nothing can drift or fire a stale effect.
+            p.input_color_entity = newEntity;
+            ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]);
+            delete p.color_kelvin; delete p.brightness; delete p.effect; delete p.transition;
           }
           presets[index] = p;
           this._updateConfig({ presets });
           this._render();
         });
       }
-
-      // Save the preset's current values INTO its linked Color Entity (explicit commit).
-      const saveBtn = container.querySelector('.cpce-preset-save-entity');
-      if (saveBtn) saveBtn.onclick = () => {
-        const preset = (this._config.presets || [])[index];
-        saveBtn.disabled = true;
-        this._writePresetToInputColor(preset).then(ok => {
-          if (ok) { this._dirtyPresets.delete(preset.id); }
-          else { saveBtn.disabled = false; window.alert('Could not save values to the Color Entity.'); }
-        });
-      };
 
       // Preset actions: Color Control mode + chips, Scenes chips, Turn-Off chips.
       const patchPreset = (patch) => {
@@ -3233,19 +4179,33 @@ class ColorLightManagerCardEditor extends HTMLElement {
         this._updateConfig({ presets });
         this._render();
       };
-      const ccMode = container.querySelector('.cpce-cc-mode');
-      if (ccMode) ccMode.addEventListener('change', () => {
-        const v = ccMode.value;
-        // Specific seeds with all card entities pre-selected; all/none clear the list.
-        patchPreset({ target_mode: v, target_entities: v === 'specific' ? [...(this._config.entities || [])] : [] });
-      });
-      const ccAdd = container.querySelector('.cpce-cc-add');
-      if (ccAdd) ccAdd.onclick = () => {
-        const sel = container.querySelector('.cpce-cc-sel'); if (!sel || !sel.value) return;
-        patchPreset({ target_mode: 'specific', target_entities: [...new Set([...(this._config.presets[index].target_entities || []), sel.value])] });
+      // Color Control targeting: two independent checkboxes (Default pool ∪ this button's own
+      // lights). We always write explicit use_default_entities / use_custom_entities and drop
+      // the legacy target_mode so the new model is authoritative.
+      const normalizeTargeting = (patch) => {
+        const cur = presetTargetSpec(this._config.presets[index]);
+        const next = { use_default_entities: cur.useDefault, use_custom_entities: cur.useCustom, target_entities: cur.custom, ...patch };
+        delete next.target_mode;
+        const p = { ...this._config.presets[index], ...next };
+        delete p.target_mode;
+        const presets = [...(this._config.presets || [])]; presets[index] = p;
+        this._updateConfig({ presets }); this._render();
       };
+      const ccUseDefault = container.querySelector('.cpce-cc-use-default');
+      if (ccUseDefault) ccUseDefault.addEventListener('change', () => normalizeTargeting({ use_default_entities: ccUseDefault.checked }));
+      const ccUseCustom = container.querySelector('.cpce-cc-use-custom');
+      if (ccUseCustom) ccUseCustom.addEventListener('change', () => normalizeTargeting({ use_custom_entities: ccUseCustom.checked }));
+      const ccAddLight = (val) => {
+        if (!val) return;
+        normalizeTargeting({ use_custom_entities: true, target_entities: [...new Set([...(this._config.presets[index].target_entities || []), val])] });
+      };
+      const ccAdd = container.querySelector('.cpce-cc-add');
+      if (ccAdd) ccAdd.onclick = () => { const sel = container.querySelector('.cpce-cc-sel'); ccAddLight(sel && sel.value); };
+      // Add on selection too (the ＋ is easy to miss) — picking a light adds it immediately.
+      const ccSel = container.querySelector('.cpce-cc-sel');
+      if (ccSel) ccSel.addEventListener('change', () => ccAddLight(ccSel.value));
       container.querySelectorAll('.cpce-cc-chip-x').forEach(x => x.onclick = () =>
-        patchPreset({ target_entities: (this._config.presets[index].target_entities || []).filter(id => id !== x.dataset.id) }));
+        normalizeTargeting({ target_entities: (this._config.presets[index].target_entities || []).filter(id => id !== x.dataset.id) }));
 
       const scAdd = container.querySelector('.cpce-scene-chip-add');
       if (scAdd) scAdd.onclick = () => {
@@ -3272,29 +4232,90 @@ class ColorLightManagerCardEditor extends HTMLElement {
         this._render();
       });
 
+      // Button Styling: enable toggle, color, and Copy From…
+      const styleEnable = container.querySelector('.cpce-btnstyle-enable');
+      if (styleEnable) styleEnable.addEventListener('change', () => {
+        const presets = [...(this._config.presets || [])];
+        const p = { ...presets[index] };
+        if (styleEnable.checked) {
+          // Seed with the current look-derived color so the picker starts sensibly.
+          p.button_style_color = p.button_style_color || ColorUtils.rgbToHex(...presetColorToRgb(this._effectivePreset(p)));
+        } else delete p.button_style_color;
+        presets[index] = p;
+        this._updateConfig({ presets });
+        this._render();
+      });
+      const styleColor = container.querySelector('.cpce-btnstyle-color');
+      if (styleColor) styleColor.addEventListener('input', () => {
+        const presets = [...(this._config.presets || [])];
+        presets[index] = { ...presets[index], button_style_color: styleColor.value };
+        this._updateConfig({ presets });
+      });
+      const styleCopy = container.querySelector('.cpce-btnstyle-copy');
+      if (styleCopy) styleCopy.addEventListener('change', () => {
+        if (!styleCopy.value) return;
+        const presets = [...(this._config.presets || [])];
+        presets[index] = { ...presets[index], button_style_color: styleCopy.value };
+        this._updateConfig({ presets });
+        this._render();
+      });
+
+      // Fixture Profile selector (Mode = Fixture Profile): "" clears the ref (button applies
+      // nothing until one is chosen), lib:<slug> references a shared profile.
+      const profSel = container.querySelector('.cpce-preset-profile');
+      if (profSel) profSel.addEventListener('change', () => {
+        const presets = [...(this._config.presets || [])];
+        const p = { ...presets[index], mode: 'profile' };
+        if (profSel.value) p.profile_ref = profSel.value; else delete p.profile_ref;
+        presets[index] = p;
+        this._updateConfig({ presets });
+        this._render();
+      });
       this._wireColorWheel(container, index);
     });
   }
 
-  // Wires a target-entities picker (rendered by _renderTargetPicker) inside `container`.
-  // Calls onChange(targetArray | undefined) — undefined means "all" (clears target_entities).
-  // Mode switch re-renders (to show/hide the checkbox list); checkbox toggles update live.
-  _wireTargetPicker(container, onChange) {
+  // Creates a new blank Fixture Profile in the shared library (prompted for a name), then opens
+  // its inline editor so the user sets the look. All profile creation/editing lives here now —
+  // buttons only reference profiles (Mode = Fixture Profile), they don't create them.
+  _addFixtureProfile() {
+    const scope = this._config.fixture_library_scope || 'system';
+    const name = window.prompt('Name the new Fixture Profile:', 'New Profile');
+    if (!name || !name.trim()) return;
+    const map = { ...fixtureLibraryMap(scope) };
+    let slug = fixtureLibSlug(name);
+    // Avoid clobbering an existing profile — suffix a counter if the slug is taken.
+    if (map[slug]) { let n = 2; while (map[`${slug}_${n}`]) n++; slug = `${slug}_${n}`; }
+    // Seed a sensible default look: red RGB (matches a new button's default).
+    map[slug] = { name: name.trim(), look: { rgb_color: [255, 0, 0] } };
+    this._openProfile = slug;   // open its editor immediately
+    saveFixtureLibrary(this._hass, scope, map)
+      .then(() => this._render())
+      .catch(e => { console.error(`${LOG_PREFIX} create profile failed`, e); window.alert(`Could not create the profile: ${formatWsError(e)}`); });
+  }
+
+  // Wires a section target picker (rendered by _renderTargetPicker) inside `container`.
+  // `getSection()` returns the current section object; `applyPatch(patch)` merges the given
+  // targeting fields onto it and persists+re-renders. Mirrors the button targeting model:
+  // use_default_entities / use_custom_entities / target_entities (any light).
+  _wireTargetPicker(container, getSection, applyPatch) {
     const picker = container.querySelector('.cpce-target-picker');
     if (!picker) return;
-    const modeEl = picker.querySelector('.cpce-target-mode');
-    if (modeEl) modeEl.addEventListener('change', () => {
-      // "all" clears the target. "specific" seeds with ALL card entities pre-checked so the
-      // list renders in the specific state (length > 0) and the user unchecks what they want
-      // to exclude — otherwise an empty array would read back as "all".
-      onChange(modeEl.value === 'specific' ? [...(this._config.entities || [])] : undefined);
-    });
-    picker.querySelectorAll('.cpce-target-entity input[type="checkbox"]').forEach(cb => {
-      cb.addEventListener('change', () => {
-        const checked = [...picker.querySelectorAll('.cpce-target-entity input:checked')].map(el => el.value);
-        onChange(checked);
-      });
-    });
+    const patchFrom = (patch) => {
+      const spec = presetTargetSpec(getSection());
+      applyPatch({ use_default_entities: spec.useDefault, use_custom_entities: spec.useCustom, target_entities: spec.custom, ...patch });
+    };
+    const useDefault = picker.querySelector('.cpce-tp-use-default');
+    if (useDefault) useDefault.addEventListener('change', () => patchFrom({ use_default_entities: useDefault.checked }));
+    const useCustom = picker.querySelector('.cpce-tp-use-custom');
+    if (useCustom) useCustom.addEventListener('change', () => patchFrom({ use_custom_entities: useCustom.checked }));
+    const addLight = (val) => { if (val) patchFrom({ use_custom_entities: true, target_entities: [...new Set([...(presetTargetSpec(getSection()).custom), val])] }); };
+    const addBtn = picker.querySelector('.cpce-tp-add');
+    if (addBtn) addBtn.onclick = () => { const sel = picker.querySelector('.cpce-tp-sel'); addLight(sel && sel.value); };
+    const selEl = picker.querySelector('.cpce-tp-sel');
+    if (selEl) selEl.addEventListener('change', () => addLight(selEl.value));
+    picker.querySelectorAll('.cpce-tp-chip-x').forEach(x => x.onclick = () =>
+      patchFrom({ target_entities: presetTargetSpec(getSection()).custom.filter(id => id !== x.dataset.id) }));
   }
 
   // Wires the Slider Sections manager: per-section name, slider checkboxes, target picker,
@@ -3327,13 +4348,13 @@ class ColorLightManagerCardEditor extends HTMLElement {
         const cb = el.querySelector(sel);
         if (cb) cb.addEventListener('change', () => { updateOne(id, { sliders: readSliders() }); this._render(); });
       });
-      // Target picker (scoped to this section's container).
-      this._wireTargetPicker(el, (target) => {
-        updateOne(id, { target_entities: target === undefined ? [] : target });
-        this._render();
-      });
+      // Target picker (scoped to this section's container) — two-checkbox any-light model.
+      this._wireTargetPicker(el,
+        () => getSections().find(s => s.id === id) || {},
+        (patch) => { updateOne(id, patch); this._render(); });
       const removeBtn = el.querySelector('.cpce-ss-remove');
       if (removeBtn) removeBtn.onclick = () => {
+        if (!this._confirmDelete('Remove this Sliders section? This cannot be undone.')) return;
         const sections = getSections().filter(s => s.id !== id);
         this._updateSections(sections);
         this._render();
@@ -3409,6 +4430,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-shared-link { --mdc-icon-size:18px; color:var(--info-color,#2196F3); flex-shrink:0; }
         .cpce-link-indicator.cpce-link-broken { color:var(--error-color,#f44336); }
         .cpce-preset-body { padding:0 10px 10px; }
+        /* Sub-group divider within a button panel (groups: Button / Profile / Actions). */
+        .cpce-subgroup { display:flex; align-items:center; gap:8px; margin:14px 0 8px; color:var(--secondary-text-color); font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }
+        .cpce-subgroup::after { content:''; flex:1; height:1px; background:var(--divider-color,#333); }
+        .cpce-subgroup ha-icon { --mdc-icon-size:15px; color:var(--primary-color); }
+        .cpce-readonly-val { flex:1; font-size:13px; color:var(--secondary-text-color); font-style:italic; }
         .cpce-input-color-link { margin-top:10px; padding-top:10px; border-top:1px solid var(--divider-color,#333); }
         .cpce-preset-save-entity { display:inline-flex; align-items:center; gap:6px; margin-top:6px; padding:6px 12px; border:none; border-radius:4px; background:var(--primary-color); color:#fff; cursor:pointer; font-size:12px; }
         .cpce-preset-save-entity:disabled { opacity:0.4; cursor:default; }
@@ -3462,7 +4488,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-action-block { padding-top:10px; margin-top:10px; border-top:1px solid var(--divider-color,#333); }
         .cpce-action-block:first-child { padding-top:0; margin-top:0; border-top:none; }
         .cpce-chips { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 2px; }
-        .cpce-chip { display:inline-flex; align-items:center; gap:6px; padding:3px 6px 3px 10px; border-radius:999px; font-size:12px; border:1px solid var(--divider-color,#333); background:var(--secondary-background-color,#2a2a2a); color:var(--primary-text-color); }
+        .cpce-chip { display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px; font-size:12px; border:1px solid var(--divider-color,#333); background:var(--secondary-background-color,#2a2a2a); color:var(--primary-text-color); }
+        .cpce-chip.default { border-color:var(--info-color,#2196F3); }
         .cpce-chip.on { border-color:var(--success-color,#4caf50); }
         .cpce-chip.off { border-color:var(--error-color,#f44336); }
         .cpce-chip.scene { border-color:var(--info-color,#2196F3); }
@@ -3484,6 +4511,16 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-unmatched-list, .cpce-manage-list { border:1px solid var(--divider-color,#333); border-radius:6px; overflow:hidden; margin-bottom:8px; }
         .cpce-unmatched-item, .cpce-manage-item { display:flex; align-items:center; gap:8px; padding:8px; border-top:1px solid var(--divider-color,#333); font-size:13px; color:var(--primary-text-color); }
         .cpce-unmatched-item:first-child, .cpce-manage-item:first-child { border-top:none; }
+        .cpce-esm-item { display:flex; flex-direction:column; gap:6px; padding:8px; border-top:1px solid var(--divider-color,#333); }
+        .cpce-esm-item:first-child { border-top:none; }
+        .cpce-esm-name { font-size:13px; color:var(--primary-text-color); display:flex; flex-direction:column; }
+        .cpce-esm-controls { display:flex; gap:10px; flex-wrap:wrap; }
+        .cpce-esm-field { display:flex; flex-direction:column; gap:2px; font-size:11px; color:var(--secondary-text-color); flex:1; min-width:130px; }
+        .cpce-esm-field select { font-size:12px; }
+        .cpce-ce-name { display:flex; flex-direction:column; flex:1; min-width:0; }
+        .cpce-link-unused { color:var(--secondary-text-color); opacity:0.6; }
+        .cpce-ce-edit-panel { padding:10px 8px; border-top:1px solid var(--divider-color,#333); background:var(--secondary-background-color,rgba(255,255,255,0.03)); }
+        .cpce-ce-create-preset { padding:4px 8px; font-size:12px; }
         .cpce-create-preset-btn {
           display:flex; align-items:center; gap:4px; margin-left:auto; padding:5px 10px;
           border:none; border-radius:4px; background:var(--primary-color); color:#fff; cursor:pointer; font-size:12px; white-space:nowrap;
@@ -3499,6 +4536,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-editor-header ha-icon { --mdc-icon-size:22px; color:var(--primary-color); }
         .cpce-editor-title { font-size:15px; font-weight:600; color:var(--primary-text-color); }
         .cpce-editor-build { margin-left:auto; font-size:11px; color:var(--secondary-text-color); font-family:var(--code-font-family, monospace); }
+        /* Group divider separating the two logical panel groups (Visuals vs Management). */
+        .cpce-group-divider { display:flex; align-items:center; gap:10px; margin:18px 2px 10px; color:var(--primary-color); font-size:13px; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; }
+        .cpce-group-divider::before, .cpce-group-divider::after { content:''; flex:1; height:2px; background:linear-gradient(to right, transparent, var(--primary-color)); opacity:0.5; }
+        .cpce-group-divider::before { background:linear-gradient(to left, transparent, var(--primary-color)); }
+        .cpce-group-divider ha-icon { --mdc-icon-size:18px; }
       </style>
       <div class="cpce">
         <div class="cpce-editor-header">
@@ -3506,34 +4548,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <span class="cpce-editor-title">${CARD_NAME}</span>
           <span class="cpce-editor-build">${BUILD_NUMBER}</span>
         </div>
-        ${this._section('mdi:lightbulb-group', 'Card Entities Manager', 'entities', `
-          <div class="cpce-hint">Search and filter light entities, then click ＋ to add each one. Color modes each light supports are shown as chips. Entities selected here will be available to card sections.</div>
-          <div class="cpce-search-row">
-            <input type="text" id="cpce-search" placeholder="Search entities…" value="${escapeHtml(this._entitySearch)}">
-            <select id="cpce-filter-type">
-              <option value="none" ${this._entityFilter.type==='none'?'selected':''}>No Filter</option>
-              <option value="label" ${this._entityFilter.type==='label'?'selected':''}>Label</option>
-              <option value="group" ${this._entityFilter.type==='group'?'selected':''}>Group</option>
-              <option value="text" ${this._entityFilter.type==='text'?'selected':''}>Text</option>
-            </select>
-          </div>
-          ${this._entityFilter.type === 'label' ? `<div class="cpce-row"><select id="cpce-filter-label"><option value="">All Labels</option>${labels.map(l => `<option value="${escapeHtml(l)}" ${this._entityFilter.value===l?'selected':''}>${escapeHtml(l)}</option>`).join('')}</select></div>` : ''}
-          ${this._entityFilter.type === 'group' ? `<div class="cpce-row"><select id="cpce-filter-group"><option value="">All Groups</option>${groups.map(g => `<option value="${escapeHtml(g.id)}" ${this._entityFilter.value===g.id?'selected':''}>${escapeHtml(g.name)}</option>`).join('')}</select></div>` : ''}
-          ${this._entityFilter.type === 'text' ? `<div class="cpce-row"><input type="text" id="cpce-filter-text" placeholder="Filter text…" value="${escapeHtml(this._entityFilter.value)}"></div>` : ''}
-          <div class="cpce-entity-list" id="cpce-entity-list">${this._renderEntityListInner()}</div>
-          <div class="cpce-collapse-head${this._addedEntitiesCollapsed ? ' collapsed' : ''}" id="cpce-added-toggle"><ha-icon icon="mdi:chevron-down"></ha-icon>Added Entities (${(cfg.entities||[]).length})</div>
-          ${this._addedEntitiesCollapsed ? '' : `<div id="cpce-selected-list">${this._renderSelectedList()}</div>`}
-        `)}
-
-        ${this._section('mdi:palette', 'Scene Manager', 'scenes', `
-          <div class="cpce-hint">Add Home Assistant Scenes here to make them available to preset buttons (a preset can trigger one or more).</div>
-          <div class="cpce-search-row">
-            <input type="text" id="cpce-scene-search" placeholder="Search scenes…" value="${escapeHtml(this._sceneSearch)}">
-          </div>
-          <div class="cpce-entity-list" id="cpce-scene-list">${this._renderSceneListInner()}</div>
-          <div class="cpce-collapse-head${this._addedScenesCollapsed ? ' collapsed' : ''}" id="cpce-added-scenes-toggle"><ha-icon icon="mdi:chevron-down"></ha-icon>Added Scenes (${(cfg.scenes||[]).length})</div>
-          ${this._addedScenesCollapsed ? '' : `<div id="cpce-selected-scene-list">${this._renderSelectedScenes()}</div>`}
-        `)}
+        <div class="cpce-group-divider"><ha-icon icon="mdi:eye-outline"></ha-icon>Card Builder</div>
 
         ${this._section('mdi:view-grid-outline', 'Section Order', 'layout', `
           <div class="cpce-hint">Order of the card's sections (top → bottom). Rename inline; use arrows to move; ✕ to remove. The gear button configures a section-name heading, its text styling, and (for Color Values) which lights it monitors.</div>
@@ -3554,7 +4569,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
                 ${s.name_show ? this._textStyleControls(`cpce-sn-${s.id}`, { size: s.name_font_size, weight: s.name_font_weight, color: s.name_color }, 13) : ''}
                 ${s.type === 'values' ? `<div class="cpce-sub-title">Monitored Lights</div>
                   <div class="cpce-hint">Which light(s) this section reads color values from.</div>
-                  ${this._renderTargetPicker(s.target_entities, `data-vs-target="${s.id}"`)}` : ''}
+                  ${this._renderTargetPicker(s, `data-vs-target="${s.id}"`)}` : ''}
               </div>` : ''}`;
             }).join('')}
           </div>
@@ -3584,11 +4599,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
           ${cfg.icon_color_enabled ? `
             <div class="cpce-row"><label class="lbl">Icon Color</label>
               <select id="cpce-icon-color-mode">
-                <option value="fixed" ${cfg.icon_color_mode!=='light'?'selected':''}>Fixed color</option>
-                <option value="light" ${cfg.icon_color_mode==='light'?'selected':''}>Current color set for the light</option>
+                <option value="fixed" ${(cfg.icon_color_mode!=='light'&&cfg.icon_color_mode!=='active')?'selected':''}>Fixed color</option>
+                <option value="light" ${cfg.icon_color_mode==='light'?'selected':''}>Light's current color</option>
+                <option value="active" ${cfg.icon_color_mode==='active'?'selected':''}>Last-pressed button's color</option>
               </select>
             </div>
-            ${cfg.icon_color_mode !== 'light' ? `<div class="cpce-row"><label class="lbl">Fixed Icon Color</label><input type="color" id="cpce-icon-color" value="${cfg.icon_color || '#2196F3'}"></div>` : `
+            ${cfg.icon_color_mode !== 'light' ? `<div class="cpce-row"><label class="lbl">${cfg.icon_color_mode==='active'?'Fallback Color':'Fixed Icon Color'}</label><input type="color" id="cpce-icon-color" value="${cfg.icon_color || '#2196F3'}"></div>${cfg.icon_color_mode==='active'?`<div class="cpce-hint">Used until a button is pressed.</div>`:''}` : `
               <div class="cpce-row"><label class="lbl">When Light Off</label>
                 <select id="cpce-icon-off-mode">
                   <option value="theme" ${cfg.icon_off_color_mode!=='fixed'?'selected':''}>Theme default</option>
@@ -3656,11 +4672,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
             </div>
             <div class="cpce-row"><label class="lbl">Glow Color</label>
               <select id="cpce-card-glow-color-mode">
-                <option value="fixed" ${cfg.card_glow_color_mode!=='light'?'selected':''}>Fixed color</option>
-                <option value="light" ${cfg.card_glow_color_mode==='light'?'selected':''}>Current color set for the light</option>
+                <option value="fixed" ${(cfg.card_glow_color_mode!=='light'&&cfg.card_glow_color_mode!=='active')?'selected':''}>Fixed color</option>
+                <option value="light" ${cfg.card_glow_color_mode==='light'?'selected':''}>Light's current color</option>
+                <option value="active" ${cfg.card_glow_color_mode==='active'?'selected':''}>Last-pressed button's color</option>
               </select>
             </div>
-            ${cfg.card_glow_color_mode !== 'light' ? `<div class="cpce-row"><label class="lbl">Fixed Glow Color</label><input type="color" id="cpce-card-glow-color" value="${cfg.card_glow_color || '#2196F3'}"></div>` : ''}
+            ${cfg.card_glow_color_mode !== 'light' ? `<div class="cpce-row"><label class="lbl">${cfg.card_glow_color_mode==='active'?'Fallback Glow Color':'Fixed Glow Color'}</label><input type="color" id="cpce-card-glow-color" value="${cfg.card_glow_color || '#2196F3'}"></div>${cfg.card_glow_color_mode==='active'?`<div class="cpce-hint">Used until a button is pressed.</div>`:''}` : ''}
             <div class="cpce-row"><label class="lbl">Glow Intensity</label><input type="range" id="cpce-card-glow-intensity" min="0.2" max="3" step="0.1" value="${Number(cfg.card_glow_intensity)||1.0}"><span class="cpce-strength-val" id="cpce-card-glow-intensity-val">${(Number(cfg.card_glow_intensity)||1.0).toFixed(1)}x</span></div>
             <div class="cpce-check"><input type="checkbox" id="cpce-card-glow-borders-only" ${cfg.card_glow_borders_only!==false?'checked':''}><label for="cpce-card-glow-borders-only">Glow stronger on sides with borders (when borders enabled)</label></div>
           ` : ''}
@@ -3755,39 +4772,6 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-hint">Set Max Width (and enable word-wrap) for uniform button sizes; 0 = Auto. Heights are aligned so wrapped buttons match single-line ones.</div>
         `)}
 
-        ${this._section('mdi:thermometer', 'White Color Temperature Options', 'options', `
-          <div class="cpce-sub-title">White Temperature Send Method</div>
-          <div class="cpce-hint">How a white color temperature is sent to the light — applies to <strong>both</strong> the manual temperature slider and Temperature/Both presets. Leave on <strong>Kelvin</strong> for most lights. If your controller (e.g. some RGBWW firmwares) shows the wrong color when you set a white temperature, try <strong>XY</strong>, or <strong>RGBWW</strong> if it has dedicated cold/warm white channels.</div>
-          ${[
-            ['kelvin', 'Kelvin', 'color_temp_kelvin — standard, correct for most lights'],
-            ['xy', 'XY', 'xy_color — accurate CIE white point'],
-            ['hs', 'HS', 'hs_color — hue/saturation'],
-            ['rgb', 'RGB', 'rgb_color — approximate white via RGB channels'],
-            ['rgbw', 'RGBW', 'rgbw_color — dedicated single white LED'],
-            ['rgbww', 'RGBWW', 'rgbww_color — dedicated cold + warm white LEDs'],
-          ].map(([val, label, desc]) => `
-            <label class="cpce-radio-row">
-              <input type="radio" name="cpce-temp-output-format" value="${val}" ${(cfg.temperature_output_format||'kelvin')===val?'checked':''}>
-              <span class="cpce-radio-label">${label}</span>
-              <span class="cpce-radio-desc">${desc}</span>
-            </label>
-          `).join('')}
-          <div class="cpce-hint">Note: XY / HS / RGB put the light in color mode approximating white. RGBW / RGBWW use the light's dedicated white LEDs (RGBWW mixes cold/warm based on your Min/Max Kelvin range). Home Assistant lights are in one color mode at a time — pick the method your controller's mode expects.</div>
-        `)}
-
-        ${this._section('mdi:format-list-numbered', 'Color Value Section', 'value-display', `
-          <div class="cpce-hint">A read-only readout of the light's current color values (RGB / Kelvin / HS / XY, plus W / CW / WW when the light reports them) — handy for reading a color to save into a preset. Add a “Color Values” section in the <strong>Section Order</strong> section; these settings apply to it.</div>
-          <div class="cpce-check"><input type="checkbox" id="cpce-temp-show-mired" ${cfg.temperature_show_mired?'checked':''}><label for="cpce-temp-show-mired">Show the mired value next to Kelvin (e.g. "2000K / 500m")</label></div>
-          <div class="cpce-row"><label class="lbl">Column Justification</label>
-            <select id="cpce-cv-justify">
-              <option value="left" ${(cfg.current_values_justify||'left')==='left'?'selected':''}>Left</option>
-              <option value="center" ${cfg.current_values_justify==='center'?'selected':''}>Center</option>
-              <option value="right" ${cfg.current_values_justify==='right'?'selected':''}>Right</option>
-            </select>
-          </div>
-          <div class="cpce-hint">Note: the mired display option also applies to the temperature slider readout.</div>
-        `)}
-
         ${this._section('mdi:minus', 'Section Dividers', 'dividers', `
           <div class="cpce-hint">Show a divider line above and/or below each section on the card.</div>
           ${[
@@ -3812,7 +4796,20 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-row"><label class="lbl">Length</label><input type="range" id="cpce-divider-length" min="5" max="100" value="${Number(cfg.divider_length)||100}"><span class="cpce-strength-val" id="cpce-divider-length-val">${Number(cfg.divider_length)||100}%</span></div>
         `)}
 
-        ${this._section('mdi:tune', 'Slider Sections', 'sliders', `
+        ${this._section('mdi:palette-swatch-outline', 'Scratchpad', 'favorites', `
+          <div class="cpce-check"><input type="checkbox" id="cpce-show-favorites" ${cfg.show_favorites?'checked':''}><label for="cpce-show-favorites">Show scratchpad bar on the card</label></div>
+          <div class="cpce-hint">Scratchpad colors are temporary and saved in this browser only (not synced across devices), shared across all Color Light Manager cards in it. Use them to quickly stash a color you're experimenting with.</div>
+        `)}
+
+        <div class="cpce-group-divider"><ha-icon icon="mdi:view-dashboard-outline"></ha-icon>Section Builder</div>
+
+        ${this._section('mdi:lightbulb-multiple-outline', 'Buttons', 'presets', `
+          <div class="cpce-hint">Configure the quick-select buttons. Use the color wheel for precise color selection.</div>
+          <div id="cpce-preset-list">${(cfg.presets||[]).map((p, i) => this._renderPresetEditor(p, i)).join('')}</div>
+          <button class="cpce-add-btn" id="cpce-add-preset"><ha-icon icon="mdi:plus"></ha-icon> Add Button</button>
+        `)}
+
+        ${this._section('mdi:tune', 'Sliders', 'sliders', `
           <div class="cpce-hint">Each slider section shows the sliders you pick and controls its own target entities. Add multiple sections to control different lights independently. Styling below (orientation, size, gradient, text) is shared across all slider sections.</div>
           ${this._orderedSectionsRaw().filter(s => s.type === 'sliders').map((s, i, arr) => {
             const sel = s.sliders || { brightness: true, temperature: true, rgb: true };
@@ -3834,7 +4831,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
                   <label class="cpce-inline-check"><input type="checkbox" class="cpce-ss-temperature" ${sel.temperature?'checked':''}> Temperature</label>
                   <label class="cpce-inline-check"><input type="checkbox" class="cpce-ss-rgb" ${sel.rgb?'checked':''}> RGB</label>
                 </div>
-                ${this._renderTargetPicker(s.target_entities, `data-ss-target="${s.id}"`)}
+                ${this._renderTargetPicker(s, `data-ss-target="${s.id}"`)}
               </div>
             </div>`;
           }).join('')}
@@ -3945,71 +4942,104 @@ class ColorLightManagerCardEditor extends HTMLElement {
           `).join('')}
         `)}
 
-        ${this._section('mdi:star-outline', 'Local Favorites', 'favorites', `
-          <div class="cpce-check"><input type="checkbox" id="cpce-show-favorites" ${cfg.show_favorites?'checked':''}><label for="cpce-show-favorites">Show favorites bar on the card</label></div>
-          <div class="cpce-hint">Local Favorites are saved to this browser only (not synced across devices) and shared across all Color Light Manager cards in it.</div>
+        ${this._section('mdi:format-list-numbered', 'Color Values', 'value-display', `
+          <div class="cpce-hint">A read-only readout of the light's current color values (RGB / Kelvin / HS / XY, plus W / CW / WW when the light reports them) — handy for reading a color to save into a preset. Add a “Color Values” section in the <strong>Section Order</strong> section; these settings apply to it.</div>
+          <div class="cpce-check"><input type="checkbox" id="cpce-temp-show-mired" ${cfg.temperature_show_mired?'checked':''}><label for="cpce-temp-show-mired">Show the mired value next to Kelvin (e.g. "2000K / 500m")</label></div>
+          <div class="cpce-row"><label class="lbl">Column Justification</label>
+            <select id="cpce-cv-justify">
+              <option value="left" ${(cfg.current_values_justify||'left')==='left'?'selected':''}>Left</option>
+              <option value="center" ${cfg.current_values_justify==='center'?'selected':''}>Center</option>
+              <option value="right" ${cfg.current_values_justify==='right'?'selected':''}>Right</option>
+            </select>
+          </div>
+          <div class="cpce-hint">Note: the mired display option also applies to the temperature slider readout.</div>
         `)}
 
-        ${this._section('mdi:link-variant', "Manage HA's Color Entities", 'color-entities', `
+        <div class="cpce-group-divider"><ha-icon icon="mdi:cog-outline"></ha-icon>Entity &amp; Profile Management</div>
+
+        ${this._section('mdi:lightbulb-group', 'Default Entities', 'entities', `
+          <div class="cpce-hint">A shared pool of lights. Each button can include this pool <strong>live</strong> ("Use Default Entities") and/or add its own lights — so changing this list updates every button that uses it. It's also what the card glow / header icon follow (in "light" mode) and where per-light Send Method overrides come from. Optional — you can leave it empty and give each button its own lights.</div>
+          <div class="cpce-search-row">
+            <input type="text" id="cpce-search" placeholder="Search entities…" value="${escapeHtml(this._entitySearch)}">
+            <select id="cpce-filter-type">
+              <option value="none" ${this._entityFilter.type==='none'?'selected':''}>No Filter</option>
+              <option value="label" ${this._entityFilter.type==='label'?'selected':''}>Label</option>
+              <option value="group" ${this._entityFilter.type==='group'?'selected':''}>Group</option>
+              <option value="text" ${this._entityFilter.type==='text'?'selected':''}>Text</option>
+            </select>
+          </div>
+          ${this._entityFilter.type === 'label' ? `<div class="cpce-row"><select id="cpce-filter-label"><option value="">All Labels</option>${labels.map(l => `<option value="${escapeHtml(l)}" ${this._entityFilter.value===l?'selected':''}>${escapeHtml(l)}</option>`).join('')}</select></div>` : ''}
+          ${this._entityFilter.type === 'group' ? `<div class="cpce-row"><select id="cpce-filter-group"><option value="">All Groups</option>${groups.map(g => `<option value="${escapeHtml(g.id)}" ${this._entityFilter.value===g.id?'selected':''}>${escapeHtml(g.name)}</option>`).join('')}</select></div>` : ''}
+          ${this._entityFilter.type === 'text' ? `<div class="cpce-row"><input type="text" id="cpce-filter-text" placeholder="Filter text…" value="${escapeHtml(this._entityFilter.value)}"></div>` : ''}
+          <div class="cpce-entity-list" id="cpce-entity-list">${this._renderEntityListInner()}</div>
+          <div class="cpce-collapse-head${this._addedEntitiesCollapsed ? ' collapsed' : ''}" id="cpce-added-toggle"><ha-icon icon="mdi:chevron-down"></ha-icon>Default Entities (${(cfg.entities||[]).length})</div>
+          ${this._addedEntitiesCollapsed ? '' : `<div id="cpce-selected-list">${this._renderSelectedList()}</div>`}
+        `)}
+
+        ${this._section('mdi:tune-variant', 'Advanced Send Methods', 'options', `
+          <div class="cpce-hint">Send methods compensate for a specific <strong>controller's firmware</strong> — how it wants white color temperature delivered, and whether it needs a color and an effect sent separately. Because these depend on the physical light (and one button can drive several different fixtures), set a <strong>card default</strong> below, then override <strong>per light</strong> for any fixture that behaves differently.</div>
+
+          <div class="cpce-sub-title">Card Default — White Temperature Send Method</div>
+          <div class="cpce-hint">How a white color temperature is sent — applies to <strong>both</strong> the manual temperature slider and Custom Temperature buttons. Leave on <strong>Kelvin</strong> for most lights. If your controller (e.g. some RGBWW firmwares) shows the wrong color, try <strong>XY</strong>, or <strong>RGBWW</strong> if it has dedicated cold/warm white channels.</div>
+          ${[
+            ['kelvin', 'Kelvin', 'color_temp_kelvin — standard, correct for most lights'],
+            ['xy', 'XY', 'xy_color — accurate CIE white point'],
+            ['hs', 'HS', 'hs_color — hue/saturation'],
+            ['rgb', 'RGB', 'rgb_color — approximate white via RGB channels'],
+            ['rgbw', 'RGBW', 'rgbw_color — dedicated single white LED'],
+            ['rgbww', 'RGBWW', 'rgbww_color — dedicated cold + warm white LEDs'],
+          ].map(([val, label, desc]) => `
+            <label class="cpce-radio-row">
+              <input type="radio" name="cpce-temp-output-format" value="${val}" ${(cfg.temperature_output_format||'kelvin')===val?'checked':''}>
+              <span class="cpce-radio-label">${label}</span>
+              <span class="cpce-radio-desc">${desc}</span>
+            </label>
+          `).join('')}
+          <div class="cpce-hint">Note: XY / HS / RGB put the light in color mode approximating white. RGBW / RGBWW use the light's dedicated white LEDs (RGBWW mixes cold/warm based on your Min/Max Kelvin range). Home Assistant lights are in one color mode at a time — pick the method your controller's mode expects.</div>
+
+          <div class="cpce-sub-title">Card Default — Effect Send Method</div>
+          <div class="cpce-hint">For a button that sets <strong>both</strong> a color and an effect, choose how they're sent. Effects run on the bulb's own firmware (e.g. Zigbee identify / color-loop) — the card only sends the effect name; its speed isn't adjustable and most effects override the button's color.</div>
+          <div class="cpce-check"><input type="checkbox" id="cpce-effect-separate" ${cfg.effect_separate_call?'checked':''}><label for="cpce-effect-separate">Send effect in a separate command (color first, then effect)</label></div>
+          <div class="cpce-hint">Some controllers (e.g. Gledopto RGBWW via Zigbee2MQTT) re-trigger the effect from the color change when both are sent together, adding an extra flash. Turn this on to send them as two commands. Leave off (one command) for most lights.</div>
+
+          <div class="cpce-sub-title">Per-Light Overrides</div>
+          ${this._renderEntitySendMethods()}
+        `)}
+
+        ${this._section('mdi:movie-open-cog-outline', 'Scene Builder', 'scene-builder', `
+          <div class="cpce-hint">Build multi-light scenes here — capture per-light states into a Home Assistant scene. (Coming soon.)</div>
+        `)}
+
+        ${this._section('mdi:card-multiple-outline', 'Fixture Profile Library', 'profile-library', this._renderProfileLibrarySection())}
+
+        ${this._section('mdi:link-variant', 'Color Entities', 'color-entities', `
           <div class="cpce-hint">
-            Presets can link to <code>color.*</code> (Color helper) entities. On load, presets are
-            auto-matched to entities whose ID matches their slugified name (e.g. preset "Sunset" ↔
-            <code>color.sunset</code>). Saving a linked preset updates the entity via
-            <code>color.set_color</code> — deleting a preset never deletes its entity.
-            Legacy <code>input_color.*</code> helpers from older integration versions still work.
+            <code>color.*</code> (Color helper) entities store a reusable color/brightness. A button set to
+            <strong>Custom Color/Temperature</strong> can link to one — the button then applies that entity's
+            value <strong>live</strong> (edit it here, every linked button updates). Legacy <code>input_color.*</code> helpers still work.
           </div>
 
-          <div class="cpce-field-title">Create New Entity</div>
-          <div class="cpce-row">
-            <input type="text" id="cpce-new-input-color-name" placeholder="Entity name (e.g. Theater Golden)">
-            <button class="cpce-create-preset-btn" id="cpce-create-input-color-entity"><ha-icon icon="mdi:plus"></ha-icon> Create Entity</button>
-          </div>
-          <div class="cpce-hint">Creates a new <code>color</code> helper entity and, once confirmed, a new preset automatically linked to it. If the entity can't be created, no preset is created.</div>
+          <div class="cpce-collapse-head${this._ceCollapsed.manage ? ' collapsed' : ''}" data-ce-toggle="manage"><ha-icon icon="mdi:chevron-down"></ha-icon>Manage Entities (${this._allInputColorEntities.length})</div>
+          ${this._ceCollapsed.manage ? '' : this._renderColorEntitiesManageList()}
 
-          <div class="cpce-field-title">Unmatched Entities</div>
-          ${this._unmatchedInputColors.length
-            ? `<div class="cpce-unmatched-list">${this._unmatchedInputColors.map(id => `
-                <div class="cpce-unmatched-item">
-                  <span class="cpce-fav-swatch" style="background:${inputColorEntitySwatch(this._hass, id)};"></span>
-                  <span>${escapeHtml(friendlyName(this._hass, id))}</span>
-                  <span class="cpce-entity-id">${escapeHtml(id)}</span>
-                  <button class="cpce-create-preset-btn" data-entity="${escapeHtml(id)}"><ha-icon icon="mdi:plus"></ha-icon> Create Preset</button>
-                </div>
-              `).join('')}</div>`
-            : `<div class="cpce-hint">${this._allInputColorEntities.length ? 'Every Color Entity is linked to a preset.' : 'No color.* (Color helper) entities found on this system.'}</div>`}
-
-          <div class="cpce-manage-entities">
-            <div class="cpce-field-title">Delete Color Entities</div>
-            <div class="cpce-hint">
-              This deletes the Home Assistant entity itself (the <code>color</code> helper), not any
-              Preset. It is kept separate from Preset editing so a Preset can never accidentally delete an entity.
+          <div class="cpce-collapse-head${this._ceCollapsed.create ? ' collapsed' : ''}" data-ce-toggle="create"><ha-icon icon="mdi:chevron-down"></ha-icon>Create New Entity</div>
+          ${this._ceCollapsed.create ? '' : `
+            <div class="cpce-row">
+              <input type="text" id="cpce-new-input-color-name" placeholder="Entity name (e.g. Theater Golden)">
+              <button class="cpce-create-preset-btn" id="cpce-create-input-color-entity"><ha-icon icon="mdi:plus"></ha-icon> Create Entity</button>
             </div>
-            ${this._allInputColorEntities.length
-              ? `<div class="cpce-manage-list">${this._allInputColorEntities.map(id => `
-                  <div class="cpce-manage-item">
-                    <span class="cpce-fav-swatch" style="background:${inputColorEntitySwatch(this._hass, id)};"></span>
-                    <span>${escapeHtml(friendlyName(this._hass, id))}</span>
-                    <span class="cpce-entity-id">${escapeHtml(id)}</span>
-                    <button class="cpce-delete-entity-btn" data-entity="${escapeHtml(id)}" title="Delete entity"><ha-icon icon="mdi:delete-forever"></ha-icon></button>
-                  </div>
-                `).join('')}</div>`
-              : `<div class="cpce-hint">No Color Entities to delete.</div>`}
+            <div class="cpce-hint">Creates a new <code>color</code> helper entity and, once confirmed, a new preset automatically linked to it. If the entity can't be created, no preset is created.</div>`}
 
-            <div class="cpce-field-title">Clean Up Orphans</div>
+          <div class="cpce-collapse-head${this._ceCollapsed.orphans ? ' collapsed' : ''}" data-ce-toggle="orphans"><ha-icon icon="mdi:chevron-down"></ha-icon>Clean Up Orphans</div>
+          ${this._ceCollapsed.orphans ? '' : `
             <div class="cpce-hint">
               Older integration versions could leave behind orphaned color entities (ones "no longer
               provided by the integration") that Home Assistant won't let you delete normally. Scan for
               and remove any such orphaned <code>color.*</code> / <code>input_color.*</code> entities here.
             </div>
-            <button class="cpce-add-btn" id="cpce-cleanup-orphans"><ha-icon icon="mdi:broom"></ha-icon> Scan &amp; Remove Orphans</button>
-          </div>
+            <button class="cpce-add-btn" id="cpce-cleanup-orphans"><ha-icon icon="mdi:broom"></ha-icon> Scan &amp; Remove Orphans</button>`}
         `)}
 
-        ${this._section('mdi:lightbulb-multiple-outline', 'Preset Buttons', 'presets', `
-          <div class="cpce-hint">Configure the quick-select buttons. Use the color wheel for precise color selection.</div>
-          <div id="cpce-preset-list">${(cfg.presets||[]).map((p, i) => this._renderPresetEditor(p, i)).join('')}</div>
-          <button class="cpce-add-btn" id="cpce-add-preset"><ha-icon icon="mdi:plus"></ha-icon> Add Preset</button>
-        `)}
       </div>
     `;
     this._wireEvents();
@@ -4121,11 +5151,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
         if ('color' in p) map.name_color = p.color;
         patchSection(id, map);
       }, '#ffffff');
-      // Values-section "Monitored Lights" target picker (scoped to this panel).
-      this._wireTargetPicker(panel, (target) => {
-        patchSection(id, { target_entities: target === undefined ? [] : target });
-        this._render();
-      });
+      // Values-section "Monitored Lights" target picker (two-checkbox any-light model).
+      this._wireTargetPicker(panel,
+        () => this._orderedSectionsRaw().find(s => s.id === id) || {},
+        (patch) => { patchSection(id, patch); this._render(); });
     });
     // Remove a section. Guard: keep at least one buttons section (presets need a home).
     this.querySelectorAll('.cpce-order-remove').forEach(btn => {
@@ -4137,6 +5166,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           window.alert('Keep at least one Buttons section — presets need somewhere to display.');
           return;
         }
+        if (!this._confirmDelete(`Remove the “${(target && target.name) || 'section'}” section? This cannot be undone.`)) return;
         this._updateSections(all.filter(s => s.id !== id));
         this._render();
       };
@@ -4161,6 +5191,22 @@ class ColorLightManagerCardEditor extends HTMLElement {
       radio.addEventListener('change', () => { if (radio.checked) this._updateConfig({ temperature_output_format: radio.value }); });
     });
     bind('#cpce-temp-show-mired', 'temperature_show_mired');
+    // Card default effect timing — re-render so per-light "Card default (…)" labels update.
+    const effSepEl = this.querySelector('#cpce-effect-separate');
+    if (effSepEl) effSepEl.addEventListener('change', () => { this._updateConfig({ effect_separate_call: effSepEl.checked }); this._render(); });
+    // Per-light send-method overrides. Empty value clears the field (inherit card default);
+    // when a row has no overrides left, its entry is removed from entity_send_methods.
+    const patchEntitySend = (id, patch) => {
+      const map = { ...(this._config.entity_send_methods || {}) };
+      const cur = { ...(map[id] || {}) };
+      Object.keys(patch).forEach(k => { if (patch[k] === undefined) delete cur[k]; else cur[k] = patch[k]; });
+      if (Object.keys(cur).length) map[id] = cur; else delete map[id];
+      this._updateConfig({ entity_send_methods: map });
+    };
+    this.querySelectorAll('.cpce-esm-temp').forEach(sel => sel.addEventListener('change', () =>
+      patchEntitySend(sel.dataset.entity, { temperature_output_format: sel.value || undefined })));
+    this.querySelectorAll('.cpce-esm-effect').forEach(sel => sel.addEventListener('change', () =>
+      patchEntitySend(sel.dataset.entity, { effect_separate_call: sel.value === '' ? undefined : (sel.value === 'separate') })));
     this._wireSliderSections();
     bind('#cpce-cv-justify', 'current_values_justify');
     ['buttons', 'sliders', 'values'].forEach(key => {
@@ -4363,16 +5409,15 @@ class ColorLightManagerCardEditor extends HTMLElement {
             // null return it already surfaced the reason — so we simply create no preset.
             if (!entityId) return;
             if (nameInput) nameInput.value = '';
-            // Entity confirmed — create a preset auto-linked to it, seeded from the entity's state.
-            const state = this._hass && this._hass.states[entityId];
-            const value = inputColorStateToPresetValue(state);
+            // Entity confirmed — create a preset auto-LINKED to it. A linked button stores NO
+            // color of its own (the entity is the source of truth), so we don't copy values in.
             const presets = [...(this._config.presets || [])];
             presets.push({
               id: newPresetId(),
               name,
-              icon: 'mdi:lightbulb',
+              icon: modeDefaultIcon('color'),
+              mode: 'color',
               input_color_entity: entityId,
-              ...value,
             });
             this._openPreset = presets.length - 1;
             this._openSection = 'presets';
@@ -4391,15 +5436,14 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this.querySelectorAll('.cpce-create-preset-btn[data-entity]').forEach(btn => {
       btn.onclick = () => {
         const entityId = btn.dataset.entity;
-        const state = this._hass && this._hass.states[entityId];
-        const value = inputColorStateToPresetValue(state);
+        // Linked button stores NO color of its own — the entity is the source of truth.
         const presets = [...(this._config.presets || [])];
         presets.push({
           id: newPresetId(),
           name: friendlyName(this._hass, entityId),
-          icon: 'mdi:lightbulb',
+          icon: modeDefaultIcon('color'),
+          mode: 'color',
           input_color_entity: entityId,
-          ...value,
         });
         this._openPreset = presets.length - 1;
         this._openSection = 'presets';
@@ -4415,7 +5459,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this.querySelectorAll('.cpce-delete-entity-btn').forEach(btn => {
       btn.onclick = () => {
         const entityId = btn.dataset.entity;
-        if (!window.confirm(`Permanently delete the entity "${entityId}"? This does not affect any linked Preset, but the Preset will lose its sync link.`)) return;
+        if (!this._confirmDelete(`Permanently delete the entity "${entityId}"? Any button linked to it will apply no color until relinked or given an inline color.`)) return;
         btn.disabled = true;
         this._deleteColorEntity(entityId)
           .then(ok => {
@@ -4462,6 +5506,139 @@ class ColorLightManagerCardEditor extends HTMLElement {
       };
     }
 
+    // Color Entities — collapse toggles for the three sub-areas.
+    this.querySelectorAll('.cpce-collapse-head[data-ce-toggle]').forEach(head => {
+      head.onclick = () => { const k = head.dataset.ceToggle; this._ceCollapsed[k] = !this._ceCollapsed[k]; this._render(); };
+    });
+
+    // Color Entities — per-entity edit-panel toggle (pencil).
+    this.querySelectorAll('.cpce-ce-edit').forEach(btn => {
+      btn.onclick = () => { this._openColorEntity = this._openColorEntity === btn.dataset.entity ? null : btn.dataset.entity; this._render(); };
+    });
+
+    // Color Entities — per-entity edit panels: color wheel + hex + temp + brightness, each
+    // writing straight to the entity via set_color (linked buttons follow it live).
+    this.querySelectorAll('.cpce-ce-edit-panel').forEach(panel => {
+      const id = panel.dataset.entity;
+      const modeEl = panel.querySelector('.cpce-ce-mode');
+      if (modeEl) modeEl.addEventListener('change', () => {
+        if (modeEl.value === 'temp') {
+          const midK = Math.round(((Number(this._config.min_kelvin)||2000) + (Number(this._config.max_kelvin)||6500)) / 2);
+          this._writeEntityColorData(id, { color_temp_kelvin: midK });
+        } else {
+          this._writeEntityColorData(id, { rgb_color: inputColorStateToPresetValue(this._hass && this._hass.states[id]).rgb_color || [255, 0, 0] });
+        }
+        this._render();
+      });
+      // Color wheel + hex.
+      const canvas = panel.querySelector('.cpce-ce-wheel');
+      if (canvas) {
+        const cur = inputColorStateToPresetValue(this._hass && this._hass.states[id]);
+        const rgb0 = cur.rgb_color || [255, 255, 255];
+        const hs0 = ColorUtils.rgbToHs(rgb0[0], rgb0[1], rgb0[2]);
+        this._drawColorWheel(canvas, hs0[0], hs0[1]);
+        const cx = canvas.width / 2, cy = canvas.height / 2, radius = Math.min(cx, cy) - 4;
+        const fromWheel = (clientX, clientY) => {
+          const rect = canvas.getBoundingClientRect();
+          const px = (clientX - rect.left) * (canvas.width / rect.width) - cx;
+          const py = (clientY - rect.top) * (canvas.height / rect.height) - cy;
+          const dist = Math.min(Math.sqrt(px*px + py*py), radius);
+          let angle = Math.atan2(py, px) * 180 / Math.PI; if (angle < 0) angle += 360;
+          const rgb = ColorUtils.hsToRgb(Math.round(angle) % 360, Math.round((dist / radius) * 100));
+          this._writeEntityColorData(id, { rgb_color: rgb }, true);
+          const prev = panel.querySelector('.cpce-hex-preview'); const hexIn = panel.querySelector('.cpce-ce-hex');
+          const hex = ColorUtils.rgbToHex(rgb[0], rgb[1], rgb[2]);
+          if (prev) prev.style.background = hex; if (hexIn && document.activeElement !== hexIn) hexIn.value = hex;
+          const sw = this.querySelector(`.cpce-manage-item[data-entity="${id}"] .cpce-fav-swatch`); if (sw) sw.style.background = hex;
+          this._drawColorWheel(canvas, ColorUtils.rgbToHs(rgb[0],rgb[1],rgb[2])[0], ColorUtils.rgbToHs(rgb[0],rgb[1],rgb[2])[1]);
+        };
+        const startDrag = () => { this._ceWheelDragging = true; };
+        const endDrag = () => { this._ceWheelDragging = false; this._render(); };
+        canvas.addEventListener('mousedown', (e) => { e.preventDefault(); startDrag(); fromWheel(e.clientX, e.clientY); });
+        window.addEventListener('mousemove', (e) => { if (this._ceWheelDragging) fromWheel(e.clientX, e.clientY); });
+        window.addEventListener('mouseup', () => { if (this._ceWheelDragging) endDrag(); });
+        canvas.addEventListener('touchstart', (e) => { startDrag(); fromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
+        window.addEventListener('touchmove', (e) => { if (this._ceWheelDragging) fromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
+        window.addEventListener('touchend', () => { if (this._ceWheelDragging) endDrag(); });
+      }
+      const hexEl = panel.querySelector('.cpce-ce-hex');
+      if (hexEl) hexEl.addEventListener('change', () => { const rgb = ColorUtils.hexToRgb(hexEl.value); if (rgb) { this._writeEntityColorData(id, { rgb_color: rgb }); this._render(); } });
+      const tempEl = panel.querySelector('.cpce-ce-temp'); const tempVal = panel.querySelector('.cpce-temp-val');
+      if (tempEl) { tempEl.addEventListener('input', () => { if (tempVal) tempVal.textContent = `${tempEl.value}K`; }); tempEl.addEventListener('change', () => this._writeEntityColorData(id, { color_temp_kelvin: parseInt(tempEl.value,10) })); }
+      const briEn = panel.querySelector('.cpce-ce-bri-enable');
+      if (briEn) briEn.addEventListener('change', () => {
+        const cur = inputColorStateToPresetValue(this._hass && this._hass.states[id]);
+        this._writeEntityColorData(id, { brightness: briEn.checked ? (cur.brightness ?? 255) : null });
+        this._render();
+      });
+      const briEl = panel.querySelector('.cpce-ce-bri'); const briVal = panel.querySelector('.cpce-bri-val');
+      if (briEl) { briEl.addEventListener('input', () => { if (briVal) briVal.textContent = `${briEl.value}%`; }); briEl.addEventListener('change', () => this._writeEntityColorData(id, { brightness: Math.round(clamp(parseInt(briEl.value,10)||1,1,100)*2.55) })); }
+    });
+
+    // Fixture Profile Library (single shared 'system' store): rename, delete.
+    this.querySelectorAll('.cpce-profile-rename').forEach(inp => {
+      inp.addEventListener('change', () => {
+        const slug = inp.dataset.slug;
+        const map = { ...fixtureLibraryMap('system') };
+        if (!map[slug]) return;
+        map[slug] = { ...map[slug], name: inp.value || slug };
+        saveFixtureLibrary(this._hass, 'system', map).catch(e => console.warn(`${LOG_PREFIX} rename profile failed`, e));
+      });
+    });
+    this.querySelectorAll('.cpce-profile-lib-delete').forEach(btn => {
+      btn.onclick = () => {
+        const slug = btn.dataset.slug;
+        const used = (this._config.presets || []).some(p => fixtureRefSlug(p && p.profile_ref) === slug);
+        const msg = used
+          ? `Delete profile "${slug}" from the library? Buttons referencing it will fall back to their inline values.`
+          : `Delete profile "${slug}" from the library?`;
+        if (!this._confirmDelete(msg)) return;
+        const map = { ...fixtureLibraryMap('system') };
+        delete map[slug];
+        saveFixtureLibrary(this._hass, 'system', map)
+          .then(() => this._render())
+          .catch(e => { console.warn(`${LOG_PREFIX} delete profile failed`, e); window.alert(`Could not delete: ${formatWsError(e)}`); });
+      };
+    });
+    // Toggle a library profile's inline edit panel.
+    this.querySelectorAll('.cpce-profile-edit').forEach(btn => {
+      btn.onclick = () => { this._openProfile = this._openProfile === btn.dataset.slug ? null : btn.dataset.slug; this._render(); };
+    });
+    // Create a new profile (opens its editor).
+    const addProfileBtn = this.querySelector('#cpce-add-profile');
+    if (addProfileBtn) addProfileBtn.onclick = () => this._addFixtureProfile();
+    // Library profile edit-panel field wiring (writes straight to the shared library).
+    this.querySelectorAll('.cpce-profile-edit-panel').forEach(panel => {
+      const slug = panel.dataset.slug;
+      const q = (sel) => panel.querySelector(sel);
+      const modeEl = q('.cpce-pe-mode');
+      if (modeEl) modeEl.addEventListener('change', () => {
+        const map = { ...fixtureLibraryMap('system') };
+        const e = map[slug]; if (!e) return;
+        const look = { ...(e.look || {}) };
+        ALL_PRESET_COLOR_KEYS.forEach(k => delete look[k]); delete look.color_kelvin; delete look.action; delete look.look_none;
+        const midK = Math.round(((Number(this._config.min_kelvin)||2000) + (Number(this._config.max_kelvin)||6500)) / 2);
+        if (modeEl.value === 'temp') look.color_kelvin = midK;
+        else { const rgb = presetColorToRgb(e.look || {}); look.rgb_color = rgb; }  // keep current color as rgb
+        map[slug] = { ...e, look };
+        saveFixtureLibrary(this._hass, 'system', map).then(() => this._render()).catch(() => this._render());
+      });
+      // Color wheel + hex + native fields (same UI as a Custom Color button).
+      this._wireProfileColorWheel(panel, slug);
+      const tempEl = q('.cpce-pe-temp'); const tempVal = q('.cpce-temp-val');
+      if (tempEl) { tempEl.addEventListener('input', () => { if (tempVal) tempVal.textContent = `${tempEl.value}K`; }); tempEl.addEventListener('change', () => this._patchProfileLook(slug, { color_kelvin: parseInt(tempEl.value,10) })); }
+      const briEn = q('.cpce-pe-bri-enable');
+      if (briEn) briEn.addEventListener('change', () => { this._patchProfileLook(slug, { brightness: briEn.checked ? (((fixtureLibraryMap('system')[slug]||{}).look||{}).brightness ?? 255) : null }); this._render(); });
+      const briEl = q('.cpce-pe-bri'); const briVal = q('.cpce-bri-val');
+      if (briEl) { briEl.addEventListener('input', () => { if (briVal) briVal.textContent = `${briEl.value}%`; }); briEl.addEventListener('change', () => this._patchProfileLook(slug, { brightness: Math.round(clamp(parseInt(briEl.value,10)||1,1,100)*2.55) })); }
+      const trEn = q('.cpce-pe-trans-enable');
+      if (trEn) trEn.addEventListener('change', () => { this._patchProfileLook(slug, { transition: trEn.checked ? (((fixtureLibraryMap('system')[slug]||{}).look||{}).transition ?? 1) : null }); this._render(); });
+      const trEl = q('.cpce-pe-trans'); const trVal = q('.cpce-transition-val');
+      if (trEl) { trEl.addEventListener('input', () => { if (trVal) trVal.textContent = `${trEl.value}s`; }); trEl.addEventListener('change', () => this._patchProfileLook(slug, { transition: clamp(parseFloat(trEl.value)||0,0,10) })); }
+      const efEl = q('.cpce-pe-effect');
+      if (efEl) efEl.addEventListener('change', () => this._patchProfileLook(slug, { effect: efEl.value.trim() || null }));
+    });
+
     // Presets
     this._attachPresetListeners();
     const addBtn = this.querySelector('#cpce-add-preset');
@@ -4471,7 +5648,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // Adds a new preset, optionally creating and linking a new input_color entity
   // for it when the user opts in.
   _addNewPreset() {
-    const newPreset = { id: newPresetId(), name: 'New Preset', icon: 'mdi:lightbulb', rgb_color: [255, 0, 0] };
+    const newPreset = { id: newPresetId(), name: 'New Preset', icon: modeDefaultIcon('color'), mode: 'color', rgb_color: [255, 0, 0] };
 
     const finish = (preset) => {
       const presets = [...(this._config.presets || []), preset];
