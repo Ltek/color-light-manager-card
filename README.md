@@ -1,86 +1,89 @@
-# Color Light Manager — Control & Management Features
+# Color Light Manager Card
 
-A Home Assistant custom Lovelace card for controlling colored lights (color, temperature, brightness) in real time, with preset buttons, scene triggering, and management of the entities that back it. This document covers the functional/control features — not the visual styling options.
-
----
-
-## Entities
-
-**Manage Card Entities** defines the pool of `light.*` entities the card works with. Everything else (presets, sliders, color-value readouts) targets a subset of this pool.
-
-- Search/filter available lights and add each with a `+`.
-- Each entity shows its **supported color modes** (e.g. `color_temp`, `xy`, `rgb`) as chips, so you know what each light natively accepts.
-- The "Added Entities" list is collapsible (for large setups).
-
-## Scenes (Scene Manager)
-
-**Scene Manager** defines a pool of `scene.*` entities available to presets — mirroring the entity manager.
-
-- Search/add scenes; presets can then trigger one or more of them.
-- Triggering calls `scene.turn_on`.
+A Home Assistant Dashboard **custom card** for controlling colored lights (color / temperature / RGB / RGBWW) in real time — with mode-driven preset buttons, reusable **Fixture Profiles**, live-linked **Color Entities**, per-light send-method tuning, and a full visual editor.
 
 ---
 
-## Sliders (real-time control)
+## Requirements
 
-Sliders send live changes to their target light(s) as you drag.
+The card works on its own for buttons, sliders, and scenes. Two features build on the **Color helper integration** (the `color` domain) by [@kkilchrist](https://github.com/kkilchrist/ha-color-ext): **Color Entities** (a button following a shared, live color) and **exact color round-trip**.
 
-- **Brightness**, **Color Temperature**, and **RGB** sliders.
-- **Multiple independent Slider Sections** — each section picks which of the three sliders it shows and targets its own entity subset, so one card can control different lights separately.
-- **Smoothing (debounce)** rate-limits service calls during a drag; the handle itself tracks the pointer smoothly (rAF-coalesced) and won't bounce back after release (settle guard ignores stale/in-transition HA states briefly).
-- Shared styling across slider sections (orientation, size, handle, text placement/color).
+- Repo: **https://github.com/kkilchrist/ha-color-ext**
+- Install via **HACS → Integrations → Custom repositories** → add that repo as an *Integration* → install → restart Home Assistant.
+- **v0.3.0+ recommended** — it adds the `color_params` / `source` / `source_type` attributes the card reads for exact color (no lossy xy→rgb drift). Older versions and legacy `input_color.*` helpers still work via a fallback path.
 
-## Color Value Readout
-
-A read-only **Color Values** section shows a target light's current values — **RGB, Kelvin, HS, XY**, plus **W / CW / WW** when the light supports RGBW/RGBWW. Useful for reading a dialed-in color to save into a preset. Each Color Values section monitors its own chosen light(s). Optional mired display alongside Kelvin.
+Not using Color Entities? The integration is optional — buttons with an inline Custom Color/Temperature need nothing extra.
 
 ---
 
-## Preset Buttons
+## Installation
 
-Presets are the core control feature. Each preset button is an **additive bundle of actions**, all fired in parallel on press:
-
-### 1. Color / Temperature / Off (the primary action)
-- **Color** — stored and sent in one **native format**: RGB, XY, HS, RGBW, or RGBWW. The value is sent verbatim (no lossy conversion), so precise typed values stay exact. Formats a target light supports natively are tagged **(native)**; others still work (HA converts them).
-- **Temperature** — a Kelvin value.
-- **Off** — turns the color-control lights off.
-- Optional **brightness** (independent toggle; when off, the light's current brightness is left unchanged).
-
-### 2. Color Control Lights (target)
-Which lights get the color/temp/off action:
-- **All** card entities, **Specific** entities (chips), or **None** (send no color — for scene-only or turn-off-only buttons).
-
-### 3. Trigger Scenes
-Select one or more scenes (from Scene Manager) to activate on press.
-
-### 4. Turn Off These
-Select card entities to turn **off** on press — independent of the color-control lights (e.g. set an accent color on one light while turning others off).
-
-> A single preset can, for example: set XY color on the accent lights, turn off the ceiling lights, and activate a "movie" scene — all at once.
-
-### Presets ↔ Color Entities
-Presets can **link to an `input_color.*` helper entity** as a persistent store of their color values:
-- On link, the preset **reads** the entity's current values.
-- Edits are held locally; **"Save to Entity"** writes them back on demand. Unsaved edits revert when the preset editor closes — the entity stays the source of truth, so a deleted/recreated button recovers its values from the entity.
-- A link-status icon shows linked (and flags broken links to missing entities).
-
-## White Color Temperature — Send Method
-
-Because some controllers mishandle standard `color_temp_kelvin`, the card can send a white temperature as any of: **Kelvin** (default), **XY**, **HS**, **RGB**, **RGBW**, or **RGBWW**. Applies to both the temperature slider and Temperature presets. Use **XY** (or RGBWW for dedicated cold/warm channels) if your controller renders whites wrong on Kelvin.
+1. Copy `color-light-manager-card.js` into your Home Assistant `config/www/` folder.
+2. Add it as a dashboard resource:
+   - **Settings → Dashboards → ⋮ → Resources → Add Resource**
+   - URL: `/local/color-light-manager-card.js`  ·  Type: **JavaScript Module**
+3. Hard-refresh the browser (Ctrl/Cmd+Shift+R). Confirm the console shows the loaded version, e.g. `[v2026.08.21.86]`.
+4. Add the card to a dashboard: **Add Card → Custom: Color Light Manager** (or `type: custom:color-light-manager-card`).
 
 ---
 
-## Manage HA's Color Entities
+## Concepts
 
-Direct management of `input_color.*` helper entities from the card:
-- **Create** a new Color Entity (drives the integration's config flow) and auto-link a preset to it.
-- **Delete** an entity (removes the config entry and its registry entry).
-- **Create Preset** from an unmatched entity.
-- **Scan & Remove Orphans** — cleans up orphaned color entities the integration can leave behind.
+- **Default Entities** — an optional shared pool of `light.*` entities. Each button/section can include this pool **live** (changes propagate instantly) and/or add its own lights. It's also the reference set the card glow / header icon follow, and where per-light Send Methods are configured. It can be left empty — every button can target its own lights instead.
+- **Buttons** — each has a **Mode** that decides what it does: **Light Off**, **Fixture Profile**, **Scene**, **Custom Temperature**, or **Custom Color**. Only the settings relevant to the mode are shown.
+- **Fixture Profiles** — reusable "looks" (color/temperature + brightness/transition/effect) stored in a shared library. A button set to *Fixture Profile* references one; editing the profile updates every button using it.
+- **Color Entities** — `color.*` helper entities that store a color/brightness. A button linked to one holds **no color of its own** and applies the entity's value **live** — edit the entity once and every linked button follows.
 
-## Sections & Targeting Model
+---
 
-The card body is an ordered list of user-defined **sections** — Buttons, Sliders, and Color Values — each nameable, reorderable, and independently targetable:
-- Multiple Buttons sections; each preset chooses which section it appears in.
-- Multiple Slider sections and Color Values sections, each with its own target entities.
-- Any action's target is always intersected with the card's managed entities.
+## Features
+
+### Live card (control)
+- **Mode-driven preset buttons** — Light Off · Fixture Profile · Scene · Custom Temperature · Custom Color. A button additively fires: its color/temp on its target lights, any triggered scenes, and a turn-off set.
+- **Per-button targeting** — combine the live Default Entities pool with the button's own lights (any `light.*`), or neither for a scene/turn-off-only button.
+- **Sliders** (real-time) — Brightness, Color Temperature, RGB. Multiple independent slider sections, each targeting its own lights; debounced sends with a smooth, non-bouncing handle.
+- **Color Values** — a read-only readout of a light's current RGB / Kelvin / HS / XY (plus W / CW / WW for RGBW/RGBWW), handy for dialing in a color.
+- **Scenes** — any button can trigger one or more `scene.*` (chosen directly, no pre-registration).
+- **Scratchpad** — a temporary, browser-local strip for stashing colors you're experimenting with.
+
+### Fixture Profile Library
+- Create, name, edit, and delete reusable profiles in one place (**Entity & Profile Management → Fixture Profile Library**).
+- Full inline editor per profile: color wheel + native format fields, or temperature, plus brightness, transition, and effect.
+- Shared across **all** Color Light Manager cards on the instance via Home Assistant's built-in frontend store — one edit updates every referencing button live. No custom component required.
+
+### Color Entities (needs the Color integration)
+- Manage `color.*` helpers from the card: **create**, **edit** (color wheel / temperature / brightness, written via `color.set_color`), **rename**, **delete**, and clean up orphans — each row collapsible.
+- A button in Custom Color/Temperature mode can **link** to an entity; it then applies that entity's value in real time and its own inline editors are hidden (the entity is the single source of truth — no drift).
+- **Exact color** — with Color integration v0.3.0+ the card reads the entity's authored value (`color_params`) and sends it in its **native format** (xy stays xy, etc.), eliminating the lossy xy→rgb round-trip.
+
+### Send Methods (per controller)
+- **White Temperature Send Method** — send a color temperature as `color_temp_kelvin` (default) or as `xy` / `hs` / `rgb` / `rgbw` / `rgbww`, for controllers whose native temperature handling is wrong.
+- **Effect Send Method** — for a button carrying both a color and an effect, send them together (default) or as two separate `light.turn_on` calls (fixes controllers that re-trigger the effect off the color change, e.g. Gledopto via Zigbee2MQTT).
+- **Per-light overrides** — set a card default, then override either method **per light**. At press time the card resolves the method per target entity and groups service calls accordingly, so one button can correctly drive mixed fixtures at once.
+
+### Card & button appearance (visual editor)
+- Grouped editor: **Card Builder** (layout, appearance, dividers, scratchpad), **Section Builder** (Buttons, Sliders, Color Values), and **Entity & Profile Management** (Default Entities, Send Methods, Scene Builder, Profile Library, Color Entities).
+- Button styling — solid / tinted, border, glow, size, icon, per-mode default icons; optional per-button custom styling color with a "copy from another button" picker.
+- Card title, icon, collapsible header, background, border (per-side), glow, and drop shadow.
+- **Glow & header icon color** can follow the light's live color, the **last-pressed button's** color, or a fixed color.
+- Linkage badges on each button (Color Entity / Fixture Profile / Scene), and per-light color-mode chips in the entity list.
+
+---
+
+## Notes & limitations
+
+- **Effects run on the bulb's firmware.** The card only sends the effect *name* from a light's `effect_list`; it can't set effect speed/intensity (Home Assistant's `light.turn_on` has no such parameter). Many effects also override the button's color. Some effects (e.g. Zigbee "identify" effects like `breathe`) are fixed-timing pulses — nothing card-side can smooth them.
+- **A linked button stores no color** — deleting its Color Entity leaves it applying no color until relinked or given an inline color.
+- **Scratchpad** colors are browser-local and not synced across devices.
+- **Fixture Profile slugs are internal.** A profile's storage key stays fixed when you rename it (so references never break); it isn't an entity and can't be used from automations/scripts.
+
+---
+
+## Version
+
+Build number format: `v<year>.<month>.<day>.<increment>` — the trailing increment is a monotonic version counter that never resets. It's defined once at the top of `color-light-manager-card.js` (`BUILD_NUMBER`) and shown in the editor header and browser console on load.
+
+## Credits
+
+- Card: **LTek** — [github.com/Ltek/color-light-manager-card](https://github.com/Ltek/color-light-manager-card)
+- Color helper integration: **[@kkilchrist](https://github.com/kkilchrist/ha-color-ext)** — [ha-color-ext](https://github.com/kkilchrist/ha-color-ext)
