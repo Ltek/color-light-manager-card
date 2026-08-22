@@ -1,19 +1,19 @@
 // ============================================================================
-// Color Light Manager for Home Assistant
+// Color Light & Scene Manager for Home Assistant
 //
-// Create Fixture Profiles & Dashboard controls, and manage Color entities — all from a
-// single GUI-driven UI, backed by the Color helper (the `color` domain; legacy
-// `input_color.*` entities are still supported for existing configs).
+// Control colored lights and author Home Assistant scenes — with reusable Fixture Profiles,
+// live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
+// domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.08.21.86
+// Version: v2026.08.22.98
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.08.21.86';
-const CARD_NAME = 'Color Light Manager';
+const BUILD_NUMBER = 'v2026.08.22.98';
+const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
 
@@ -212,6 +212,35 @@ function getLightEntities(hass) {
 function getSceneEntities(hass) {
   if (!hass || !hass.states) return [];
   return Object.keys(hass.states).filter(id => id.startsWith('scene.')).sort();
+}
+
+// ---- Scene capture: per-domain settable-attribute whitelist ----
+// A Home Assistant scene stores {entity_id: {state, ...attributes}} and restores it via each
+// domain's reproduce_state. We must capture ONLY attributes a domain can actually accept back —
+// blindly copying every attribute (supported_features, friendly_name, all three color formats
+// at once, etc.) makes HA reject or misapply the scene. This whitelist mirrors what the core
+// domains' reproduce_state supports. `light` is handled specially (native color format).
+const SCENE_CAPTURE_DOMAINS = {
+  light:        ['brightness', 'effect', 'color_temp_kelvin', 'rgb_color', 'rgbw_color', 'rgbww_color', 'xy_color', 'hs_color'],
+  switch:       [],
+  fan:          ['percentage', 'preset_mode', 'oscillating', 'direction'],
+  cover:        ['current_position', 'current_tilt_position'],
+  climate:      ['temperature', 'target_temp_low', 'target_temp_high', 'hvac_mode', 'fan_mode', 'preset_mode', 'swing_mode', 'humidity'],
+  media_player: ['volume_level', 'source', 'sound_mode'],
+  input_boolean:[],
+  input_number: [],
+  input_select: [],
+  select:       [],
+  lock:         [],
+  humidifier:   ['humidity', 'mode'],
+};
+function sceneDomainOf(entityId) { return String(entityId || '').split('.')[0]; }
+function sceneDomainSupported(entityId) { return Object.prototype.hasOwnProperty.call(SCENE_CAPTURE_DOMAINS, sceneDomainOf(entityId)); }
+// Entities eligible to be added to a scene capture set — those whose domain we can safely
+// snapshot. Sorted by friendly name for the picker.
+function getSceneCapturableEntities(hass) {
+  if (!hass || !hass.states) return [];
+  return Object.keys(hass.states).filter(sceneDomainSupported).sort();
 }
 function friendlyName(hass, entityId) {
   const st = hass && hass.states && hass.states[entityId];
@@ -505,11 +534,18 @@ function buttonMode(preset) {
 const MODE_DEFAULT_ICON = {
   off: 'mdi:lightbulb-off',
   profile: 'mdi:palette-swatch',
-  scene: 'mdi:palette',
+  scene: 'mdi:ticket',
   temp: 'mdi:thermometer',
   color: 'mdi:palette-outline',
 };
 function modeDefaultIcon(mode) { return MODE_DEFAULT_ICON[mode] || 'mdi:lightbulb'; }
+// Normalize a user-typed icon: a bare name with no namespace assumes the `mdi:` set (the HA
+// default). Prefixed icons (mdi:/si:/hass:/custom sets) are left untouched. Empty → ''.
+function normalizeIcon(icon) {
+  const s = String(icon || '').trim();
+  if (!s) return '';
+  return s.includes(':') ? s : `mdi:${s}`;
+}
 // Icons we treat as "not user-customized" — the generic old defaults plus every mode default.
 // A preset carrying one of these gets the CURRENT mode's default at render time, so buttons
 // created before per-mode icons (all saved as mdi:lightbulb) still reflect their Mode.
@@ -518,7 +554,7 @@ const GENERIC_DEFAULT_ICONS = new Set(['mdi:lightbulb', 'mdi:lightbulb-off', ...
 // otherwise the default glyph for its mode.
 function resolvePresetIcon(preset, mode) {
   const icon = preset && preset.icon;
-  if (icon && !GENERIC_DEFAULT_ICONS.has(icon)) return icon;
+  if (icon && !GENERIC_DEFAULT_ICONS.has(icon)) return normalizeIcon(icon);   // bare name → mdi:
   return modeDefaultIcon(mode || buttonMode(preset));
 }
 // Resolves a preset's color-control targeting mode: 'all' | 'specific' | 'none'.
@@ -567,6 +603,9 @@ function newSectionId(prefix) { SECTION_UID += 1; return `${prefix}-${Date.now()
 // resolved duplicates to the first match). The counter guarantees uniqueness.
 let PRESET_UID = 0;
 function newPresetId() { PRESET_UID += 1; return `p-${Date.now().toString(36)}${PRESET_UID}`; }
+// Unique id for a new HA scene config (the scene config API keys scenes by an opaque id string).
+let SCENE_UID = 0;
+function newSceneConfigId() { SCENE_UID += 1; return `${Date.now()}${SCENE_UID}`; }
 // Returns presets with any duplicate/missing ids reassigned to fresh unique ones, so
 // per-button lookups (glow, click) resolve to the right preset.
 function dedupePresetIds(presets) {
@@ -576,6 +615,35 @@ function dedupePresetIds(presets) {
     if (!p || !p.id || seen.has(p.id)) { const np = { ...p, id: newPresetId() }; seen.add(np.id); return np; }
     seen.add(p.id); return p;
   });
+}
+
+// Migrate legacy additive buttons to the single-purpose model (v91). Buttons used to be able to
+// ALSO trigger scenes / turn off a set, regardless of mode. Now a button does one thing. We:
+//   - auto-convert an unambiguous scene-only button (Scene mode or look_none, no color/off,
+//     exactly one scene in `scenes`) into mode:'scene' + scene_ref — so it keeps working;
+//   - otherwise LEAVE the legacy `scenes` / `turn_off_entities` data in place (never destroyed)
+//     but the runtime no longer fires it. Returns { presets, affected: [names] } where affected
+//     lists buttons whose additive behavior was dropped (for a one-time notice).
+function migrateLegacyButtonActions(presets) {
+  if (!Array.isArray(presets)) return { presets, affected: [] };
+  const affected = [];
+  const out = presets.map(p => {
+    if (!p) return p;
+    const hasScenes = Array.isArray(p.scenes) && p.scenes.length;
+    const hasOff = Array.isArray(p.turn_off_entities) && p.turn_off_entities.length;
+    if (!hasScenes && !hasOff) return p;
+    const mode = buttonMode(p);
+    // Unambiguous scene-only button → promote to Scene mode with its single scene.
+    if (!p.scene_ref && (mode === 'scene') && hasScenes && p.scenes.length === 1 && !hasOff) {
+      const np = { ...p, mode: 'scene', scene_ref: p.scenes[0], look_none: true };
+      return np;
+    }
+    // Anything else: the additive part is no longer honored. Flag it (once) if it actually did
+    // something beyond its mode (i.e. it wasn't already a pure scene button we converted).
+    affected.push(p.name || p.id);
+    return p;
+  });
+  return { presets: out, affected };
 }
 
 // ============================================================================
@@ -989,6 +1057,9 @@ class ColorLightManagerCard extends HTMLElement {
     this._config = { ...ColorLightManagerCard.getStubConfig(), ...config };
     // Heal any duplicate preset ids from older builds (they broke per-button glow lookups).
     this._config.presets = dedupePresetIds(this._config.presets);
+    // v91: single-purpose buttons — auto-convert scene-only buttons; legacy additive scene/off
+    // data is preserved but no longer fired at runtime.
+    this._config.presets = migrateLegacyButtonActions(this._config.presets).presets;
     DEBUG = this._config.debug || false;
     // Collapsible cards start collapsed. Resolve the initial state only once so a later
     // config round-trip (or hass update) doesn't re-collapse a card the user has expanded.
@@ -1130,14 +1201,26 @@ class ColorLightManagerCard extends HTMLElement {
     });
   }
 
-  // A preset is an additive bundle of actions, all fired in parallel on press:
-  //   1. color/temp OR off — on its Color Control Lights (unless target mode is None)
-  //   2. activate any linked Scenes (scene.turn_on)
-  //   3. turn off its Turn-Off entity set (light.turn_off)
+  // A button does ONE thing, decided by its Mode (single-purpose model):
+  //   scene   → activate one HA scene (scene.turn_on on scene_ref)
+  //   off     → turn its target lights off
+  //   profile/color/temp → apply the resolved look to its target lights
+  // To combine actions (dim + turn off others + close blinds), build a Scene and use Scene mode.
+  // Legacy additive fields (scenes[]/turn_off_entities[]) are preserved in config but NOT fired.
   _applyPreset(rawPreset) {
     if (!rawPreset) return;
-    // Resolve the look from a referenced library profile (if any) before applying. Targets,
-    // scenes, and turn-off set stay on the raw preset (button-owned); only the look resolves.
+
+    // Scene mode: fire exactly the referenced scene, nothing else.
+    if (buttonMode(rawPreset) === 'scene') {
+      const scene = rawPreset.scene_ref;
+      if (!scene) return;
+      if (!this._hass || !this._hass.states[scene]) { console.warn(`[ColorLightManagerCard] scene ${scene} not found`); return; }
+      this._hass.callService('scene', 'turn_on', { entity_id: scene })
+        .catch(e => console.warn('[ColorLightManagerCard] scene.turn_on failed', e));
+      return;
+    }
+
+    // Resolve the look from a referenced library profile / linked entity before applying.
     const preset = this._effectivePreset(rawPreset);
 
     // Optional profile-style extras applied alongside the color action:
@@ -1176,19 +1259,6 @@ class ColorLightManagerCard extends HTMLElement {
         });
       }
     }
-
-    // 2. Activate scenes (button-owned; each button picks any scene.* directly — there's no
-    // card-level scene pool to validate against). Fire only entities that still exist.
-    (rawPreset.scenes || []).forEach(scene => {
-      if (!this._hass) return;
-      if (!this._hass.states[scene]) { console.warn(`[ColorLightManagerCard] scene ${scene} not found`); return; }
-      this._hass.callService('scene', 'turn_on', { entity_id: scene })
-        .catch(e => console.warn('[ColorLightManagerCard] scene.turn_on failed', e));
-    });
-
-    // 3. Turn off the preset's turn-off set (button-owned; limited to the card's entities).
-    const offIds = this._targetIds(rawPreset.turn_off_entities).filter(id => (rawPreset.turn_off_entities || []).includes(id));
-    if (offIds.length) this._callLightService('turn_off', {}, offIds);
   }
 
   _setBrightness(pct, ids) {
@@ -2306,6 +2376,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this._addedScenesCollapsed = true;   // "Added Scenes" list starts collapsed
     this._openProfile = null;            // slug of the library profile whose editor is open
     this._openColorEntity = null;        // entity_id whose inline edit panel is open (Color Entities)
+    this._openScene = null;              // scene.* entity_id whose edit panel is open
+    this._sceneConfigCache = {};         // scene entity_id -> fetched {name, entities} config (+ _dirty edits)
+    this._sceneCaptureSet = null;        // entity_ids to include in the next capture (null = seed from Default Entities)
+    this._sceneListCollapsed = true;     // Scene Manager "Your Scenes" list starts collapsed
+    this._sceneCreateCollapsed = true;   // Scene Manager "Create a Scene" sub-area starts collapsed
     // Collapse state for the Color Entities sub-areas (they can get long with many entities).
     this._ceCollapsed = { manage: false, create: true, orphans: true };
     this._unmatchedInputColors = [];
@@ -2361,6 +2436,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
   setConfig(config) {
     this._config = { ...ColorLightManagerCard.getStubConfig(), ...config };
     this._config.presets = dedupePresetIds(this._config.presets);
+    // v91 migration: convert scene-only buttons, flag any whose additive scene/turn-off behavior
+    // is no longer fired (shown once as a dismissible notice).
+    const mig = migrateLegacyButtonActions(this._config.presets);
+    this._config.presets = mig.presets;
+    if (mig.affected.length && this._legacyActionNotice === undefined) this._legacyActionNotice = mig.affected;
     if (this._skipNextRender) { this._skipNextRender = false; return; }
     if (this._hass) this._syncInputColorMatches();
     this._render();
@@ -3449,6 +3529,36 @@ class ColorLightManagerCardEditor extends HTMLElement {
     </div>`;
   }
 
+  // Search-as-you-type picker for a large entity list, backed by a native <datalist>. The user
+  // types (matching name OR id) and picks; `inputCls` is the text input's class and `listId`
+  // the datalist id (must be unique per instance). Wiring reads the input's value → id.
+  // A search-as-you-type picker that works on ALL platforms (no <datalist> — it silently fails
+  // on mobile Safari/Chrome). Renders a filter input plus a scrollable list of clickable rows;
+  // typing filters the rows live in JS (matching name OR id). Clicking a row calls the wired
+  // add handler. `pickerCls` marks the wrapper so wiring can scope to it.
+  _renderEntitySearchPicker(candidates, chosen, pickerCls, placeholder) {
+    const remaining = (candidates || []).filter(id => !(chosen || []).includes(id));
+    return `<div class="cpce-search-picker ${pickerCls}">
+      <input type="text" class="cpce-sp-input" placeholder="${placeholder}" autocomplete="off">
+      <div class="cpce-sp-list">
+        ${remaining.map(id => `<div class="cpce-sp-item" data-id="${escapeHtml(id)}" data-search="${escapeHtml((friendlyName(this._hass, id) + ' ' + id).toLowerCase())}"><span class="cpce-sp-name">${escapeHtml(friendlyName(this._hass, id))}</span><span class="cpce-entity-id">${escapeHtml(id)}</span></div>`).join('')}
+        ${remaining.length ? '' : '<div class="cpce-hint" style="padding:8px;">Nothing left to add.</div>'}
+      </div>
+    </div>`;
+  }
+  // Wires a search picker: live filtering of its rows + onPick(id) when a row is clicked.
+  _wireEntitySearchPicker(root, pickerCls, onPick) {
+    const picker = root.querySelector(`.${pickerCls}`);
+    if (!picker) return;
+    const input = picker.querySelector('.cpce-sp-input');
+    const items = [...picker.querySelectorAll('.cpce-sp-item')];
+    if (input) input.addEventListener('input', () => {
+      const q = input.value.trim().toLowerCase();
+      items.forEach(it => { it.style.display = (!q || it.dataset.search.includes(q)) ? '' : 'none'; });
+    });
+    items.forEach(it => it.addEventListener('click', () => onPick(it.dataset.id)));
+  }
+
   // Target-lights picker for a slider/values section — SAME model as buttons: two checkboxes
   // (Default Entities pool ∪ this section's own any-light list). `section` is the section
   // object; `dataAttr` carries data-ss-target / data-vs-target so wiring can route the update.
@@ -3495,7 +3605,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         </div>
         ${linkedExists
           ? `<div class="cpce-row"><label class="lbl">Live Value</label><span class="cpce-preset-swatch" style="background:${previewHex}; width:26px; height:26px;"></span><span class="cpce-entity-id">follows the entity</span></div>
-             <div class="cpce-hint">This button has <strong>no color of its own</strong> — it always applies <code>${escapeHtml(linked)}</code>'s current value, in real time. To change the color or brightness, edit the entity in <strong>Color Entities</strong> (Entity &amp; Profile Management). Every button linked to it updates together.</div>`
+             <div class="cpce-hint">This button has <strong>no color of its own</strong> — it always applies <code>${escapeHtml(linked)}</code>'s current value, in real time. To change the color or brightness, edit the entity in <strong>Color Entities</strong> (Entities, Scenes &amp; Profiles). Every button linked to it updates together.</div>`
           : (linked
             ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">Linked entity "${escapeHtml(linked)}" isn't available. This button applies no color until it's restored (or unlink to set an inline color).</div>`
             : `<div class="cpce-hint">${allEntities.length ? 'Link to a Color Entity to make this button follow that entity live (its color/brightness are then edited in Color Entities, not here).' : 'No color.* (Color helper) entities found.'}</div>`)}
@@ -3658,7 +3768,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
               <option value="color" ${isColor ? 'selected' : ''}>Custom Color</option>
             </select>
           </div>
-          ${isScene ? `<div class="cpce-hint">This button applies no color of its own — use it for scene-only buttons. Set a Custom button styling color below so it still looks intentional.</div>` : ''}
+          ${isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:palette"></ha-icon>Scene</div>${this._renderPresetScenePicker(preset, index)}` : ''}
           ${showButtonStyle ? this._renderButtonStyling(preset, index) : ''}
 
           ${isProfile ? `<div class="cpce-subgroup"><ha-icon icon="mdi:palette-swatch-outline"></ha-icon>Fixture Profile</div>
@@ -3675,8 +3785,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
           ` : ''}
           ${(isColor || isTemp) ? this._renderInputColorLink(preset, index) : ''}
 
-          <div class="cpce-subgroup"><ha-icon icon="mdi:cog-outline"></ha-icon>Actions &amp; Targets</div>
-          ${this._renderPresetActions(preset, index, mode)}
+          ${!isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:lightbulb-group-outline"></ha-icon>Target Lights</div>
+          ${this._renderPresetActions(preset, index, mode)}` : ''}
         </div>
       </div>
     `;
@@ -3727,20 +3837,349 @@ class ColorLightManagerCardEditor extends HTMLElement {
           ? `<div class="cpce-hint">This button uses the shared profile <strong>${escapeHtml(lib[curSlug].name || curSlug)}</strong>. Edit it in the Fixture Profile Library; changes apply to every button using it.</div>`
           : (curSlug
             ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">Referenced profile "${escapeHtml(curSlug)}" isn't in the Library.</div>`
-            : `<div class="cpce-hint">${slugs.length ? 'Pick a saved profile above.' : 'No profiles yet — create one in the Fixture Profile Library (Entity &amp; Profile Management), then select it here.'}</div>`)}
+            : `<div class="cpce-hint">${slugs.length ? 'Pick a saved profile above.' : 'No profiles yet — create one in the Fixture Profile Library (Entities, Scenes &amp; Profiles), then select it here.'}</div>`)}
       </div>
     `;
   }
 
+  // The Scene selector (shown only in Mode = Scene). A Scene button activates exactly ONE HA
+  // scene (scene.turn_on). Build/edit scenes in the Scene Builder; combine multiple actions
+  // (dim + turn off + close blinds…) inside the scene, not by stacking actions on the button.
+  _renderPresetScenePicker(preset, index) {
+    const scenes = getSceneEntities(this._hass);
+    const cur = preset.scene_ref || '';
+    const curExists = cur && scenes.includes(cur);
+    return `
+      <div class="cpce-row"><label class="lbl">Scene</label>
+        <select class="cpce-preset-scene" data-index="${index}">
+          <option value="" ${!cur?'selected':''}>Choose a scene…</option>
+          ${scenes.map(s => `<option value="${escapeHtml(s)}" ${cur===s?'selected':''}>${escapeHtml(friendlyName(this._hass, s))}</option>`).join('')}
+          ${cur && !curExists ? `<option value="${escapeHtml(cur)}" selected>${escapeHtml(cur)} (missing)</option>` : ''}
+        </select>
+      </div>
+      ${cur && !curExists ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">Scene "${escapeHtml(cur)}" isn't available.</div>`
+        : `<div class="cpce-hint">${scenes.length ? 'This button activates the chosen scene. Build scenes in Scene Manager (Entities, Scenes &amp; Profiles).' : 'No scenes yet — create one in Scene Manager, then select it here.'}</div>`}
+    `;
+  }
+
+  // ---- Scene Builder ----
+  // Authors REAL Home Assistant scenes (scene.* entities) so they're usable by native cards,
+  // select/input_select helpers, automations, and voice — not a card-private store. Scenes are
+  // written via HA's scene config REST API (POST config/scene/config/<id>), the same endpoint
+  // HA's own scene editor uses; they then appear as scene.* and can be triggered by any button's
+  // "Trigger Scenes". Build #1: capture current light states into a new scene; list + delete.
+  //
+  // A scene is a frozen snapshot of per-entity state — unlike a Fixture Profile (a live look),
+  // editing a light later does not change a saved scene. That's standard HA scene behavior.
+  // The entity set the next capture will snapshot: an explicit user-chosen set, or (until they
+  // touch it) the Default Entities pool as a sensible seed. Only capturable domains are kept.
+  _sceneCaptureIds() {
+    const base = this._sceneCaptureSet != null ? this._sceneCaptureSet : (this._config.entities || []);
+    return base.filter(id => sceneDomainSupported(id));
+  }
+
+  _renderSceneBuilderSection() {
+    const scenes = getSceneEntities(this._hass);
+    const captureIds = this._sceneCaptureIds();
+    const candidates = getSceneCapturableEntities(this._hass);
+    return `
+      <div class="cpce-hint">Manage real Home Assistant <code>scene.*</code> entities — snapshots of the entities you choose (lights <em>and</em> switches, fans, covers, climate, media players…). They work anywhere in HA (native cards, <code>select</code> helpers, automations, voice) and can be triggered by a Scene-mode button.</div>
+
+      <div class="cpce-collapse-head${this._sceneCreateCollapsed ? ' collapsed' : ''}" id="cpce-scene-create-toggle"><ha-icon icon="mdi:chevron-down"></ha-icon>Create a Scene</div>
+      ${this._sceneCreateCollapsed ? '' : `
+      <div class="cpce-hint">Set everything how you want it, choose which entities to include, then Capture. Seeded from your Default Entities; add or remove any supported entity. (A scene is a frozen snapshot — re-capture to update it.)</div>
+      ${this._renderAddPicker(candidates, captureIds, 'on', 'cpce-scene-cap-add', 'cpce-scene-cap-sel', 'Add an entity to capture…')}
+      ${captureIds.length
+        ? this._renderChips(captureIds, 'on', 'cpce-scene-cap-x')
+        : `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">No entities selected — add at least one to capture.</div>`}
+      <div class="cpce-row"><label class="lbl">Transition</label>
+        <input type="range" id="cpce-scene-new-transition" min="0" max="30" step="0.5" value="0"><span class="cpce-strength-val" id="cpce-scene-new-transition-val">0 sec</span>
+      </div>
+      <div class="cpce-row"><label class="lbl">Name</label><input type="text" id="cpce-scene-new-name" placeholder="e.g. Movie Night"></div>
+      <div class="cpce-row"><label class="lbl">Icon</label><input type="text" id="cpce-scene-new-icon" placeholder="mdi:ticket"></div>
+      <div class="cpce-row" style="margin-top:6px;">
+        <button class="cpce-create-preset-btn" id="cpce-scene-capture"${captureIds.length?'':' disabled'}><ha-icon icon="mdi:camera-plus-outline"></ha-icon> Capture</button>
+      </div>`}
+
+      <div class="cpce-collapse-head${this._sceneListCollapsed ? ' collapsed' : ''}" id="cpce-scene-list-toggle"><ha-icon icon="mdi:chevron-down"></ha-icon>Your Scenes (${scenes.length})</div>
+      ${this._sceneListCollapsed ? '' : (scenes.length
+        ? `<div class="cpce-manage-list">${scenes.map(id => {
+            const st = this._hass && this._hass.states[id];
+            const members = (st && st.attributes && Array.isArray(st.attributes.entity_id)) ? st.attributes.entity_id.length : null;
+            const open = this._openScene === id;
+            return `<div class="cpce-manage-item" data-scene="${escapeHtml(id)}">
+              <ha-icon icon="mdi:ticket" style="color:var(--info-color,#2196F3);"></ha-icon>
+              <span class="cpce-ce-name">${escapeHtml(friendlyName(this._hass, id))}<span class="cpce-entity-id">${escapeHtml(id)}${members != null ? ` · ${members} ${members===1?'entity':'entities'}` : ''}</span></span>
+              <button class="cpce-icon-btn cpce-scene-activate" data-scene="${escapeHtml(id)}" title="Activate this scene now" style="color:var(--primary-color);"><ha-icon icon="mdi:play"></ha-icon></button>
+              <button class="cpce-icon-btn cpce-scene-edit${open?' active':''}" data-scene="${escapeHtml(id)}" title="View / edit scene values" style="color:var(--primary-color);"><ha-icon icon="mdi:pencil"></ha-icon></button>
+              <button class="cpce-icon-btn cpce-scene-duplicate" data-scene="${escapeHtml(id)}" title="Duplicate this scene"><ha-icon icon="mdi:content-duplicate"></ha-icon></button>
+              <button class="cpce-icon-btn cpce-scene-recapture" data-scene="${escapeHtml(id)}" title="Re-capture current state into this scene"><ha-icon icon="mdi:camera-retake-outline"></ha-icon></button>
+              <button class="cpce-delete-entity-btn cpce-scene-delete" data-scene="${escapeHtml(id)}" title="Delete this scene"><ha-icon icon="mdi:delete-forever"></ha-icon></button>
+            </div>${open ? `<div class="cpce-scene-edit-panel" data-scene="${escapeHtml(id)}">${this._renderSceneEditPanel(id)}</div>` : ''}`;
+          }).join('')}</div>
+          <div class="cpce-hint">Edit/re-capture/delete work for scenes stored in <code>scenes.yaml</code> (the editable store). Scenes defined in packages or read-only YAML can't be changed here — HA will report an error.</div>`
+        : `<div class="cpce-hint">No scenes yet. Capture one above.</div>`)}
+    `;
+  }
+
+  // The expanded edit panel for a scene: shows each captured light's exact stored values and
+  // lets you edit them, then Save (a separate button writes back via the scene config API).
+  // The scene's saved config isn't in the entity state, so we fetch it via GET config/scene/
+  // config/<id> on expand and cache it (with any pending edits) in _sceneConfigCache.
+  _renderSceneEditPanel(sceneEntity) {
+    const cached = this._sceneConfigCache[sceneEntity];
+    if (!cached) return `<div class="cpce-hint">Loading scene data…</div>`;
+    if (cached._error) return `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">${escapeHtml(cached._error)}</div>`;
+    const ents = cached.entities || {};
+    const ids = Object.keys(ents);
+    if (!ids.length) return `<div class="cpce-hint">This scene has no light entries.</div>`;
+    const rows = ids.map(id => {
+      const e = ents[id] || {};
+      const domain = sceneDomainOf(id);
+      // Swatch: light color if a light, else a neutral domain dot.
+      let sw = 'var(--secondary-text-color)';
+      if (domain === 'light') {
+        if (e.state === 'off') sw = 'transparent';
+        else if (e.color_temp_kelvin != null) sw = ColorUtils.rgbToHex(...ColorUtils.kelvinToRgb(e.color_temp_kelvin));
+        else if (presetColorFormat(e)) sw = ColorUtils.rgbToHex(...presetColorToRgb(e));
+        else sw = '#ffd27f';
+      }
+      return `<div class="cpce-manage-item" data-scene-row="${escapeHtml(id)}">
+        <span class="cpce-fav-swatch" style="background:${sw};"></span>
+        <span class="cpce-ce-name">${escapeHtml(friendlyName(this._hass, id))}<span class="cpce-entity-id">${escapeHtml(id)}</span></span>
+        <button class="cpce-delete-entity-btn cpce-scene-row-remove" data-scene="${escapeHtml(sceneEntity)}" data-id="${escapeHtml(id)}" title="Remove this entity from the scene"><ha-icon icon="mdi:close"></ha-icon></button>
+      </div>
+      <div class="cpce-scene-row-detail" style="margin:0 0 10px 26px;">${this._renderSceneRowDetail(sceneEntity, id, e)}</div>`;
+    }).join('');
+    // Add-entity picker (searchable): any capturable entity not already in the scene.
+    const addCandidates = getSceneCapturableEntities(this._hass).filter(cid => !ids.includes(cid));
+    const iconVal = cached.icon || '';
+    return `
+      <div class="cpce-hint">Exact values stored in this scene, grouped by entity. Edit, then Save.</div>
+      <div class="cpce-row"><label class="lbl">Name</label><input type="text" class="cpce-scene-name" data-scene="${escapeHtml(sceneEntity)}" value="${escapeHtml(cached.name || '')}" placeholder="Scene name"></div>
+      <div class="cpce-row"><label class="lbl">Icon</label><input type="text" class="cpce-scene-icon" data-scene="${escapeHtml(sceneEntity)}" value="${escapeHtml(iconVal)}" placeholder="mdi:ticket"><ha-icon icon="${escapeHtml(normalizeIcon(iconVal) || 'mdi:ticket')}"></ha-icon></div>
+      ${rows}
+      <div class="cpce-sub-title">Add an Entity</div>
+      <div class="cpce-hint">Type to filter, then tap an entity to add it. Set its values here (no need to change the physical device first).</div>
+      ${this._renderEntitySearchPicker(addCandidates, [], 'cpce-scene-add-picker', 'Search entities…')}
+      <div class="cpce-row" style="margin-top:10px;">
+        <button class="cpce-scene-save${cached._dirty?' dirty':''}" data-scene="${escapeHtml(sceneEntity)}">
+          <ha-icon icon="${cached._dirty?'mdi:content-save-alert':'mdi:check'}"></ha-icon>
+          ${cached._dirty ? 'Unsaved Changes — Click to Save' : 'Settings Saved'}
+        </button>
+      </div>
+    `;
+  }
+
+  // A sensible default scene entry for a freshly-added entity (so it appears with editable
+  // values). Lights default to on/white; toggles to on; others to their live state.
+  _defaultSceneEntry(id) {
+    const domain = sceneDomainOf(id);
+    const st = this._hass && this._hass.states[id];
+    if (domain === 'light') return { state: 'on', rgb_color: [255, 255, 255], brightness: 255 };
+    if (domain === 'switch' || domain === 'input_boolean') return { state: 'on' };
+    if (domain === 'lock') return { state: 'locked' };
+    // Capture the live state as a starting point for richer domains.
+    const cap = this._captureSceneEntities([id]);
+    return cap[id] || { state: (st && st.state) || 'on' };
+  }
+
+  // Renders the editable detail for one scene entry, branched by domain. Choice-type attributes
+  // (fan preset, media source, climate modes) draw their options from the LIVE entity's option
+  // lists (e.g. preset_modes / source_list / hvac_modes) so we only offer valid values.
+  _renderSceneRowDetail(sceneEntity, id, e) {
+    const domain = sceneDomainOf(id);
+    const st = this._hass && this._hass.states[id];
+    const la = (st && st.attributes) || {};   // live attributes (for option lists)
+    const d = (attr) => `data-scene="${escapeHtml(sceneEntity)}" data-id="${escapeHtml(id)}" data-attr="${attr}"`;
+    // A generic on/off state selector shared by toggle-like domains.
+    const stateSelect = (onVal, offVal) => `<div class="cpce-row"><label class="lbl">State</label>
+      <select class="cpce-scene-attr" ${d('state')}>
+        <option value="${onVal}" ${e.state!==offVal?'selected':''}>On</option>
+        <option value="${offVal}" ${e.state===offVal?'selected':''}>Off</option>
+      </select></div>`;
+    // A number control. When min AND max are finite it's a same-row SLIDER with a live value
+    // readout; otherwise a number input (open-ended values like a target temperature). The
+    // slider uses class cpce-scene-slider (wired for live readout + commit-on-release).
+    const numRow = (label, attr, val, min, max, step, suffix) => {
+      const hasRange = Number.isFinite(min) && Number.isFinite(max);
+      const cur = (val ?? '');
+      if (hasRange) {
+        const shown = (val != null && val !== '') ? val : min;
+        return `<div class="cpce-row"><label class="lbl">${label}</label>
+          <input type="range" class="cpce-scene-slider" ${d(attr)} min="${min}" max="${max}" ${step!=null?`step="${step}"`:''} value="${shown}">
+          <span class="cpce-strength-val cpce-scene-slider-val">${shown}${suffix?` ${suffix}`:''}</span></div>`;
+      }
+      return `<div class="cpce-row"><label class="lbl">${label}</label>
+        <input type="number" class="cpce-scene-attr" ${d(attr)} value="${cur}" ${min!=null?`min="${min}"`:''} ${max!=null?`max="${max}"`:''} ${step!=null?`step="${step}"`:''}>${suffix?`<span class="cpce-entity-id">${suffix}</span>`:''}</div>`;
+    };
+    const selRow = (label, attr, cur, options) => `<div class="cpce-row"><label class="lbl">${label}</label>
+      <select class="cpce-scene-attr" ${d(attr)}>
+        <option value="" ${cur==null?'selected':''}>(unset)</option>
+        ${(options||[]).map(o => `<option value="${escapeHtml(String(o))}" ${String(cur)===String(o)?'selected':''}>${escapeHtml(String(o))}</option>`).join('')}
+      </select></div>`;
+    const checkRow = (label, attr, checked) => `<div class="cpce-check"><input type="checkbox" class="cpce-scene-attr-bool" ${d(attr)} ${checked?'checked':''}><label>${label}</label></div>`;
+
+    if (domain === 'light') {
+      const on = e.state !== 'off';
+      let rgb = [255,210,127], fmtLabel = '';
+      if (e.color_temp_kelvin != null) { rgb = ColorUtils.kelvinToRgb(e.color_temp_kelvin); fmtLabel = `${e.color_temp_kelvin}K`; }
+      else if (presetColorFormat(e)) { rgb = presetColorToRgb(e); fmtLabel = presetColorFormat(e).toUpperCase(); }
+      const hex = ColorUtils.rgbToHex(rgb[0], rgb[1], rgb[2]);
+      const briPct = e.brightness != null ? Math.round((e.brightness / 255) * 100) : null;
+      const effects = Array.isArray(la.effect_list) ? la.effect_list : [];
+      return `
+        <div class="cpce-row"><label class="lbl">State</label>
+          <select class="cpce-scene-light-state" data-scene="${escapeHtml(sceneEntity)}" data-id="${escapeHtml(id)}">
+            <option value="on" ${on?'selected':''}>On</option>
+            <option value="off" ${!on?'selected':''}>Off</option>
+          </select></div>
+        ${on ? `
+          <div class="cpce-row"><label class="lbl">Color</label>
+            <input type="color" class="cpce-scene-row-color" data-scene="${escapeHtml(sceneEntity)}" data-id="${escapeHtml(id)}" value="${hex}">
+            <span class="cpce-entity-id">${fmtLabel ? `stored as ${escapeHtml(fmtLabel)}` : 'no color'}</span>
+          </div>
+          <div class="cpce-check"><input type="checkbox" class="cpce-scene-row-bri-en" data-scene="${escapeHtml(sceneEntity)}" data-id="${escapeHtml(id)}" ${briPct!=null?'checked':''}><label>Set brightness</label></div>
+          ${briPct != null ? `<div class="cpce-row"><label class="lbl">Brightness</label><input type="range" class="cpce-scene-row-bri" data-scene="${escapeHtml(sceneEntity)}" data-id="${escapeHtml(id)}" min="1" max="100" value="${briPct}"><span class="cpce-strength-val cpce-bri-val">${briPct}%</span></div>` : ''}
+          ${effects.length ? selRow('Effect', 'effect', e.effect ?? null, effects) : (e.effect ? `<div class="cpce-hint">Effect: <code>${escapeHtml(e.effect)}</code> (target reports no effect_list)</div>` : '')}
+          ${numRow('Transition', 'transition', e.transition, 0, 300, 0.5, 'sec')}
+        ` : ''}`;
+    }
+    if (domain === 'switch' || domain === 'input_boolean' || domain === 'lock') {
+      return stateSelect(domain === 'lock' ? 'locked' : 'on', domain === 'lock' ? 'unlocked' : 'off');
+    }
+    if (domain === 'fan') {
+      return `${stateSelect('on','off')}
+        ${e.state!=='off' ? `${numRow('Speed %','percentage', e.percentage, 0, 100, 1, '%')}
+        ${selRow('Preset', 'preset_mode', e.preset_mode ?? null, la.preset_modes)}
+        ${checkRow('Oscillating', 'oscillating', !!e.oscillating)}` : ''}`;
+    }
+    if (domain === 'cover') {
+      return `${numRow('Position','current_position', e.current_position, 0, 100, 1, '% open')}
+        ${la.current_tilt_position != null || e.current_tilt_position != null ? numRow('Tilt','current_tilt_position', e.current_tilt_position, 0, 100, 1, '%') : ''}`;
+    }
+    if (domain === 'climate') {
+      return `${selRow('Mode','hvac_mode', e.hvac_mode ?? null, la.hvac_modes)}
+        ${numRow('Target °','temperature', e.temperature, null, null, 0.5)}
+        ${selRow('Fan','fan_mode', e.fan_mode ?? null, la.fan_modes)}
+        ${selRow('Preset','preset_mode', e.preset_mode ?? null, la.preset_modes)}`;
+    }
+    if (domain === 'media_player') {
+      const volPct = e.volume_level != null ? Math.round(e.volume_level * 100) : 50;
+      return `${stateSelect('on','off')}
+        <div class="cpce-row"><label class="lbl">Volume</label><input type="range" class="cpce-scene-attr-vol" ${d('volume_level')} min="0" max="100" value="${volPct}"><span class="cpce-strength-val cpce-bri-val">${volPct}%</span></div>
+        ${selRow('Source','source', e.source ?? null, la.source_list)}
+        ${selRow('Sound Mode','sound_mode', e.sound_mode ?? null, la.sound_mode_list)}`;
+    }
+    if (domain === 'humidifier') {
+      return `${stateSelect('on','off')}
+        ${numRow('Humidity %','humidity', e.humidity, 0, 100, 1, '%')}
+        ${selRow('Mode','mode', e.mode ?? null, la.available_modes)}`;
+    }
+    if (domain === 'input_number') return numRow('Value','state', e.state, null, null, 'any');
+    if (domain === 'select' || domain === 'input_select') return selRow('Option','state', e.state, la.options);
+    // Fallback: show the raw state read-only.
+    return `<div class="cpce-hint">State: <code>${escapeHtml(String(e.state))}</code></div>`;
+  }
+
+  // Fetch a scene's saved config (name + per-entity states) via the scene config REST API and
+  // cache it, then re-render the panel with real data.
+  _loadSceneConfig(sceneEntity) {
+    const cfgId = this._sceneConfigId(sceneEntity);
+    if (!cfgId) { this._sceneConfigCache[sceneEntity] = { _error: 'This scene has no editable config id (likely YAML/packages) — can’t view its values here.' }; this._render(); return; }
+    if (typeof this._hass.callApi !== 'function') { this._sceneConfigCache[sceneEntity] = { _error: 'hass.callApi unavailable.' }; this._render(); return; }
+    this._hass.callApi('GET', `config/scene/config/${cfgId}`)
+      .then(cfg => { this._sceneConfigCache[sceneEntity] = { name: cfg.name, icon: cfg.icon || '', entities: cfg.entities || {}, _cfgId: cfgId, _dirty: false }; this._render(); })
+      .catch(e => { this._sceneConfigCache[sceneEntity] = { _error: `Could not load scene config: ${formatWsError(e)}` }; this._render(); });
+  }
+
+  // Mutate a cached scene entry and mark dirty (does not persist until Save Scene).
+  _patchSceneRow(sceneEntity, entityId, patch) {
+    const c = this._sceneConfigCache[sceneEntity]; if (!c || !c.entities) return;
+    const e = { ...(c.entities[entityId] || {}) };
+    Object.keys(patch).forEach(k => { if (patch[k] === undefined) delete e[k]; else e[k] = patch[k]; });
+    c.entities[entityId] = e; c._dirty = true;
+  }
+
+  // Builds a scene `entities` map by snapshotting each entity's current state. Multi-domain:
+  // lights get on/off + native color/brightness + effect; other domains get their state plus
+  // the settable attributes from SCENE_CAPTURE_DOMAINS. Unknown domains are skipped.
+  // `transition` (seconds), when > 0, is written onto each ON light entry (per-entity fade-in).
+  _captureSceneEntities(ids, transition) {
+    const tr = Number(transition);
+    const hasTr = Number.isFinite(tr) && tr > 0;
+    const out = {};
+    (ids || []).forEach(id => {
+      const st = this._hass && this._hass.states[id];
+      if (!st) return;
+      const domain = sceneDomainOf(id);
+      if (!sceneDomainSupported(id)) return;
+      const a = st.attributes || {};
+      if (domain === 'light') {
+        if (st.state !== 'on') { out[id] = { state: 'off' }; return; }
+        const e = { state: 'on' };
+        if (a.brightness != null) e.brightness = a.brightness;
+        if (a.color_mode === 'color_temp' && a.color_temp_kelvin != null) e.color_temp_kelvin = a.color_temp_kelvin;
+        else if (Array.isArray(a.rgbww_color)) e.rgbww_color = a.rgbww_color;
+        else if (Array.isArray(a.rgbw_color)) e.rgbw_color = a.rgbw_color;
+        else if (Array.isArray(a.xy_color)) e.xy_color = a.xy_color;
+        else if (Array.isArray(a.hs_color)) e.hs_color = a.hs_color;
+        else if (Array.isArray(a.rgb_color)) e.rgb_color = a.rgb_color;
+        else if (a.color_temp_kelvin != null) e.color_temp_kelvin = a.color_temp_kelvin;
+        // Effect: only meaningful values (skip "None"/empty, which isn't a real effect).
+        if (a.effect && a.effect !== 'None' && a.effect !== 'none') e.effect = a.effect;
+        if (hasTr) e.transition = tr;
+        out[id] = e;
+        return;
+      }
+      // Other domains: always capture the state, plus each whitelisted attribute that's present.
+      const e = { state: st.state };
+      (SCENE_CAPTURE_DOMAINS[domain] || []).forEach(key => { if (a[key] !== undefined && a[key] !== null) e[key] = a[key]; });
+      out[id] = e;
+    });
+    return out;
+  }
+
+  // Writes a scene via HA's scene config REST API (persistent; lands in scenes.yaml), then
+  // reloads scenes so the scene.* entity appears/refreshes. `sceneId` is the numeric-ish unique
+  // id; for a new scene we mint one from a timestamp+counter. Returns a Promise<bool>.
+  _saveSceneConfig(sceneId, name, entities, icon) {
+    const hass = this._hass;
+    if (!hass || typeof hass.callApi !== 'function') return Promise.reject(new Error('hass.callApi unavailable'));
+    if (!Object.keys(entities).length) return Promise.reject(new Error('No entity states captured'));
+    const body = { name, entities };
+    const ic = normalizeIcon(icon);
+    if (ic) body.icon = ic;
+    return hass.callApi('POST', `config/scene/config/${sceneId}`, body)
+      .then(() => hass.callService('scene', 'reload').catch(() => {}))
+      .then(() => true);
+  }
+
+  _deleteSceneConfig(sceneId) {
+    const hass = this._hass;
+    if (!hass || typeof hass.callApi !== 'function') return Promise.reject(new Error('hass.callApi unavailable'));
+    return hass.callApi('DELETE', `config/scene/config/${sceneId}`)
+      .then(() => hass.callService('scene', 'reload').catch(() => {}))
+      .then(() => true);
+  }
+
+  // The scene config API keys scenes by a unique id (the entity is scene.<slug of name> but the
+  // config id is a separate opaque id). For a scene.* entity we read its `id` attribute when
+  // present; else fall back to null (can't edit externally-defined scenes without an id).
+  _sceneConfigId(sceneEntityId) {
+    const st = this._hass && this._hass.states[sceneEntityId];
+    return (st && st.attributes && st.attributes.id) || null;
+  }
+
   // The Fixture Profile Library manager: lists saved profiles with rename/delete, a scope
-  // toggle, and a swatch. Profiles are shared across all Color Light Manager cards.
+  // toggle, and a swatch. Profiles are shared across all Color Light & Scene Manager cards.
   _renderProfileLibrarySection() {
     const lib = fixtureLibraryMap('system');
     const slugs = Object.keys(lib).sort((a, b) => (lib[a].name || a).localeCompare(lib[b].name || b));
     // Which library slugs are referenced by this card's presets (usage badge).
     const usedSlugs = new Set((this._config.presets || []).map(p => fixtureRefSlug(p && p.profile_ref)).filter(Boolean));
     return `
-      <div class="cpce-hint">Reusable fixture profiles (color/brightness/transition/effect) shared across all Color Light Manager cards via Home Assistant's built-in store. Create and edit profiles here; a button uses one by setting Mode = Fixture Profile — one edit updates every button referencing it.</div>
+      <div class="cpce-hint">Reusable fixture profiles (color/brightness/transition/effect) shared across all Color Light & Scene Manager cards via Home Assistant's built-in store. Create and edit profiles here; a button uses one by setting Mode = Fixture Profile — one edit updates every button referencing it.</div>
       ${slugs.length
         ? `<div class="cpce-manage-list">${slugs.map(s => {
             const e = lib[s];
@@ -3957,47 +4396,28 @@ class ColorLightManagerCardEditor extends HTMLElement {
     `;
   }
 
-  // The additive-actions block for a preset: Color Control Lights (Default Entities + custom),
-  // Scenes to trigger (any scene.*), and a Turn-Off entity set. `mode` is the button mode;
-  // color-control targeting is hidden for Scene buttons (they apply no color). The Color Entity
-  // Link is NOT here — it lives with the Custom look editor.
+  // Target Lights for a preset: which lights get its color/temp/profile look, or its off command.
+  // Single-purpose model — a button does ONE thing (its Mode); to combine actions (dim + turn
+  // off others + close blinds), build a Scene and use a Scene-mode button. So there is no longer
+  // an additive "Trigger Scenes" / "Turn Off These" here. Scene/None buttons show nothing.
   _renderPresetActions(preset, index, mode) {
+    if (mode === 'scene') return '';   // Scene buttons target nothing here — they fire a scene.
     const cardEntities = this._config.entities || [];
     const isOff = mode === 'off';
-    const showColorControl = mode !== 'scene';
     const spec = presetTargetSpec(preset);
     const customSel = spec.custom;
     const allLights = getLightEntities(this._hass);
-    const allScenes = getSceneEntities(this._hass);
-    const scenes = preset.scenes || [];   // any scene.*; no card-level pool to filter against
-    const offIds = (preset.turn_off_entities || []).filter(id => cardEntities.includes(id));
-
     return `
       <div class="cpce-preset-actions" data-index="${index}">
-        ${showColorControl ? `<div class="cpce-action-block">
-          <div class="cpce-field-title">Color Control Lights</div>
-          <div class="cpce-hint">Which lights get this button's ${isOff ? 'off command' : mode === 'profile' ? "profile's look" : 'color/temperature'}. Combine the shared Default Entities pool with this button's own lights — or uncheck both for a scene/turn-off-only button.</div>
+        <div class="cpce-action-block">
+          <div class="cpce-hint">Which lights get this button's ${isOff ? 'off command' : mode === 'profile' ? "profile's look" : 'color/temperature'}. Combine the shared Default Entities pool with this button's own lights.</div>
           <div class="cpce-check"><input type="checkbox" class="cpce-cc-use-default" ${spec.useDefault?'checked':''}><label>Use Default Entities${cardEntities.length ? ` (${cardEntities.length})` : ' — none set'}</label></div>
           ${spec.useDefault && cardEntities.length ? `<div style="margin-left:22px;">${this._renderStaticChips(cardEntities, 'default')}</div>` : ''}
           <div class="cpce-check"><input type="checkbox" class="cpce-cc-use-custom" ${spec.useCustom?'checked':''}><label>Include other Entities</label></div>
           ${spec.useCustom ? (allLights.length
             ? `${this._renderAddPicker(allLights, customSel, 'on', 'cpce-cc-add', 'cpce-cc-sel', 'Add any light…')}${this._renderChips(customSel, 'on', 'cpce-cc-chip-x')}`
             : `<div class="cpce-hint">No <code>light.*</code> entities found.</div>`) : ''}
-          ${!spec.useDefault && !spec.useCustom ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">No lights selected — this button applies no color (scene / turn-off only).</div>` : ''}
-        </div>` : ''}
-
-        <div class="cpce-action-block">
-          <div class="cpce-field-title">Trigger Scenes</div>
-          ${allScenes.length
-            ? `${this._renderAddPicker(allScenes, scenes, 'scene', 'cpce-scene-chip-add', 'cpce-scene-chip-sel', 'Add any scene…')}${this._renderChips(scenes, 'scene', 'cpce-scene-chip-x')}`
-            : `<div class="cpce-hint">No <code>scene.*</code> entities found on this system.</div>`}
-        </div>
-
-        <div class="cpce-action-block">
-          <div class="cpce-field-title">Turn Off These</div>
-          ${cardEntities.length
-            ? `${this._renderAddPicker(cardEntities, offIds, 'off', 'cpce-off-add', 'cpce-off-sel', 'Add a light to turn off…')}${this._renderChips(offIds, 'off', 'cpce-off-chip-x')}`
-            : `<div class="cpce-hint">Add lights to Default Entities first.</div>`}
+          ${!spec.useDefault && !spec.useCustom ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">No lights selected — this button won't affect any light.</div>` : ''}
         </div>
       </div>
     `;
@@ -4029,7 +4449,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
       const commitMeta = () => {
         const presets = [...(this._config.presets || [])];
-        presets[index] = { ...presets[index], name: nameEl.value || 'Preset', icon: iconEl.value || '' };
+        // Store the icon normalized (bare name → mdi:) so a typed "lightbulb" becomes "mdi:lightbulb".
+        presets[index] = { ...presets[index], name: nameEl.value || 'Preset', icon: normalizeIcon(iconEl.value) };
         this._updateConfig({ presets });
       };
       if (nameEl) nameEl.addEventListener('change', commitMeta);
@@ -4043,16 +4464,17 @@ class ColorLightManagerCardEditor extends HTMLElement {
         const supported = getUnionColorModes(this._hass, this._entityIds ? this._entityIds() : (this._config.entities || []));
         const preferFmt = ['rgb', 'xy', 'hs'].find(f => supported.includes(FORMAT_TO_COLOR_MODE[f])) || 'rgb';
         const seedColor = () => { p[PRESET_COLOR_KEYS[preferFmt]] = preferFmt === 'xy' ? ColorUtils.rgbToXy(255,0,0) : (preferFmt === 'hs' ? ColorUtils.rgbToHs(255,0,0) : [255,0,0]); };
-        // Clear every look/link field, then set only what the chosen mode needs.
+        // Clear every look/link field, then set only what the chosen mode needs. scene_ref is
+        // owned by Scene mode only; profile_ref by Profile mode only.
         delete p.action; ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]); delete p.color_kelvin;
-        delete p.look_none; delete p.profile_ref; delete p.transition; delete p.effect;
+        delete p.look_none; delete p.profile_ref; delete p.scene_ref; delete p.transition; delete p.effect;
         const v = modeEl.value;
         // If the icon isn't a user-customized one (empty or a generic/mode default), follow the
         // new mode's default icon so the button glyph matches its function automatically.
         if (!p.icon || GENERIC_DEFAULT_ICONS.has(p.icon)) p.icon = modeDefaultIcon(v);
         p.mode = v;
         if (v === 'off') { p.action = 'turn_off'; delete p.brightness; delete p.input_color_entity; }
-        else if (v === 'scene') { p.look_none = true; delete p.brightness; delete p.input_color_entity; }
+        else if (v === 'scene') { p.look_none = true; delete p.brightness; delete p.input_color_entity; }  // scene_ref set by the picker
         else if (v === 'profile') { delete p.brightness; delete p.input_color_entity; }  // profile_ref set by the picker
         else if (v === 'temp') p.color_kelvin = midKelvin;
         else seedColor();  // color
@@ -4172,13 +4594,6 @@ class ColorLightManagerCardEditor extends HTMLElement {
         });
       }
 
-      // Preset actions: Color Control mode + chips, Scenes chips, Turn-Off chips.
-      const patchPreset = (patch) => {
-        const presets = [...(this._config.presets || [])];
-        presets[index] = { ...presets[index], ...patch };
-        this._updateConfig({ presets });
-        this._render();
-      };
       // Color Control targeting: two independent checkboxes (Default pool ∪ this button's own
       // lights). We always write explicit use_default_entities / use_custom_entities and drop
       // the legacy target_mode so the new model is authoritative.
@@ -4207,21 +4622,16 @@ class ColorLightManagerCardEditor extends HTMLElement {
       container.querySelectorAll('.cpce-cc-chip-x').forEach(x => x.onclick = () =>
         normalizeTargeting({ target_entities: (this._config.presets[index].target_entities || []).filter(id => id !== x.dataset.id) }));
 
-      const scAdd = container.querySelector('.cpce-scene-chip-add');
-      if (scAdd) scAdd.onclick = () => {
-        const sel = container.querySelector('.cpce-scene-chip-sel'); if (!sel || !sel.value) return;
-        patchPreset({ scenes: [...new Set([...(this._config.presets[index].scenes || []), sel.value])] });
-      };
-      container.querySelectorAll('.cpce-scene-chip-x').forEach(x => x.onclick = () =>
-        patchPreset({ scenes: (this._config.presets[index].scenes || []).filter(id => id !== x.dataset.id) }));
-
-      const offAdd = container.querySelector('.cpce-off-add');
-      if (offAdd) offAdd.onclick = () => {
-        const sel = container.querySelector('.cpce-off-sel'); if (!sel || !sel.value) return;
-        patchPreset({ turn_off_entities: [...new Set([...(this._config.presets[index].turn_off_entities || []), sel.value])] });
-      };
-      container.querySelectorAll('.cpce-off-chip-x').forEach(x => x.onclick = () =>
-        patchPreset({ turn_off_entities: (this._config.presets[index].turn_off_entities || []).filter(id => id !== x.dataset.id) }));
+      // Scene mode: single-scene selector (this button activates exactly one scene).
+      const sceneSel = container.querySelector('.cpce-preset-scene');
+      if (sceneSel) sceneSel.addEventListener('change', () => {
+        const presets = [...(this._config.presets || [])];
+        const p = { ...presets[index], mode: 'scene' };
+        if (sceneSel.value) p.scene_ref = sceneSel.value; else delete p.scene_ref;
+        presets[index] = p;
+        this._updateConfig({ presets });
+        this._render();
+      });
 
       // Button-section assignment.
       const sectionSel = container.querySelector('.cpce-preset-section');
@@ -4386,8 +4796,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-sec.collapsed .cpce-sec-header .chev { transform:rotate(-90deg); }
         .cpce-sec-body { padding:0 12px 12px; }
         .cpce-sec.collapsed .cpce-sec-body { display:none; }
-        .cpce-row { display:flex; align-items:center; gap:12px; padding:6px 0; flex-wrap:wrap; }
-        .cpce-row label.lbl { min-width:130px; color:var(--primary-text-color); font-size:13px; }
+        .cpce-row { display:flex; align-items:center; gap:12px; padding:6px 0; flex-wrap:wrap; justify-content:flex-start; }
+        .cpce-row label.lbl { min-width:130px; max-width:130px; color:var(--primary-text-color); font-size:13px; flex:none; }
+        /* Scene Save button: grey when saved, accent-blue when there are unsaved changes. */
+        .cpce-scene-save { display:inline-flex; align-items:center; gap:6px; padding:8px 14px; border:none; border-radius:6px; font-size:13px; cursor:default; background:var(--secondary-background-color,#2a2a2a); color:var(--secondary-text-color); }
+        .cpce-scene-save.dirty { background:var(--primary-color); color:#fff; cursor:pointer; }
+        .cpce-scene-save ha-icon { --mdc-icon-size:16px; }
         .cpce-row input[type="text"], .cpce-row select, .cpce-row input[type="number"] {
           flex:1; padding:6px 10px; background:var(--secondary-background-color,#2a2a2a);
           border:1px solid var(--divider-color,#333); border-radius:4px; color:var(--primary-text-color); font-size:13px;
@@ -4398,7 +4812,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-mini-btn { padding:4px 10px; margin-right:6px; border:1px solid var(--divider-color,#333); border-radius:4px; background:var(--secondary-background-color,#2a2a2a); color:var(--primary-text-color); font-size:12px; cursor:pointer; }
         .cpce-mini-btn:hover { border-color:var(--primary-color); }
         .cpce-hint { font-size:12px; color:var(--secondary-text-color); margin-bottom:8px; }
-        .cpce-sub-title { font-size:12px; font-weight:600; color:var(--primary-color); margin:12px 0 4px; border-top:1px solid var(--divider-color,#333); padding-top:10px; }
+        .cpce-sub-title { font-size:12px; font-weight:600; color:var(--accent-color,var(--primary-color)); margin:12px 0 4px; border-top:1px solid var(--divider-color,#333); padding-top:10px; }
         .cpce-strength-val { font-size:12px; color:var(--secondary-text-color); min-width:36px; }
         .cpce-row input[type="color"] { width:44px; height:32px; padding:0; border:1px solid var(--divider-color,#333); border-radius:4px; background:transparent; cursor:pointer; flex:none; }
         .cpce-entity-list { max-height:200px; overflow-y:auto; border:1px solid var(--divider-color,#333); border-radius:6px; padding:4px; }
@@ -4480,7 +4894,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-order-style-panel { border:1px solid var(--divider-color,#333); border-top:none; border-radius:0 0 6px 6px; padding:8px; margin:-8px 0 8px; background:var(--secondary-background-color,#1e1e1e); }
         .cpce-slider-section { border:1px solid var(--divider-color,#333); border-radius:8px; padding:10px; margin-bottom:10px; }
         /* Collapsible sub-header (e.g. Added Entities). */
-        .cpce-collapse-head { display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; font-size:12px; font-weight:600; color:var(--primary-color); margin:12px 0 6px; }
+        .cpce-collapse-head { display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; font-size:12px; font-weight:600; color:var(--accent-color,var(--primary-color)); margin:12px 0 6px; }
         .cpce-collapse-head ha-icon { --mdc-icon-size:16px; transition:transform 0.2s ease; }
         .cpce-collapse-head.collapsed ha-icon { transform:rotate(-90deg); }
         /* Entity/scene chips (green = color-control/on, red = turn-off, blue = scene). */
@@ -4499,8 +4913,15 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-chip.on .cpce-chip-dot { background:var(--success-color,#4caf50); }
         .cpce-chip.off .cpce-chip-dot { background:var(--error-color,#f44336); }
         .cpce-chip.scene .cpce-chip-dot { background:var(--info-color,#2196F3); }
+        .cpce-search-picker { display:flex; flex-direction:column; gap:6px; }
+        .cpce-search-picker .cpce-sp-input { padding:6px 10px; background:var(--secondary-background-color,#2a2a2a); border:1px solid var(--divider-color,#333); border-radius:4px; color:var(--primary-text-color); font-size:13px; }
+        .cpce-sp-list { max-height:220px; overflow-y:auto; border:1px solid var(--divider-color,#333); border-radius:4px; }
+        .cpce-sp-item { display:flex; flex-direction:column; padding:7px 10px; cursor:pointer; border-top:1px solid var(--divider-color,#333); }
+        .cpce-sp-item:first-child { border-top:none; }
+        .cpce-sp-item:hover { background:var(--secondary-background-color,#2a2a2a); }
+        .cpce-sp-name { font-size:13px; color:var(--primary-text-color); }
         .cpce-addrow { display:flex; align-items:center; gap:8px; }
-        .cpce-addrow select { flex:1; padding:6px 10px; background:var(--secondary-background-color,#2a2a2a); border:1px solid var(--divider-color,#333); border-radius:4px; color:var(--primary-text-color); font-size:13px; }
+        .cpce-addrow select, .cpce-addrow input { flex:1; min-width:0; padding:6px 10px; background:var(--secondary-background-color,#2a2a2a); border:1px solid var(--divider-color,#333); border-radius:4px; color:var(--primary-text-color); font-size:13px; }
         .cpce-addrow .cpce-add-plus { width:28px; height:28px; flex-shrink:0; border:none; border-radius:4px; color:#fff; cursor:pointer; font-size:18px; line-height:1; }
         .cpce-add-plus.on { background:var(--success-color,#4caf50); }
         .cpce-add-plus.off { background:var(--error-color,#f44336); }
@@ -4519,7 +4940,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-esm-field select { font-size:12px; }
         .cpce-ce-name { display:flex; flex-direction:column; flex:1; min-width:0; }
         .cpce-link-unused { color:var(--secondary-text-color); opacity:0.6; }
-        .cpce-ce-edit-panel { padding:10px 8px; border-top:1px solid var(--divider-color,#333); background:var(--secondary-background-color,rgba(255,255,255,0.03)); }
+        .cpce-ce-edit-panel, .cpce-scene-edit-panel { padding:10px 8px; border-top:1px solid var(--divider-color,#333); background:var(--secondary-background-color,rgba(255,255,255,0.03)); }
         .cpce-ce-create-preset { padding:4px 8px; font-size:12px; }
         .cpce-create-preset-btn {
           display:flex; align-items:center; gap:4px; margin-left:auto; padding:5px 10px;
@@ -4536,6 +4957,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-editor-header ha-icon { --mdc-icon-size:22px; color:var(--primary-color); }
         .cpce-editor-title { font-size:15px; font-weight:600; color:var(--primary-text-color); }
         .cpce-editor-build { margin-left:auto; font-size:11px; color:var(--secondary-text-color); font-family:var(--code-font-family, monospace); }
+        .cpce-legacy-notice { display:flex; gap:8px; align-items:flex-start; padding:10px 12px; margin:4px 2px; border:1px solid var(--warning-color,#ff9800); border-radius:8px; background:rgba(255,152,0,0.08); font-size:12px; color:var(--primary-text-color); line-height:1.5; }
+        .cpce-legacy-notice ha-icon { color:var(--warning-color,#ff9800); flex-shrink:0; }
         /* Group divider separating the two logical panel groups (Visuals vs Management). */
         .cpce-group-divider { display:flex; align-items:center; gap:10px; margin:18px 2px 10px; color:var(--primary-color); font-size:13px; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; }
         .cpce-group-divider::before, .cpce-group-divider::after { content:''; flex:1; height:2px; background:linear-gradient(to right, transparent, var(--primary-color)); opacity:0.5; }
@@ -4548,6 +4971,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <span class="cpce-editor-title">${CARD_NAME}</span>
           <span class="cpce-editor-build">${BUILD_NUMBER}</span>
         </div>
+        ${(this._legacyActionNotice && this._legacyActionNotice.length) ? `
+        <div class="cpce-legacy-notice">
+          <ha-icon icon="mdi:information-outline"></ha-icon>
+          <div>Buttons are now single-purpose: a button does one thing (its Mode). The old “also trigger scenes / turn off these” on these buttons is no longer applied: <strong>${this._legacyActionNotice.map(n => escapeHtml(n)).join(', ')}</strong>. To reproduce combined actions, build a <strong>Scene</strong> (Scene Builder) and use a Scene-mode button. Your data was kept, not deleted.
+          <button class="cpce-mini-btn" id="cpce-dismiss-legacy-notice" style="margin-top:6px;">Got it</button></div>
+        </div>` : ''}
         <div class="cpce-group-divider"><ha-icon icon="mdi:eye-outline"></ha-icon>Card Builder</div>
 
         ${this._section('mdi:view-grid-outline', 'Section Order', 'layout', `
@@ -4798,7 +5227,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
         ${this._section('mdi:palette-swatch-outline', 'Scratchpad', 'favorites', `
           <div class="cpce-check"><input type="checkbox" id="cpce-show-favorites" ${cfg.show_favorites?'checked':''}><label for="cpce-show-favorites">Show scratchpad bar on the card</label></div>
-          <div class="cpce-hint">Scratchpad colors are temporary and saved in this browser only (not synced across devices), shared across all Color Light Manager cards in it. Use them to quickly stash a color you're experimenting with.</div>
+          <div class="cpce-hint">Scratchpad colors are temporary and saved in this browser only (not synced across devices), shared across all Color Light & Scene Manager cards in it. Use them to quickly stash a color you're experimenting with.</div>
         `)}
 
         <div class="cpce-group-divider"><ha-icon icon="mdi:view-dashboard-outline"></ha-icon>Section Builder</div>
@@ -4955,7 +5384,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-hint">Note: the mired display option also applies to the temperature slider readout.</div>
         `)}
 
-        <div class="cpce-group-divider"><ha-icon icon="mdi:cog-outline"></ha-icon>Entity &amp; Profile Management</div>
+        <div class="cpce-group-divider"><ha-icon icon="mdi:cog-outline"></ha-icon>Entities, Scenes &amp; Profiles</div>
 
         ${this._section('mdi:lightbulb-group', 'Default Entities', 'entities', `
           <div class="cpce-hint">A shared pool of lights. Each button can include this pool <strong>live</strong> ("Use Default Entities") and/or add its own lights — so changing this list updates every button that uses it. It's also what the card glow / header icon follow (in "light" mode) and where per-light Send Method overrides come from. Optional — you can leave it empty and give each button its own lights.</div>
@@ -5006,9 +5435,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           ${this._renderEntitySendMethods()}
         `)}
 
-        ${this._section('mdi:movie-open-cog-outline', 'Scene Builder', 'scene-builder', `
-          <div class="cpce-hint">Build multi-light scenes here — capture per-light states into a Home Assistant scene. (Coming soon.)</div>
-        `)}
+        ${this._section('mdi:movie-open-cog-outline', 'Scene Manager', 'scene-builder', this._renderSceneBuilderSection())}
 
         ${this._section('mdi:card-multiple-outline', 'Fixture Profile Library', 'profile-library', this._renderProfileLibrarySection())}
 
@@ -5639,6 +6066,183 @@ class ColorLightManagerCardEditor extends HTMLElement {
       if (efEl) efEl.addEventListener('change', () => this._patchProfileLook(slug, { effect: efEl.value.trim() || null }));
     });
 
+    // Dismiss the one-time v91 legacy-actions notice.
+    const dismissLegacy = this.querySelector('#cpce-dismiss-legacy-notice');
+    if (dismissLegacy) dismissLegacy.onclick = () => { this._legacyActionNotice = []; this._render(); };
+
+    // Scene Manager — collapse/expand the two sub-areas.
+    const sceneCreateToggle = this.querySelector('#cpce-scene-create-toggle');
+    if (sceneCreateToggle) sceneCreateToggle.onclick = () => { this._sceneCreateCollapsed = !this._sceneCreateCollapsed; this._render(); };
+    const sceneNewTr = this.querySelector('#cpce-scene-new-transition');
+    const sceneNewTrVal = this.querySelector('#cpce-scene-new-transition-val');
+    if (sceneNewTr && sceneNewTrVal) sceneNewTr.addEventListener('input', () => { sceneNewTrVal.textContent = `${sceneNewTr.value} sec`; });
+    const sceneListToggle = this.querySelector('#cpce-scene-list-toggle');
+    if (sceneListToggle) sceneListToggle.onclick = () => { this._sceneListCollapsed = !this._sceneListCollapsed; this._render(); };
+
+    // Scene Builder — capture-set picker (which entities the next capture snapshots).
+    const capAdd = this.querySelector('.cpce-scene-cap-add');
+    if (capAdd) capAdd.onclick = () => {
+      const sel = this.querySelector('.cpce-scene-cap-sel'); if (!sel || !sel.value) return;
+      this._sceneCaptureSet = [...new Set([...this._sceneCaptureIds(), sel.value])];
+      this._render();
+    };
+    const capSel = this.querySelector('.cpce-scene-cap-sel');
+    if (capSel) capSel.addEventListener('change', () => { if (!capSel.value) return; this._sceneCaptureSet = [...new Set([...this._sceneCaptureIds(), capSel.value])]; this._render(); });
+    this.querySelectorAll('.cpce-scene-cap-x').forEach(x => x.onclick = () => {
+      this._sceneCaptureSet = this._sceneCaptureIds().filter(id => id !== x.dataset.id);
+      this._render();
+    });
+
+    // Scene Builder: capture the chosen entities' current state into a new HA scene; activate;
+    // re-capture (snapshots the scene's OWN members' current state); delete.
+    const sceneCaptureBtn = this.querySelector('#cpce-scene-capture');
+    if (sceneCaptureBtn) sceneCaptureBtn.onclick = () => {
+      const nameEl = this.querySelector('#cpce-scene-new-name');
+      const name = nameEl ? nameEl.value.trim() : '';
+      if (!name) { window.alert('Enter a name for the new scene.'); return; }
+      const trEl = this.querySelector('#cpce-scene-new-transition');
+      const transition = trEl ? parseFloat(trEl.value) : 0;
+      const iconEl = this.querySelector('#cpce-scene-new-icon');
+      const entities = this._captureSceneEntities(this._sceneCaptureIds(), transition);
+      if (!Object.keys(entities).length) { window.alert('No entities selected to capture.'); return; }
+      sceneCaptureBtn.disabled = true;
+      this._saveSceneConfig(newSceneConfigId(), name, entities, iconEl && iconEl.value)
+        .then(() => { if (nameEl) nameEl.value = ''; this._sceneCaptureSet = null; this._render(); })
+        .catch(e => { console.error(`${LOG_PREFIX} scene save failed`, e); window.alert(`Could not save the scene: ${formatWsError(e)}`); })
+        .finally(() => { sceneCaptureBtn.disabled = false; });
+    };
+    this.querySelectorAll('.cpce-scene-activate').forEach(btn => btn.onclick = () => {
+      this._hass && this._hass.callService('scene', 'turn_on', { entity_id: btn.dataset.scene })
+        .catch(e => window.alert(`Could not activate scene: ${formatWsError(e)}`));
+    });
+    // Duplicate a scene: fetch its config, save a new scene (fresh id) with a copied name.
+    this.querySelectorAll('.cpce-scene-duplicate').forEach(btn => btn.onclick = () => {
+      const sceneEntity = btn.dataset.scene;
+      const cfgId = this._sceneConfigId(sceneEntity);
+      if (!cfgId || typeof this._hass.callApi !== 'function') { window.alert('This scene has no editable config id (likely YAML/packages) and can’t be duplicated here.'); return; }
+      const base = friendlyName(this._hass, sceneEntity);
+      const name = window.prompt('Name for the duplicated scene:', `${base} (copy)`);
+      if (!name || !name.trim()) return;
+      btn.disabled = true;
+      this._hass.callApi('GET', `config/scene/config/${cfgId}`)
+        .then(cfg => this._saveSceneConfig(newSceneConfigId(), name.trim(), cfg.entities || {}, cfg.icon))
+        .then(() => this._render())
+        .catch(e => { console.error(`${LOG_PREFIX} scene duplicate failed`, e); window.alert(`Could not duplicate the scene: ${formatWsError(e)}`); })
+        .finally(() => { btn.disabled = false; });
+    });
+    this.querySelectorAll('.cpce-scene-recapture').forEach(btn => btn.onclick = () => {
+      const sceneEntity = btn.dataset.scene;
+      const cfgId = this._sceneConfigId(sceneEntity);
+      if (!cfgId) { window.alert('This scene has no editable config id (likely defined in YAML/packages) and can’t be re-captured here.'); return; }
+      // Re-capture snapshots the scene's OWN current members' state (not the Default pool).
+      const st = this._hass && this._hass.states[sceneEntity];
+      const members = (st && st.attributes && Array.isArray(st.attributes.entity_id)) ? st.attributes.entity_id : [];
+      if (!window.confirm(`Overwrite "${friendlyName(this._hass, sceneEntity)}" with the current state of its ${members.length} member ${members.length===1?'entity':'entities'}?`)) return;
+      const entities = this._captureSceneEntities(members);
+      if (!Object.keys(entities).length) { window.alert('No capturable members found for this scene.'); return; }
+      btn.disabled = true;
+      this._saveSceneConfig(cfgId, friendlyName(this._hass, sceneEntity), entities)
+        .then(() => this._render())
+        .catch(e => { console.error(`${LOG_PREFIX} scene recapture failed`, e); window.alert(`Could not update the scene: ${formatWsError(e)}`); })
+        .finally(() => { btn.disabled = false; });
+    });
+    this.querySelectorAll('.cpce-scene-delete').forEach(btn => btn.onclick = () => {
+      const sceneEntity = btn.dataset.scene;
+      const cfgId = this._sceneConfigId(sceneEntity);
+      if (!cfgId) { window.alert('This scene has no editable config id (likely defined in YAML/packages) and can’t be deleted here.'); return; }
+      if (!this._confirmDelete(`Delete the scene "${friendlyName(this._hass, sceneEntity)}"? Any button that triggers it will no longer find it.`)) return;
+      btn.disabled = true;
+      this._deleteSceneConfig(cfgId)
+        .then(() => this._render())
+        .catch(e => { console.error(`${LOG_PREFIX} scene delete failed`, e); window.alert(`Could not delete the scene: ${formatWsError(e)}`); });
+    });
+    // Expand/collapse a scene's edit panel (fetch its config on first open).
+    this.querySelectorAll('.cpce-scene-edit').forEach(btn => btn.onclick = () => {
+      const sceneEntity = btn.dataset.scene;
+      if (this._openScene === sceneEntity) { this._openScene = null; this._render(); return; }
+      this._openScene = sceneEntity;
+      if (!this._sceneConfigCache[sceneEntity] || this._sceneConfigCache[sceneEntity]._error) this._loadSceneConfig(sceneEntity);
+      this._render();
+    });
+    // Scene edit-panel field wiring (edits are cached + dirty until Save Scene).
+    this.querySelectorAll('.cpce-scene-edit-panel').forEach(panel => {
+      const sceneEntity = panel.dataset.scene;
+      panel.querySelectorAll('.cpce-scene-light-state').forEach(sel => sel.addEventListener('change', () => {
+        const on = sel.value === 'on';
+        this._patchSceneRow(sceneEntity, sel.dataset.id, on ? { state: 'on' } : { state: 'off', brightness: undefined, rgb_color: undefined, xy_color: undefined, hs_color: undefined, rgbw_color: undefined, rgbww_color: undefined, color_temp_kelvin: undefined, effect: undefined, transition: undefined });
+        this._render();
+      }));
+      panel.querySelectorAll('.cpce-scene-row-color').forEach(col => col.addEventListener('input', () => {
+        const rgb = ColorUtils.hexToRgb(col.value); if (!rgb) return;
+        // Editing a color here normalizes the entry to rgb_color (drops other color keys).
+        this._patchSceneRow(sceneEntity, col.dataset.id, { rgb_color: rgb, xy_color: undefined, hs_color: undefined, rgbw_color: undefined, rgbww_color: undefined, color_temp_kelvin: undefined });
+        const c = this._sceneConfigCache[sceneEntity]; if (c) c._dirty = true;
+      }));
+      panel.querySelectorAll('.cpce-scene-row-bri-en').forEach(cb => cb.addEventListener('change', () => {
+        const cur = ((this._sceneConfigCache[sceneEntity]||{}).entities||{})[cb.dataset.id] || {};
+        this._patchSceneRow(sceneEntity, cb.dataset.id, { brightness: cb.checked ? (cur.brightness ?? 255) : undefined });
+        this._render();
+      }));
+      panel.querySelectorAll('.cpce-scene-row-bri').forEach(sl => sl.addEventListener('change', () => {
+        this._patchSceneRow(sceneEntity, sl.dataset.id, { brightness: Math.round(clamp(parseInt(sl.value,10)||1,1,100)*2.55) });
+        this._render();
+      }));
+      // Generic per-domain attribute controls (select/number → value; empty select clears the key).
+      panel.querySelectorAll('.cpce-scene-attr').forEach(el => el.addEventListener('change', () => {
+        const attr = el.dataset.attr;
+        let v = el.value;
+        if (v === '') { this._patchSceneRow(sceneEntity, el.dataset.id, { [attr]: undefined }); this._render(); return; }
+        if (el.type === 'number') { v = parseFloat(v); if (!Number.isFinite(v)) return; }
+        this._patchSceneRow(sceneEntity, el.dataset.id, { [attr]: v });
+        this._render();
+      }));
+      panel.querySelectorAll('.cpce-scene-attr-bool').forEach(cb => cb.addEventListener('change', () => {
+        this._patchSceneRow(sceneEntity, cb.dataset.id, { [cb.dataset.attr]: cb.checked });
+      }));
+      // Media volume slider: 0-100 UI → 0-1 stored.
+      panel.querySelectorAll('.cpce-scene-attr-vol').forEach(sl => sl.addEventListener('change', () => {
+        this._patchSceneRow(sceneEntity, sl.dataset.id, { volume_level: clamp(parseInt(sl.value,10)||0,0,100) / 100 });
+        this._render();
+      }));
+      // Ranged numeric attributes rendered as sliders: live readout on drag, commit on release.
+      panel.querySelectorAll('.cpce-scene-slider').forEach(sl => {
+        const valEl = sl.parentElement && sl.parentElement.querySelector('.cpce-scene-slider-val');
+        const suffix = valEl ? (valEl.textContent.replace(/^[\d.]+/, '').trim()) : '';
+        sl.addEventListener('input', () => { if (valEl) valEl.textContent = `${sl.value}${suffix?` ${suffix}`:''}`; });
+        sl.addEventListener('change', () => {
+          const v = parseFloat(sl.value); if (!Number.isFinite(v)) return;
+          this._patchSceneRow(sceneEntity, sl.dataset.id, { [sl.dataset.attr]: v });
+          this._render();
+        });
+      });
+      // Remove an entity from the scene.
+      panel.querySelectorAll('.cpce-scene-row-remove').forEach(btn => btn.onclick = () => {
+        const c = this._sceneConfigCache[sceneEntity]; if (!c || !c.entities) return;
+        if (!window.confirm(`Remove "${friendlyName(this._hass, btn.dataset.id)}" from this scene?`)) return;
+        delete c.entities[btn.dataset.id]; c._dirty = true;
+        this._render();
+      });
+      // Scene name / icon (edit-panel header).
+      const nameEl2 = panel.querySelector('.cpce-scene-name');
+      if (nameEl2) nameEl2.addEventListener('change', () => { const c = this._sceneConfigCache[sceneEntity]; if (!c) return; c.name = nameEl2.value; c._dirty = true; this._render(); });
+      const iconEl2 = panel.querySelector('.cpce-scene-icon');
+      if (iconEl2) iconEl2.addEventListener('change', () => { const c = this._sceneConfigCache[sceneEntity]; if (!c) return; c.icon = iconEl2.value; c._dirty = true; this._render(); });
+      // Add an entity to the scene (searchable, cross-platform). Seeds a default/live entry.
+      this._wireEntitySearchPicker(panel, 'cpce-scene-add-picker', (id) => {
+        const c = this._sceneConfigCache[sceneEntity]; if (!c || !id) return;
+        if (!c.entities) c.entities = {};
+        if (!c.entities[id]) { c.entities[id] = this._defaultSceneEntry(id); c._dirty = true; this._render(); }
+      });
+      const saveBtn = panel.querySelector('.cpce-scene-save');
+      if (saveBtn) saveBtn.onclick = () => {
+        const c = this._sceneConfigCache[sceneEntity]; if (!c || !c._cfgId || !c._dirty) return;
+        saveBtn.disabled = true;
+        this._saveSceneConfig(c._cfgId, c.name || friendlyName(this._hass, sceneEntity), c.entities, c.icon)
+          .then(() => { c._dirty = false; this._render(); })
+          .catch(e => { console.error(`${LOG_PREFIX} scene edit save failed`, e); window.alert(`Could not save the scene: ${formatWsError(e)}`); saveBtn.disabled = false; });
+      };
+    });
+
     // Presets
     this._attachPresetListeners();
     const addBtn = this.querySelector('#cpce-add-preset');
@@ -5678,6 +6282,6 @@ if (!customElements.get('color-light-manager-card')) customElements.define('colo
 if (!customElements.get('color-light-manager-card-editor')) customElements.define('color-light-manager-card-editor', ColorLightManagerCardEditor);
 
 window.customCards = window.customCards || [];
-window.customCards.push({ type: 'color-light-manager-card', name: 'Color Light Manager', description: 'Control colored lights (color temp / RGB / RGBWW) in real time, with preset and Color Entity management.', preview: true });
+window.customCards.push({ type: 'color-light-manager-card', name: 'Color Light & Scene Manager', description: 'Control colored lights (color temp / RGB / RGBWW) and author Home Assistant scenes — with preset buttons, Fixture Profiles, and Color Entity management.', preview: true });
 
 debugLog('Loaded', BUILD_NUMBER);
