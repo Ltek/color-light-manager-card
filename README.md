@@ -118,4 +118,16 @@ Build number format: `v<year>.<month>.<day>.<increment>` — the trailing increm
 - Color helper integration: **[@kkilchrist](https://github.com/kkilchrist/ha-color-ext)** — [ha-color-ext](https://github.com/kkilchrist/ha-color-ext)
 
 <!-- SCREENSHOTS:START -->
+<table>
+  <tr>
+    <td align="center" valign="top">
+      <img src="screenshots/editor.JPG" width="100%" alt="editor">
+    </td>
+    <td align="center" valign="top">
+      <img src="screenshots/example-live.JPG" width="100%" alt="example live">
+    </td>
+    <td></td>
+    <td></td>
+  </tr>
+</table>
 <!-- SCREENSHOTS:END -->
