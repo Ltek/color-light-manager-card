@@ -188,7 +188,9 @@ A scene button that **Follows Lights for Color** shows the live room color only 
     <td align="center" valign="top">
       <img src="screenshots/example-live.JPG" width="100%" alt="example live">
     </td>
-    <td></td>
+    <td align="center" valign="top">
+      <img src="screenshots/example2.JPG" width="100%" alt="example2">
+    </td>
     <td></td>
   </tr>
 </table>
