@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.08.31.180
+// Version: v2026.09.08.239
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.08.31.180';
+const BUILD_NUMBER = 'v2026.09.08.239';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -32,6 +32,43 @@ function formatWsError(err) {
   if (err.code) return `code: ${err.code}`;
   try { return JSON.stringify(err); } catch (e) { return String(err); }
 }
+
+// ============ input_select HELPER MANAGEMENT (WebSocket collection API) ============
+// Thin wrappers over HA's input_select collection commands. These manage UI/storage helpers (the
+// same ones under Settings → Devices & Services → Helpers). REQUIRE ADMIN — non-admins get a
+// rejected promise from HA (callers gate the UI on hass.user.is_admin). Helpers defined in YAML are
+// NOT editable here (they have no collection id in the list) and are surfaced read-only.
+//   list   → [{ id, name, options[], icon?, initial? }]   (id = collection id, NOT entity_id)
+//   create → { name, options[], initial?, icon? }          returns the created item
+//   update → { input_select_id, name?, options?, icon?, initial? }
+//   delete → { input_select_id }
+function wsInputSelectList(hass) {
+  if (!hass || !hass.connection || typeof hass.connection.sendMessagePromise !== 'function') return Promise.reject(new Error('No connection'));
+  return hass.connection.sendMessagePromise({ type: 'input_select/list' });
+}
+function wsInputSelectCreate(hass, { name, options, initial, icon }) {
+  const msg = { type: 'input_select/create', name, options: Array.isArray(options) ? options : [] };
+  if (initial != null && initial !== '') msg.initial = initial;
+  if (icon) msg.icon = icon;
+  return hass.connection.sendMessagePromise(msg);
+}
+function wsInputSelectUpdate(hass, id, patch) {
+  const msg = { type: 'input_select/update', input_select_id: id };
+  if (patch.name != null) msg.name = patch.name;
+  if (Array.isArray(patch.options)) msg.options = patch.options;
+  if (patch.initial !== undefined) msg.initial = patch.initial;
+  if (patch.icon !== undefined) msg.icon = patch.icon;
+  return hass.connection.sendMessagePromise(msg);
+}
+function wsInputSelectDelete(hass, id) {
+  return hass.connection.sendMessagePromise({ type: 'input_select/delete', input_select_id: id });
+}
+// Map a helper's collection id → its runtime entity_id (input_select.<slug>). HA doesn't return the
+// entity_id in list(), but the slug is derived from the ORIGINAL name at create time; the reliable
+// link is to match by scanning hass.states for an input_select whose friendly options match, OR — the
+// robust approach — read the entity_registry. For our needs we match the collection item to a state
+// by comparing the item id against the entity_id suffix when possible, else by name. See
+// _sceneHelperRows which reconciles list() with hass.states.
 
 // ============ STORAGE ============
 const FAVORITES_STORAGE_KEY = 'color_light_manager_favorites';
@@ -881,11 +918,38 @@ const BUTTON_APPEARANCE_KEYS = [
   'layout', 'columns', 'gap', 'wrap',
   'button_style',
   'button_border_enabled', 'button_border_width', 'button_border_color', 'button_border_color_mode', 'button_border_radius', 'button_border_sides',
-  'button_border_gradient',
+  'button_border_gradient', 'button_border_gradient_color_mode',
   'button_glow_enabled', 'button_glow_color', 'button_glow_color_mode', 'button_glow_intensity', 'button_glow_condition',
+  'button_glow_blur', 'button_glow_spread', 'button_glow_opacity',
   'button_shadow_enabled', 'button_shadow_color', 'button_shadow_x', 'button_shadow_y', 'button_shadow_blur', 'button_shadow_spread', 'button_shadow_opacity',
-  'button_font_size', 'button_name_weight', 'button_height', 'button_icon_gap', 'button_name_wrap', 'button_max_width',
+  'button_font_size', 'button_name_weight', 'button_name_color', 'button_name_color_mode', 'button_height', 'button_icon_gap', 'button_name_wrap', 'button_max_width',
+  'button_icon', 'button_icon_size', 'button_icon_color', 'button_icon_color_mode',
 ];
+// Button-appearance keys grouped by feature (mirrors the Frame model's whole-group layering).
+// A layer "owns" a group when it carries that group's keys; on flatten a later owning layer
+// REPLACES the whole group, and groups it doesn't own fall through — no per-key deltas. The
+// Builder subpanels map 1:1 to these groups, each with an include toggle on overlay layers.
+const BUTTON_STYLE_GROUPS = {
+  layout:   ['layout', 'columns', 'gap', 'wrap'],
+  background: ['button_style'],
+  border:   ['button_border_enabled', 'button_border_width', 'button_border_color', 'button_border_color_mode', 'button_border_sides'],
+  gradient: ['button_border_gradient', 'button_border_gradient_color_mode'],
+  glow:     ['button_glow_enabled', 'button_glow_color', 'button_glow_color_mode', 'button_glow_intensity', 'button_glow_condition', 'button_glow_blur', 'button_glow_spread', 'button_glow_opacity'],
+  shadow:   ['button_shadow_enabled', 'button_shadow_color', 'button_shadow_x', 'button_shadow_y', 'button_shadow_blur', 'button_shadow_spread', 'button_shadow_opacity'],
+  text:     ['button_font_size', 'button_name_weight', 'button_name_color', 'button_name_color_mode', 'button_name_wrap', 'button_icon_gap'],
+  icon:     ['button_icon', 'button_icon_size', 'button_icon_color', 'button_icon_color_mode'],
+  sizing:   ['button_border_radius', 'button_height', 'button_max_width'],
+};
+const BUTTON_STYLE_GROUP_KEYS = ['layout','background','border','gradient','glow','shadow','text','icon','sizing'];
+// Which group a given appearance key belongs to (reverse map).
+const BUTTON_KEY_GROUP = (() => { const m = {}; BUTTON_STYLE_GROUP_KEYS.forEach(g => BUTTON_STYLE_GROUPS[g].forEach(k => { m[k] = g; })); return m; })();
+// The set of groups a layer's `groups` object owns (has at least one key of). Layer 1 (the base)
+// typically owns all; overlays own only the groups they define.
+function layerOwnedGroups(groups) {
+  const owned = new Set();
+  Object.keys(groups || {}).forEach(k => { const g = BUTTON_KEY_GROUP[k]; if (g) owned.add(g); });
+  return owned;
+}
 function extractButtonAppearance(cfg) {
   const out = {};
   BUTTON_APPEARANCE_KEYS.forEach(k => { if (cfg && cfg[k] !== undefined) out[k] = JSON.parse(JSON.stringify(cfg[k])); });
@@ -906,6 +970,32 @@ function buttonBorderCss(width, color, sides) {
   if (!on.size) return 'border:none;';
   if (on.size === 4) return `border:${width}px solid ${color};`;
   return BUTTON_BORDER_SIDES.map(s => `border-${s}:${on.has(s) ? `${width}px solid ${color}` : 'none'};`).join('');
+}
+// Resolve the CSS color for a button's label from the name-color settings.
+//   mode 'fixed'  → the configured hex (button_name_color)
+//   mode 'match'  → `matchColor` (the button's own display color, passed by the caller)
+//   mode 'inherit'/unset → '' (inherit the surrounding text color — the pre-v181 behavior)
+// Returns '' when nothing should be forced, so callers can omit the `color:` declaration entirely
+// (keeps existing configs byte-identical in output).
+function buttonNameColorCss(cfg, matchColor) {
+  const mode = (cfg && cfg.button_name_color_mode) || 'inherit';
+  if (mode === 'fixed') return (cfg && cfg.button_name_color) || '';
+  if (mode === 'match') return matchColor || '';
+  return '';
+}
+// General 3-way color-mode resolver shared by border / glow / gradient / icon (and, via the
+// helper above, text). Returns the resolved CSS color, or `null` meaning "disable this effect".
+//   mode 'match' → `matchColor` (the button's own display color); null if the button has none
+//                  (e.g. an Off/colorless button) → caller disables the effect.
+//   mode 'fixed' → the configured `fixedColor` hex.
+//   mode 'none'  → null → caller disables the effect entirely.
+// `fallbackMode` is used when the style predates this field (back-compat: old border/glow used
+// 'fixed'|'match' only, so unset stays whatever the feature defaulted to).
+function resolveButtonColor(mode, fixedColor, matchColor, fallbackMode) {
+  const m = mode || fallbackMode || 'fixed';
+  if (m === 'none') return null;
+  if (m === 'match') return matchColor != null ? matchColor : null;
+  return fixedColor || null;
 }
 const BTN_STYLE_LIB_KEY = 'color_light_manager_button_styles';
 const BTN_STYLE_LIB_VERSION = 1;
@@ -930,8 +1020,28 @@ function _btnStyleNormalize(slug, p) {
     // Legacy single-preset → one always-on layer.
     layers = [{ groups: (p.settings && typeof p.settings === 'object') ? p.settings : {} }];
   }
+  // MIGRATION (per-key delta → whole-group ownership): older overlay layers stored partial deltas
+  // (e.g. just button_glow_color). The new model owns WHOLE groups. For each layer, any group it
+  // partially touched is completed from the EFFECTIVE look at that layer (base beneath + its own
+  // keys), so a touched group carries its full key-set. Base (idx 0) keeps its full look as-is.
+  if (kind === 'button' && layers.length) {
+    const effBelow = {};   // running effective look beneath the current layer
+    layers = layers.map((l, idx) => {
+      const owned = layerOwnedGroups(l.groups);
+      const effHere = { ...effBelow, ...l.groups };
+      let groups = l.groups;
+      if (idx > 0 && owned.size) {
+        groups = {};
+        owned.forEach(g => BUTTON_STYLE_GROUPS[g].forEach(k => { if (effHere[k] !== undefined) groups[k] = effHere[k]; }));
+      }
+      Object.keys(l.groups).forEach(k => { effBelow[k] = l.groups[k]; });   // advance the running base
+      return { ...l, groups };
+    });
+  }
   const out = { slug, name, kind, _default, layers };
   if (p.note != null && String(p.note).trim()) out.note = String(p.note);   // optional freeform note
+  if (p.starter != null && String(p.starter).trim()) out.starter = String(p.starter);           // provenance: source slug
+  if (p.starter_name != null && String(p.starter_name).trim()) out.starter_name = String(p.starter_name);  // provenance: source display name
   return out;
 }
 function _btnStyleParseValue(value) {
@@ -942,8 +1052,9 @@ function _btnStyleParseValue(value) {
     const p = presets[slug];
     if (p && typeof p === 'object') map[slug] = _btnStyleNormalize(slug, p);
   });
-  // Read the stored system-wide-default pointer into module state (see buttonStyleDefaultSlug).
-  BTN_STYLE_LIBRARY.system.defaultSlug = (value && typeof value.default_slug === 'string') ? value.default_slug : null;
+  // Legacy: an old envelope may still carry a system-wide-default pointer. We no longer use it for
+  // rendering, but keep it readable so a one-time section migration can preserve the prior look.
+  BTN_STYLE_LIBRARY.system.legacyDefaultSlug = (value && typeof value.default_slug === 'string') ? value.default_slug : null;
   return map;
 }
 function ensureButtonStyleLibrary(hass, onChange) {
@@ -965,64 +1076,116 @@ function ensureButtonStyleLibrary(hass, onChange) {
     .catch(() => { st.loading = false; st.loaded = true; st.map = {}; });
 }
 function buttonStyleLibraryMap() { return BTN_STYLE_LIBRARY.system.map || {}; }
-function saveButtonStyleLibrary(hass, map, defaultSlug) {
+function saveButtonStyleLibrary(hass, map) {
   if (!hass || !hass.connection || typeof hass.connection.sendMessagePromise !== 'function') return Promise.reject(new Error('No connection'));
   const presets = {};
   Object.keys(map || {}).forEach(slug => {
     const e = map[slug] || {};
     const layers = (Array.isArray(e.layers) ? e.layers : []).map(l => ({ groups: l.groups || {}, ...(l.when ? { when: l.when } : {}), ...(l.hidden ? { hidden: true } : {}), ...(l.label != null && String(l.label).trim() ? { label: String(l.label) } : {}) }));
-    presets[slug] = { name: e.name || slug, kind: e.kind === 'frame' ? 'frame' : 'button', layers, ...(e._default ? { _default: true } : {}), ...(e.note ? { note: e.note } : {}) };
+    // `starter`/`starter_name` record which style this one was created FROM (provenance shown in the
+    // Library). Purely informational — never affects rendering.
+    presets[slug] = { name: e.name || slug, kind: e.kind === 'frame' ? 'frame' : 'button', layers, ...(e.note ? { note: e.note } : {}), ...(e.starter ? { starter: e.starter } : {}), ...(e.starter_name ? { starter_name: e.starter_name } : {}) };
   });
-  // Persist the system-wide-default pointer alongside the presets. Passing undefined keeps the
-  // current pointer; pass a slug to move it (Built-In or any preset).
-  const ptr = (defaultSlug !== undefined) ? defaultSlug : BTN_STYLE_LIBRARY.system.defaultSlug;
   const value = { color_light_manager_button_styles: BTN_STYLE_LIB_VERSION, presets };
-  if (ptr) value.default_slug = ptr;
   return hass.connection.sendMessagePromise({ type: 'frontend/set_system_data', key: BTN_STYLE_LIB_KEY, value });
 }
 // Legacy reserved slug for the old baked-in Default stack. No longer special — kept only so the
 // migration can recognize it and point the (new) system-wide-default pointer at it.
 const BTN_STYLE_DEFAULT_SLUG = '__default__';
-// The synthetic, read-only "Built-In" preset. It's never stored — always rendered from these
-// hardcoded groups, so it can't drift. Users can Duplicate it or set it as the system-wide default.
+// The synthetic, read-only built-in presets. They're never stored — always rendered from these
+// hardcoded groups, so they can't drift. Users can Duplicate one or set it as the system-wide
+// default. There are two:
+//   Basic Theme (__basic_theme__) — a clean "theme surface" look with NO decoration; its own stack
+//     adds an active-glow overlay so the selected button glows. Its Layer-1 groups double as the
+//     FLATTEN FLOOR (the neutral fallback for any group a style leaves unset).
+//   Neon Lux (__neon_lux__) — the decorative blue look (transparent tiles, gradient edge lines,
+//     drop shadow, active glow). A single self-contained layer (glow gated by when_active).
+const BTN_STYLE_BASIC_SLUG = '__basic_theme__';
+const BTN_STYLE_NEON_SLUG = '__neon_lux__';
+// Legacy slug for the old single Built-In. Kept only so an existing default pointer still resolves
+// (→ Basic Theme, the safe neutral floor).
 const BTN_STYLE_BUILTIN_SLUG = '__builtin__';
-const BUILTIN_BUTTON_STYLE_GROUPS = {
-  layout: 'columns', columns: 6, gap: 7, wrap: true,
-  button_style: 'tinted',
-  button_border_enabled: true, button_border_width: 1, button_border_color: '#2196F3', button_border_color_mode: 'match', button_border_radius: 8,
-  button_border_gradient: { enabled: true, width: 2, sides: { top: true, bottom: true, left: false, right: false }, stops: [{ pos: 0, color: 'transparent' }, { pos: 50, color: 'match' }, { pos: 100, color: 'transparent' }], pattern: 2 },
-  button_glow_enabled: true, button_glow_color: '#2196F3', button_glow_color_mode: 'match', button_glow_intensity: 1, button_glow_condition: 'when_active',
+// Basic Theme — Layer 1 (the neutral floor). Every group present, all decoration OFF. This exact
+// object is also the flatten floor used when a style leaves a group unset (see flattenButtonStack),
+// so it must stay decoration-free (glow disabled here; the active glow lives in the overlay below).
+const BUILTIN_BASIC_THEME_GROUPS = {
+  layout: 'columns', columns: 3, gap: 8, wrap: true,
+  button_style: 'theme',
+  button_border_enabled: false, button_border_width: 1, button_border_color: '#2196F3', button_border_color_mode: 'fixed', button_border_sides: ['top', 'bottom', 'left', 'right'],
+  button_border_gradient: { enabled: false, width: 1, sides: { top: false, bottom: true, left: false, right: false }, stops: [{ pos: 0, color: 'transparent' }, { pos: 50, color: 'match' }, { pos: 100, color: 'transparent' }] },
+  button_border_gradient_color_mode: 'fixed',
+  button_glow_enabled: false, button_glow_color: '#2196F3', button_glow_color_mode: 'fixed', button_glow_intensity: 1, button_glow_condition: 'when_active', button_glow_blur: 8, button_glow_spread: 2, button_glow_opacity: 0.5,
   button_shadow_enabled: false, button_shadow_color: '#000000', button_shadow_x: 0, button_shadow_y: 4, button_shadow_blur: 12, button_shadow_spread: 0, button_shadow_opacity: 0.35,
-  button_font_size: 14, button_name_weight: '400', button_height: 31, button_icon_gap: 8, button_name_wrap: true, button_max_width: 120,
+  button_font_size: 14, button_name_weight: '400', button_name_color: '', button_name_color_mode: 'inherit', button_height: 44, button_icon_gap: 8, button_name_wrap: true, button_max_width: 0,
+  button_icon: '', button_icon_size: 0, button_icon_color: '', button_icon_color_mode: '',
+  button_border_radius: 8,
 };
-// The Built-In preset as a normal stack shape (one always-on layer). Deep-cloned on read so callers
-// can't mutate the shared constant.
-function builtinButtonStack() {
-  return { slug: BTN_STYLE_BUILTIN_SLUG, name: 'Built-In', kind: 'button', builtin: true, layers: [{ groups: JSON.parse(JSON.stringify(BUILTIN_BUTTON_STYLE_GROUPS)) }] };
+// Basic Theme — Layer 2: an active-only overlay that turns the glow ON for the selected button, so
+// the plain theme buttons still signal "active". Owns only the Glow group; applies via button_active.
+const BUILTIN_BASIC_THEME_ACTIVE_GLOW = {
+  button_glow_enabled: true, button_glow_color: '#2196F3', button_glow_color_mode: 'fixed', button_glow_intensity: 1, button_glow_condition: 'when_active', button_glow_blur: 8, button_glow_spread: 2, button_glow_opacity: 0.5,
+};
+// Neon Lux — a single self-contained look (the user-provided JSON). glow_condition 'when_active'
+// already restricts the glow to the active button, so no separate overlay layer is needed.
+const BUILTIN_NEON_LUX_GROUPS = {
+  layout: 'columns', columns: 6, gap: 7, wrap: true,
+  button_style: 'transparent',
+  button_border_enabled: false, button_border_width: 1, button_border_color: '#2196F3', button_border_color_mode: 'match', button_border_sides: ['top', 'bottom'],
+  button_border_gradient: { enabled: true, width: 1, sides: { top: true, bottom: true, left: false, right: false }, stops: [{ pos: 0, color: 'transparent' }, { pos: 50, color: 'match' }, { pos: 100, color: 'transparent' }] },
+  button_border_gradient_color_mode: 'fixed',
+  button_glow_enabled: true, button_glow_color: '#2196F3', button_glow_color_mode: 'fixed', button_glow_intensity: 1, button_glow_condition: 'when_active', button_glow_blur: 8, button_glow_spread: 2, button_glow_opacity: 0.5,
+  button_shadow_enabled: true, button_shadow_color: '#000000', button_shadow_x: 0, button_shadow_y: 4, button_shadow_blur: 12, button_shadow_spread: 4, button_shadow_opacity: 0.56,
+  button_font_size: 14, button_name_weight: '400', button_name_color: '', button_name_color_mode: 'inherit', button_name_wrap: true, button_icon_gap: 4,
+  button_icon: 'mdi:power', button_icon_size: 0, button_icon_color: '#2196F3', button_icon_color_mode: '',
+  button_border_radius: 8, button_height: 30, button_max_width: 115,
+};
+// Registry of the built-in stacks by slug. Order here is the order shown in the library list.
+const BUILTIN_BUTTON_STYLES = {
+  [BTN_STYLE_BASIC_SLUG]: { name: 'Basic Theme', layers: [
+    { groups: BUILTIN_BASIC_THEME_GROUPS },
+    { groups: BUILTIN_BASIC_THEME_ACTIVE_GLOW, when: { type: 'button_active' }, label: 'Active glow' },
+  ] },
+  [BTN_STYLE_NEON_SLUG]: { name: 'Neon Lux', layers: [{ groups: BUILTIN_NEON_LUX_GROUPS }] },
+};
+// Normalize any built-in slug (incl. the legacy alias) to a current registry slug, or null if not
+// a built-in. The legacy Built-In maps to Basic Theme (the safe neutral floor).
+function builtinButtonSlug(slug) {
+  if (slug === BTN_STYLE_BUILTIN_SLUG) return BTN_STYLE_BASIC_SLUG;
+  return BUILTIN_BUTTON_STYLES[slug] ? slug : null;
 }
-// Resolve a stack by slug: the synthetic Built-In, else a stored preset (or undefined).
+function isBuiltinButtonSlug(slug) { return builtinButtonSlug(slug) !== null; }
+// A built-in as a normal stack shape. Deep-cloned on read so callers can't mutate the shared
+// constants. `slug` defaults to Basic Theme (the fail-safe). Unknown slug → Basic Theme.
+function builtinButtonStack(slug) {
+  const key = builtinButtonSlug(slug) || BTN_STYLE_BASIC_SLUG;
+  const def = BUILTIN_BUTTON_STYLES[key];
+  return { slug: key, name: def.name, kind: 'button', builtin: true, layers: JSON.parse(JSON.stringify(def.layers)) };
+}
+// Resolve a stack by slug: a synthetic built-in, else a stored preset (or undefined).
 function buttonStyleStack(slug) {
-  if (slug === BTN_STYLE_BUILTIN_SLUG) return builtinButtonStack();
+  if (isBuiltinButtonSlug(slug)) return builtinButtonStack(slug);
   return buttonStyleLibraryMap()[slug];
 }
-// The slug the system-wide default points at. Order: explicit stored pointer (if it resolves) →
-// the migrated legacy __default__ stack (if present) → Built-In. Never returns an unresolvable slug.
-function buttonStyleDefaultSlug() {
+// LEGACY-ONLY: what the old system-wide-default pointer resolved to, used solely by the one-time
+// section migration to preserve appearance (sections that stored "(system default)" get pinned to
+// this concrete slug). Returns a slug that resolves to a built-in or an existing preset, else Basic
+// Theme. Not used for any live rendering — the section resolver falls back to Basic Theme directly.
+function legacyDefaultResolvedSlug() {
   const st = BTN_STYLE_LIBRARY.system;
   const map = buttonStyleLibraryMap();
-  if (st.defaultSlug && (st.defaultSlug === BTN_STYLE_BUILTIN_SLUG || map[st.defaultSlug])) return st.defaultSlug;
+  if (st.legacyDefaultSlug && (isBuiltinButtonSlug(st.legacyDefaultSlug) || map[st.legacyDefaultSlug])) return builtinButtonSlug(st.legacyDefaultSlug) || st.legacyDefaultSlug;
   if (map[BTN_STYLE_DEFAULT_SLUG]) return BTN_STYLE_DEFAULT_SLUG;
-  return BTN_STYLE_BUILTIN_SLUG;
+  return BTN_STYLE_BASIC_SLUG;
 }
-// The resolved default stack object (never undefined — falls back to Built-In).
-function buttonStyleDefaultStack() { return buttonStyleStack(buttonStyleDefaultSlug()) || builtinButtonStack(); }
 // Condition catalog for conditional style layers. `kinds` limits a condition to button and/or
 // frame stacks so the picker can hide context-inappropriate options (e.g. section_* are frame-only,
 // evaluated true for buttons). The first entry (type '') is the unconditional / base layer.
 const BTN_STYLE_CONDITIONS = [
   { type: '', label: 'Always', kinds: ['button', 'frame'] },
-  { type: 'light_on', label: 'Light is on', kinds: ['button', 'frame'] },
-  { type: 'light_off', label: 'Light is off', kinds: ['button', 'frame'] },
+  { type: 'button_active', label: 'Button Active', kinds: ['button'] },
+  { type: 'button_off', label: 'Off button only', kinds: ['button'] },
+  { type: 'light_on', label: 'Light On', kinds: ['button', 'frame'] },
+  { type: 'light_off', label: 'Light Off', kinds: ['button', 'frame'] },
   { type: 'light_unavailable', label: 'Light unavailable/unknown', kinds: ['button', 'frame'] },
   { type: 'entity_state', label: 'Entity state / attribute…', kinds: ['button', 'frame'] },
   { type: 'section_has_entities', label: 'Section has entities', kinds: ['frame'] },
@@ -1042,8 +1205,13 @@ function btnStyleConditionLabel(when) {
 // group). `isActive(when)` decides each layer's conditional application (always-on if no when).
 // Returns a flat cfg-style object (the same keys _renderPresetButton reads).
 function flattenButtonStack(stack, isActive) {
-  const acc = {};
-  if (!stack || !Array.isArray(stack.layers)) return acc;
+  if (!stack || !Array.isArray(stack.layers)) return { ...BUILTIN_BASIC_THEME_GROUPS };
+  // Is there an active UNCONDITIONAL (Always) base layer contributing the full look? If not (no
+  // base, or the base is hidden/inactive), seed from the curated Built-In look so overlays land on
+  // a real starting look instead of the card's raw stub defaults (which render as an unstyled pill).
+  const hasActiveBase = stack.layers.some(l => !l.hidden && (!l.when || !l.when.type)
+    && (typeof isActive !== 'function' || !l.when || isActive(l.when)) && l.groups && Object.keys(l.groups).length);
+  const acc = hasActiveBase ? {} : { ...BUILTIN_BASIC_THEME_GROUPS };
   stack.layers.forEach(l => {
     if (l.hidden) return;                                                 // hidden layers are skipped entirely
     if (l.when && typeof isActive === 'function' && !isActive(l.when)) return;
@@ -1086,7 +1254,7 @@ function resolvePresetLook(preset, scope) {
 function buildSections(cfg) {
   // Already migrated? Use as-is (filtered to known types — including standalone dividers).
   if (Array.isArray(cfg.sections) && cfg.sections.length) {
-    return cfg.sections.filter(s => s && ['buttons', 'sliders', 'values', 'divider'].includes(s.type));
+    return cfg.sections.filter(s => s && ['buttons', 'sliders', 'values', 'divider', 'scene_tracker'].includes(s.type));
   }
   // Legacy migration from flat config.
   const sliders = {
@@ -1486,6 +1654,52 @@ function mergeFramePresets(existing, incoming) {
     seen.add(key); out.push(p); added += 1;
   });
   return { list: out, added, skipped };
+}
+
+// ---------------------------------------------------------------------------
+// SECTION EXPORT/IMPORT — a whole section + its buttons as a portable payload.
+// A section's structure travels inline; its buttons (which have no shared library
+// — they live in cfg.presets) are bundled in the payload so an import lands a
+// complete, working section. Library-backed refs (Button Style style_preset,
+// Fixture Profile profile_ref, Frame/Header refs) and HA entity ids (selects,
+// targets, tracker areas, default_scene_group) are NOT copied — they resolve on
+// the same instance and degrade gracefully cross-instance (missing style → Basic
+// Theme, missing entity → binding just doesn't match), exactly like a Button
+// Style import that references a missing profile.
+// ---------------------------------------------------------------------------
+const SECTION_EXPORT_VERSION = 1;
+
+// Serialize a section + its buttons into the versioned text envelope. `presets`
+// is the list of button objects belonging to this section (caller resolves them).
+function serializeSection(section, presets, exportedIso) {
+  const env = {
+    seed_section: SECTION_EXPORT_VERSION,
+    section: JSON.parse(JSON.stringify(section)),
+    presets: (Array.isArray(presets) ? presets : []).map(p => JSON.parse(JSON.stringify(p))),
+  };
+  if (exportedIso) env.exported = String(exportedIso);
+  return JSON.stringify(env, null, 2);
+}
+
+// Parse + validate a pasted section envelope. Returns { ok, section, presets, error }.
+// The returned section keeps its stored fields but its id/section_id linkage is left
+// for the caller to re-key (so ids never collide with the target card).
+function parseSectionBlob(text) {
+  let raw;
+  try { raw = JSON.parse(text); }
+  catch (e) { return { ok: false, error: 'Not valid JSON.' }; }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !('seed_section' in raw)) {
+    return { ok: false, error: 'Unrecognized format — expected an exported Section.' };
+  }
+  if (Number(raw.seed_section) > SECTION_EXPORT_VERSION) {
+    return { ok: false, error: 'Made by a newer version of the card. Update the card first.' };
+  }
+  const section = raw.section;
+  if (!section || typeof section !== 'object' || !section.type) {
+    return { ok: false, error: 'Envelope has no valid section.' };
+  }
+  const presets = Array.isArray(raw.presets) ? raw.presets.filter(p => p && typeof p === 'object') : [];
+  return { ok: true, section: JSON.parse(JSON.stringify(section)), presets: presets.map(p => JSON.parse(JSON.stringify(p))) };
 }
 
 // A url/id-safe slug from a preset name, used as its library key.
@@ -2051,6 +2265,215 @@ function _usesHeaderLibRef(list) {
   });
 }
 
+// ============ SHARED BUTTON RENDERER (module-level) ============
+// The card element and the editor's live PREVIEW are separate custom elements, so button-render
+// logic lives in module functions both call (never as a method one class can't reach). This is
+// what guarantees the editor preview matches the live card byte-for-byte.
+
+// Is `preset` the currently-active scene on `state`? (color/temp match, or off-state for off presets)
+// `tempOutFmt` is the card's temperature_output_format (for temp presets driven in a color mode).
+// A button's input_select "scene selects": the ordered list of { entity, option } bindings it sets
+// on press and tracks for "active". Sanitized to well-formed string pairs. Empty when none.
+function presetSelects(preset) {
+  const raw = preset && preset.selects;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(b => b && typeof b === 'object' && typeof b.entity === 'string' && b.entity
+    && typeof b.option === 'string' && b.option).map(b => ({ entity: b.entity, option: b.option }));
+}
+// Deterministic "active" from a button's scene selects: true when EVERY binding currently matches
+// (hass.states[entity].state === option). Returns null when the button has NO selects (so callers
+// fall back to the legacy color/state/last-pressed logic). This is the single-winner signal that
+// replaces the fuzzy proxies for any button bound to input_select helpers.
+function presetSelectsActive(preset, hass) {
+  const binds = presetSelects(preset);
+  if (!binds.length) return null;                 // no bindings → not applicable
+  if (!hass || !hass.states) return false;
+  const result = binds.every(b => { const st = hass.states[b.entity]; return !!st && String(st.state) === String(b.option); });
+  return result;
+}
+// `selectsActive` (optional): when a boolean, it OVERRIDES all other active logic (the button has
+// input_select bindings and this is their all-match result). null/undefined → legacy behavior.
+function isPresetActiveFor(preset, state, tempOutFmt, activeId, selectsActive) {
+  if (selectsActive === true) return true;
+  if (selectsActive === false) return false;
+  // Scene-only (mode 'none') buttons apply no color, so there's nothing to color-match against the
+  // light. They're "active" when this is the last-pressed preset in the section (the only signal we
+  // have; session-only — resets on reload until pressed again).
+  if (presetMode(preset) === 'none') return !!(activeId && preset && preset.id === activeId);
+  if (!state) return false;
+  const attrs = state.attributes || {};
+  const mode = presetMode(preset);
+  if (mode === 'off') return state.state === 'off';
+  if (state.state !== 'on') return false;
+  const fmt = presetColorFormat(preset);
+  const near = (a, b, tol) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) <= tol);
+  const colorMatches = () => {
+    if (fmt === 'xy' && Array.isArray(attrs.xy_color)) return near(preset.xy_color, attrs.xy_color, 0.05);
+    if (fmt === 'hs' && Array.isArray(attrs.hs_color)) return near(preset.hs_color, attrs.hs_color, 8);
+    const target = presetColorToRgb(preset);
+    const cur = Array.isArray(attrs.rgb_color) ? attrs.rgb_color
+      : (Array.isArray(attrs.xy_color) ? ColorUtils.xyToRgb(attrs.xy_color[0], attrs.xy_color[1]) : null);
+    return near(target, cur, 32);
+  };
+  const tempMatches = () => {
+    const k = attrsToKelvin(attrs);
+    if (k !== undefined) return Math.abs(k - preset.color_kelvin) <= 40;
+    if (tempOutFmt === 'xy' && Array.isArray(attrs.xy_color)) return near(ColorUtils.kelvinToXy(preset.color_kelvin), attrs.xy_color, 0.05);
+    if (tempOutFmt === 'hs' && Array.isArray(attrs.hs_color)) return near(ColorUtils.kelvinToHs(preset.color_kelvin), attrs.hs_color, 8);
+    const target = ColorUtils.kelvinToRgb(preset.color_kelvin);
+    const cur = Array.isArray(attrs.rgb_color) ? attrs.rgb_color
+      : (Array.isArray(attrs.xy_color) ? ColorUtils.xyToRgb(attrs.xy_color[0], attrs.xy_color[1]) : null);
+    return near(target, cur, 32);
+  };
+  if (mode === 'color') return colorMatches();
+  if (mode === 'temp') return tempMatches();
+  return false;
+}
+
+// Resolve a button's border + glow (box-shadow) CSS from its style cfg + the light's state.
+// `btnColor` is the button's own display color hex (null for a colorless/Off button). Border/glow
+// resolve their match against it; 'none' or an unresolvable match disables that effect.
+function presetBorderAndGlowCssFor(preset, state, cfg, tempOutFmt, btnColor, activeId, selectsActive, glowColorOverride) {
+  const parts = { border: '', boxShadow: 'none' };
+  if (cfg.button_border_enabled) {
+    const w = Number(cfg.button_border_width) || 1;
+    // Match = a lighter shade of the button's own color (room-card look); fixed = configured hex;
+    // none = no border. Back-compat: pre-3-way border defaulted to 'fixed'.
+    const matchShade = btnColor ? ColorUtils.rgbToHex(...ColorUtils.mixRgb(ColorUtils.hexToRgb(btnColor), [255, 255, 255], 0.45)) : null;
+    const color = resolveButtonColor(cfg.button_border_color_mode, cfg.button_border_color || '#2196F3', matchShade, 'fixed');
+    if (color) parts.border = buttonBorderCss(w, color, buttonBorderSides(cfg));
+    else parts.border = 'border:none;';
+  }
+  const shadows = [];
+  if (cfg.button_glow_enabled) {
+    const condition = cfg.button_glow_condition || 'never';
+    const shouldGlow = condition === 'always' || (condition === 'when_active' && isPresetActiveFor(preset, state, tempOutFmt, activeId, selectsActive));
+    if (shouldGlow) {
+      let color;
+      // `glowColorOverride` (scene/follow buttons): the glow color is resolved by the caller — a
+      // fixed Glow Color, else the live follow-light color, else a neutral. It's independent of the
+      // button-body color (change: a fixed button color no longer forces the glow, and vice-versa).
+      if (glowColorOverride) {
+        color = glowColorOverride;
+      } else {
+        // Match = the light's CURRENT color (live), falling back to the button's own color; fixed =
+        // configured hex; none = no glow. Back-compat: pre-3-way glow defaulted to 'fixed'.
+        const attrs = (state && state.attributes) || {};
+        let liveRgb = Array.isArray(attrs.rgb_color) ? attrs.rgb_color
+          : (Array.isArray(attrs.xy_color) ? ColorUtils.xyToRgb(attrs.xy_color[0], attrs.xy_color[1]) : null);
+        if (!liveRgb) { const k = attrsToKelvin(attrs); if (k !== undefined) liveRgb = ColorUtils.kelvinToRgb(k); }
+        const liveHex = (liveRgb && state && state.state === 'on') ? ColorUtils.rgbToHex(...liveRgb) : (btnColor || null);
+        color = resolveButtonColor(cfg.button_glow_color_mode, cfg.button_glow_color || '#2196F3', liveHex, 'fixed');
+        // MATCH-mode fallback: when there's no color to match, don't drop the glow — fall back to the
+        // style's configured glow color.
+        if (!color && cfg.button_glow_color_mode === 'match') color = cfg.button_glow_color || '#2196F3';
+      }
+      if (color) {
+        // Blur/spread/opacity are explicit when set; else derived from the legacy single "intensity"
+        // (blur = 12×intensity, spread = −2×intensity, opacity = 1) so old styles render unchanged.
+        const intensity = Number(cfg.button_glow_intensity) || 1.0;
+        const blur = Number.isFinite(Number(cfg.button_glow_blur)) ? Number(cfg.button_glow_blur) : 12 * intensity;
+        const spread = Number.isFinite(Number(cfg.button_glow_spread)) ? Number(cfg.button_glow_spread) : -2 * intensity;
+        const op = Number.isFinite(Number(cfg.button_glow_opacity)) ? clamp(Number(cfg.button_glow_opacity), 0, 1) : 1;
+        shadows.push(`0 0 ${blur}px ${spread}px ${op < 1 ? ColorUtils.hexToRgba(color, op) : color}`);
+      }
+    }
+  }
+  if (cfg.button_shadow_enabled) {
+    const op = clamp(Number(cfg.button_shadow_opacity), 0, 1);
+    shadows.push(`${Number(cfg.button_shadow_x)||0}px ${Number(cfg.button_shadow_y)||0}px ${Number(cfg.button_shadow_blur)||0}px ${Number(cfg.button_shadow_spread)||0}px ${ColorUtils.hexToRgba(cfg.button_shadow_color || '#000000', Number.isFinite(op) ? op : 0.35)}`);
+  }
+  if (shadows.length) parts.boxShadow = shadows.join(', ');
+  return parts;
+}
+
+// Render one preset button's HTML. `look` is the resolved effective preset (color/action);
+// `preset` supplies name/icon/id; `cfg` is the effective button style; `state` is the light state
+// (for active/glow). Pure — no `this` — so the card and the editor preview render identically.
+function renderPresetButtonHtml(look, preset, cfg, state, tempOutFmt, activeId, selectsActive, appearance) {
+  const isOff = look.action === 'turn_off';
+  // `appearance` (optional, scene/follow buttons): a pre-resolved { bodyColor, glowColor } pair so
+  // the button body and its glow are colored INDEPENDENTLY (a fixed button color no longer forces
+  // the glow color, and vice-versa). bodyColor drives fill + gradient + icon accents; glowColor is
+  // handed to the glow resolver. Either may be null (→ fall back to the look/style-color path).
+  //   IMPORTANT (change #1): the body color only reflects a LIVE follow color while the button is
+  //   ACTIVE. When inactive it uses the fixed style color (or a neutral) so a scene button doesn't
+  //   flicker every time its follow-light changes color in the background.
+  const bodyOverrideHex = (appearance && appearance.bodyColor) || null;
+  const glowOverrideHex = (appearance && appearance.glowColor) || null;
+  const styleOverride = bodyOverrideHex ? ColorUtils.hexToRgb(bodyOverrideHex)
+    : (preset.button_style_color ? ColorUtils.hexToRgb(preset.button_style_color) : null);
+  const rgb = styleOverride || presetColorToRgb(look);
+  const bg = ColorUtils.rgbToHex(...rgb);
+  const hasStyleOverride = !!styleOverride;
+  // The button's own display color, or null for a colorless/Off button (drives every `match` mode:
+  // an unresolvable match disables that effect rather than falling back to an unrelated color).
+  const btnColor = (!isOff || hasStyleOverride) ? bg : null;
+  const { border, boxShadow } = presetBorderAndGlowCssFor(look, state, cfg, tempOutFmt, btnColor, activeId, selectsActive, glowOverrideHex);
+  const radius = Number(cfg.button_border_radius);
+  // Icon: a style-level override (cfg.button_icon) replaces the per-button icon for every button;
+  // else the button's own icon. Optional fixed icon size (px).
+  const icon = escapeHtml((cfg.button_icon && String(cfg.button_icon).trim()) || resolvePresetIcon(preset, buttonMode(preset)));
+  const iconSize = Number(cfg.button_icon_size) || 0;
+  const iconSizeCss = iconSize > 0 ? `--mdc-icon-size:${iconSize}px;` : '';
+  const glowCls = boxShadow && boxShadow !== 'none' ? ' cpc-glowing' : '';
+  const nameColor = buttonNameColorCss(cfg, btnColor);
+  const nameWeight = cfg.button_name_weight || '600';
+  const labelStyle = `font-weight:${nameWeight};${nameColor ? `color:${nameColor};` : ''}`;
+  // Gradient border lines: match = the button's own color; fixed = configured stop color; none =
+  // no gradient. Back-compat: unset mode → 'match' (the old behavior, where 'match' stops resolved
+  // to the border color / button color).
+  const gbColor = resolveButtonColor(cfg.button_border_gradient_color_mode, cfg.button_border_color || '#2196F3', btnColor, 'match');
+  const gb = gbColor ? gradientBorderBackground(cfg.button_border_gradient, gbColor) : null;
+  // Icon color: match = the button's own color; fixed = configured hex; none = leave the icon its
+  // default. Back-compat: unset → the historic per-style default (colored icon on tinted; theme on Off).
+  const iconOverride = cfg.button_icon_color_mode ? resolveButtonColor(cfg.button_icon_color_mode, cfg.button_icon_color || '#2196F3', btnColor, 'none') : undefined;
+  if (cfg.button_style === 'tinted' || cfg.button_style === 'tile') {
+    const radiusCss = Number.isFinite(radius) ? `border-radius:${radius}px;` : '';
+    let fillImage, iconColor;
+    if (isOff && !hasStyleOverride) {
+      fillImage = 'linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02))';
+      iconColor = 'var(--secondary-text-color)';
+    } else {
+      fillImage = `linear-gradient(135deg, ${ColorUtils.hexToRgba(bg, 0.35)}, ${ColorUtils.hexToRgba(bg, 0.06)})`;
+      iconColor = bg;
+    }
+    if (iconOverride !== undefined) iconColor = iconOverride || iconColor;   // explicit mode wins; 'none' keeps default
+    const bgCss = gb
+      ? `background-image:${gb.image}, ${fillImage}; background-size:${gb.size}, auto; background-position:${gb.position}, center; background-repeat:${gb.repeat}, no-repeat; background-color:transparent;`
+      : `background:${fillImage};`;
+    const styleAttr = `style="${bgCss}${border}${radiusCss}box-shadow:${boxShadow};--cpc-tile-icon-color:${iconColor};"`;
+    const tSub = preset._sublabel ? `<span class="cpc-btn-sublabel">${escapeHtml(preset._sublabel)}</span>` : '';
+    const tLabel = tSub
+      ? `<span class="cpc-btn-labelwrap"><span class="cpc-tile-name cpc-btn-label" style="${labelStyle}">${escapeHtml(preset.name)}</span>${tSub}</span>`
+      : `<span class="cpc-tile-name cpc-btn-label" style="${labelStyle}">${escapeHtml(preset.name)}</span>`;
+    return `<button class="cpc-preset-btn cpc-tile${glowCls} ${isOff ? 'off-style' : ''}" data-preset-id="${escapeHtml(preset.id)}" ${styleAttr}><ha-icon icon="${icon}" style="${iconSizeCss}"></ha-icon>${tLabel}</button>`;
+  }
+  const radiusCss = Number.isFinite(radius) ? `border-radius:${radius}px;` : '';
+  // Background fill by style: 'transparent' → none; 'theme' → the card/theme surface color;
+  // 'solid' (default) → the button's own color (none for a colorless Off button).
+  let fill;
+  if (cfg.button_style === 'transparent') fill = null;
+  else if (cfg.button_style === 'theme') fill = 'var(--ha-card-background, var(--card-background-color, #1c1c1c))';
+  else fill = (isOff && !hasStyleOverride) ? null : bg;
+  let bgCss;
+  if (gb) {
+    bgCss = `background-image:${gb.image}; background-size:${gb.size}; background-position:${gb.position}; background-repeat:${gb.repeat}; background-color:${fill || 'transparent'};`;
+  } else {
+    bgCss = fill ? `background:${fill};` : '';
+  }
+  // Non-tinted icon: default is theme/inherited; an explicit icon-color mode can set or 'none'-skip it.
+  const iconStyle = ` style="${iconSizeCss}${(iconOverride !== undefined && iconOverride) ? `color:${iconOverride};` : ''}"`;
+  const styleAttr = `style="${bgCss}${border}${radiusCss}box-shadow:${boxShadow};"`;
+  // Optional secondary line (used by the Scene Tracker to show the current scene under the area name).
+  // Regular buttons never set `_sublabel`, so their markup is unchanged.
+  const subLabel = preset._sublabel ? `<span class="cpc-btn-sublabel">${escapeHtml(preset._sublabel)}</span>` : '';
+  const labelBlock = subLabel
+    ? `<span class="cpc-btn-labelwrap"><span class="cpc-btn-label" style="${labelStyle}">${escapeHtml(preset.name)}</span>${subLabel}</span>`
+    : `<span class="cpc-btn-label" style="${labelStyle}">${escapeHtml(preset.name)}</span>`;
+  return `<button class="cpc-preset-btn${glowCls} ${isOff ? 'off-style' : ''}" data-preset-id="${escapeHtml(preset.id)}" ${styleAttr}><ha-icon icon="${icon}"${iconStyle}></ha-icon>${labelBlock}</button>`;
+}
+
 // ============ LIVE CARD ============
 class ColorLightManagerCard extends HTMLElement {
   static getStubConfig() {
@@ -2230,10 +2653,14 @@ class ColorLightManagerCard extends HTMLElement {
       // Gradient border for buttons (same shape/technique as the card's). Universal — applies to
       // every button. Painted as background-layer gradient lines on the chosen sides.
       button_border_gradient: { enabled: false, width: 2, sides: { top: false, bottom: true, left: false, right: false }, stops: [{ pos: 0, color: 'transparent' }, { pos: 50, color: 'match' }, { pos: 100, color: 'transparent' }] },
+      button_border_gradient_color_mode: 'match', // match (button's own color) | fixed (button_border_color) | none (disable)
       button_glow_enabled: false,
       button_glow_color: '#2196F3',
-      button_glow_color_mode: 'fixed', // fixed | match (match = current light color)
-      button_glow_intensity: 1.0,
+      button_glow_color_mode: 'fixed', // fixed | match (match = current light color) | none (disable)
+      button_glow_intensity: 1.0, // legacy single knob; blur/spread/opacity below override when set
+      button_glow_blur: 12, // px — box-shadow blur radius
+      button_glow_spread: 2, // px — box-shadow spread radius
+      button_glow_opacity: 0.5, // 0-1 — glow color alpha
       button_glow_condition: 'always', // always | when_active (only relevant when button_glow_enabled is true)
       // ---- Button drop shadow (parity with the card's shadow; separate from the colored glow) ----
       button_shadow_enabled: false,
@@ -2254,6 +2681,12 @@ class ColorLightManagerCard extends HTMLElement {
       // ---- Button sizing ----
       button_font_size: 14,
       button_name_weight: '600', // 300|400|500|600|700 — weight of the button label text
+      button_name_color: '', // fixed hex for the label text (only when mode='fixed'); '' = inherit
+      button_name_color_mode: 'inherit', // inherit (theme/default text color) | fixed | match (button's own color) | none (=inherit)
+      button_icon: '', // '' = use the per-button icon; a style-level mdi:* overrides it for all buttons
+      button_icon_size: 0, // 0 = default (per button_style); >0 = fixed px icon size
+      button_icon_color: '#2196F3', // fixed hex for the icon (only when mode='fixed')
+      button_icon_color_mode: '', // '' = historic default (colored on tinted) | match | fixed | none (leave default)
       button_height: 44, // approximate, via padding
       button_icon_gap: 8, // px gap between a button's icon and its label
       button_name_wrap: false, // allow the label to wrap to multiple lines
@@ -2374,15 +2807,43 @@ class ColorLightManagerCard extends HTMLElement {
     // color/tint is computed at full render (not in updateStates), so when any linked entity's
     // state changes, re-render so those buttons reflect the entity. These helper entities only
     // change on a deliberate set_color, so this is rare and cheap.
-    if (prev && this._linkedColorEntitiesChanged(prev, hass)) { this.renderCard(); return; }
+    // NOTE: these full re-renders go through _scheduleRender() (rAF-coalesced), NOT renderCard()
+    // directly. A scene fade fires many light-state updates in quick succession; rebuilding the DOM
+    // synchronously on each one made the buttons visibly FLICKER (their glow flashed as the DOM was
+    // destroyed/recreated). Coalescing collapses a burst into one rebuild per frame — no flicker.
+    if (prev && this._linkedColorEntitiesChanged(prev, hass)) { this._scheduleRender(); return; }
     // Conditional button-style layers can change a button's WHOLE look (bg/border/gradient), not
-    // just glow, when a watched entity changes — those aren't recomputed by updateStates(). So if
+    // just glow, when a watched entity changed — those aren't recomputed by updateStates(). So if
     // any style-condition-relevant entity changed, do a full re-render.
-    if (prev && this._buttonConditionEntitiesChanged(prev, hass)) { this.renderCard(); return; }
+    if (prev && this._buttonConditionEntitiesChanged(prev, hass)) { this._scheduleRender(); return; }
     // A card_frame conditional preset (when_entity) can change the whole frame
     // when its entity changes — re-render so _applyCardFrame re-evaluates it.
-    if (prev && this._frameConditionEntitiesChanged(prev, hass)) { this.renderCard(); return; }
+    if (prev && this._frameConditionEntitiesChanged(prev, hass)) { this._scheduleRender(); return; }
+    // Scene Tracker tiles read input_select options (+ optional light color) — re-render when any
+    // watched tracker entity changes so the board stays live.
+    if (prev && this._sceneTrackerEntitiesChanged(prev, hass)) { this._scheduleRender(); return; }
     this.updateStates();
+  }
+
+  // Entity ids the Scene Tracker sections display (each Area's input_select + optional light).
+  _sceneTrackerEntityIds() {
+    const ids = new Set();
+    ((this._config && this._config.sections) || []).forEach(s => {
+      if (!s || s.type !== 'scene_tracker' || !Array.isArray(s.areas)) return;
+      s.areas.forEach(a => { if (a && a.entity) ids.add(a.entity); if (a && a.light) ids.add(a.light); });
+    });
+    return ids;
+  }
+  _sceneTrackerEntitiesChanged(prevHass, hass) {
+    const ids = this._sceneTrackerEntityIds();
+    for (const id of ids) {
+      const a = prevHass.states[id], b = hass.states[id];
+      if (a === b) continue;
+      if (!a || !b) return true;
+      if (a.state !== b.state) return true;
+      if (a.last_updated !== b.last_updated) return true;   // light color/brightness attr changes
+    }
+    return false;
   }
 
   // True if the state of any Color Entity a button links to differs between two hass snapshots.
@@ -2400,32 +2861,53 @@ class ColorLightManagerCard extends HTMLElement {
   // The set of entity ids whose state a button-section's conditional style layers depend on:
   // each buttons section's representative light (for light_on/off/unavailable) + any entity a
   // layer's `entity_state` condition watches. Empty when no stacks use conditions.
+  // Returns { ids:Set, attrSensitive:bool } | null. `attrSensitive` is true when any layer uses
+  // `button_active`: matching a color/temp preset depends on the light's COLOR ATTRIBUTES, which
+  // can change while `.state` stays "on" — so those watched entities need attribute-level compare.
   _buttonConditionEntityIds() {
     const ids = new Set();
     let anyCond = false;
+    let attrSensitive = false;
+    // Every button's scene selects: watching each bound input_select means an option change repaints
+    // the buttons (their deterministic "active" flips). Independent of any conditional-layer usage.
+    ((this._config && this._config.presets) || []).forEach(p => {
+      presetSelects(p).forEach(b => { ids.add(b.entity); anyCond = true; });
+      // NOTE: follow-lights (glow_entities / scene members) are deliberately NOT watched here. They
+      // don't need a full DOM rebuild — updateStates() (the default path on every hass change) already
+      // repaints follow buttons via the fast-path. Watching them here (attribute-sensitive) caused a
+      // full re-render on every attribute tick of a followed light — a render storm.
+    });
+    // A section's default scene group flips to '-none-' on divergence — watch it so buttons bound to
+    // it de-highlight immediately (covers the case where no button explicitly binds the group).
+    this._orderedSectionsRaw().forEach(s => { if (s && s.default_scene_group) { ids.add(s.default_scene_group); anyCond = true; } });
     this._orderedSectionsRaw().filter(s => s.type === 'buttons').forEach(section => {
-      const slug = fixtureRefSlug(section.style_preset);
-      const stack = (slug && buttonStyleStack(slug)) ? buttonStyleStack(slug) : buttonStyleDefaultStack();
+      const stack = this._sectionButtonStack(section);
       if (!stack || !Array.isArray(stack.layers)) return;
       stack.layers.forEach(l => {
         const w = l && l.when; if (!w || !w.type) return;
         anyCond = true;
         if (w.type === 'entity_state' && w.entity) ids.add(w.entity);
-        else if (w.type === 'light_on' || w.type === 'light_off' || w.type === 'light_unavailable') {
+        else if (w.type === 'light_on' || w.type === 'light_off' || w.type === 'light_unavailable' || w.type === 'button_active') {
+          // button_active depends on each button's own target; those live within the section's
+          // target scope, so watching the section's targets covers them (full re-render on change).
+          if (w.type === 'button_active') attrSensitive = true;
           this._sectionTargetIds(section).forEach(id => ids.add(id));
         }
       });
     });
-    return anyCond ? ids : null;
+    return anyCond ? { ids, attrSensitive } : null;
   }
   _buttonConditionEntitiesChanged(prevHass, hass) {
-    const ids = this._buttonConditionEntityIds();
-    if (!ids) return false;
-    for (const id of ids) {
+    const spec = this._buttonConditionEntityIds();
+    if (!spec) return false;
+    for (const id of spec.ids) {
       const a = prevHass.states[id], b = hass.states[id];
       if (a === b) continue;
       if (!a || !b) return true;
       if (a.state !== b.state) return true;
+      // Color/temp button_active matching turns on attributes, not just state — repaint on any
+      // attribute change too (last_updated moves whenever a light's attributes are re-reported).
+      if (spec.attrSensitive && a.last_updated !== b.last_updated) return true;
     }
     return false;
   }
@@ -2467,8 +2949,16 @@ class ColorLightManagerCard extends HTMLElement {
   connectedCallback() {
     this._favoritesUnsub = favoritesService.subscribe(favs => { this._favorites = favs; this._renderFavoritesBar(); });
     this._favorites = favoritesService.getFavorites();
+    // Re-render when a button-style preset is saved elsewhere (e.g. this card's editor), so HA's
+    // live preview pane repaints immediately with the saved style — the WS store subscription
+    // covers the general case, this guarantees the same-page editor→preview repaint.
+    this._btnStylesSavedHandler = () => { if (this._rendered) this.renderCard(); };
+    window.addEventListener('clm-button-styles-saved', this._btnStylesSavedHandler);
   }
-  disconnectedCallback() { if (this._favoritesUnsub) { this._favoritesUnsub(); this._favoritesUnsub = null; } }
+  disconnectedCallback() {
+    if (this._favoritesUnsub) { this._favoritesUnsub(); this._favoritesUnsub = null; }
+    if (this._btnStylesSavedHandler) { window.removeEventListener('clm-button-styles-saved', this._btnStylesSavedHandler); this._btnStylesSavedHandler = null; }
+  }
   getCardSize() { return 6; }
   static getConfigElement() { return document.createElement('color-light-manager-card-editor'); }
 
@@ -2537,6 +3027,13 @@ class ColorLightManagerCard extends HTMLElement {
   _sectionPrimaryState(section) {
     const ids = this._sectionTargetIds(section);
     if (!ids.length || !this._hass) return null;
+    // Prefer the first target light that is currently ON, mirroring _presetPrimaryState. A section's
+    // Button Style light_on/light_off/light_unavailable conditions must reflect "is this section's
+    // lighting on" — not the fixed first id. Otherwise a scene that turns the FIRST target light off
+    // (e.g. Dinner dimming the floor light) flips a light_off-gated layer and disables the whole
+    // section's glow, even though the room is still lit. Falls back to the first id when none are on,
+    // so genuine all-off detection still works.
+    for (const id of ids) { const st = this._hass.states[id]; if (st && st.state === 'on') return st; }
     return this._hass.states[ids[0]] || null;
   }
   _primaryState(targetEntities) {
@@ -2544,13 +3041,85 @@ class ColorLightManagerCard extends HTMLElement {
     if (!ids.length || !this._hass) return null;
     return this._hass.states[ids[0]] || null;
   }
-  // The representative light state for a preset's active/glow detection — its first
-  // color-control light, or (no color targets) the card's first entity as a fallback.
+  // Light ids whose live color/state this button's APPEARANCE follows (fill, glow, accents).
+  // Resolution order (first non-empty wins):
+  //   1. preset.glow_entities — an explicit "follow these lights for color" list. Set by the user
+  //      when auto-resolution can't work (e.g. a Zigbee2MQTT scene whose scene.* entity is a proxy
+  //      that lists no member lights) or to override. Applies to ANY button kind.
+  //   2. Scene mode → the referenced scene's member LIGHTS, read live from the scene.* entity's
+  //      `entity_id` attribute. HA-native scenes expose them; Z2M/script proxy scenes yield [] here
+  //      (→ fall through to the fixed-color / grey fallback in _presetAppearance).
+  //   3. Non-scene buttons → their action color targets (Default pool ∪ own lights), as before.
+  // NOTE: there is deliberately NO section-Default-Entities fallback for scene buttons — that
+  // fallback was the "Dinner glow dies" bug: a scene button with no targets borrowed the section's
+  // representative light, so when a scene turned THAT light off the glow (and any light_on-gated
+  // glow layer) collapsed even though the scene's own lights were on.
+  _glowSourceIds(preset) {
+    const follow = Array.isArray(preset && preset.glow_entities) ? preset.glow_entities.filter(Boolean) : [];
+    if (follow.length) return follow;
+    if (buttonMode(preset) === 'scene') return this._sceneMemberLightIds(preset);
+    // Non-scene buttons: their action color targets, resolved from the targeting spec (Default pool
+    // if "Use Default Entities" is checked ∪ any own lights). NO extra fallback to the Default pool:
+    // if the user unchecks everything ("No lights selected"), the button follows NOTHING — so an Off
+    // button with no targets can't be falsely "active" just because a scene turned a pool light off
+    // (the "Off goes active when Dinner is active" bug). A button that wants the pool checks
+    // "Use Default Entities", which already includes it in these ids.
+    return this._presetColorIds(preset);
+  }
+  // Member light ids of a scene-mode button's referenced scene, from the scene.* entity's live
+  // `entity_id` attribute (HA-native scenes only; a Z2M proxy scene lists none → []).
+  _sceneMemberLightIds(preset) {
+    const ref = preset && preset.scene_ref;
+    const st = ref && this._hass && this._hass.states[ref];
+    const members = (st && st.attributes && Array.isArray(st.attributes.entity_id)) ? st.attributes.entity_id : [];
+    return members.filter(id => typeof id === 'string' && id.startsWith('light.'));
+  }
   _presetPrimaryState(preset) {
-    const ids = this._presetColorIds(preset);
-    const use = ids.length ? ids : this._entityIds();
+    const use = this._glowSourceIds(preset);
     if (!use.length || !this._hass) return null;
-    return this._hass.states[use[0]] || null;
+    let firstOn = null;
+    for (const id of use) {
+      const st = this._hass.states[id];
+      if (st && st.state === 'on') { firstOn = st; break; }
+    }
+    const chosen = firstOn || this._hass.states[use[0]] || null;
+    return chosen;
+  }
+  // Live color of a scene/follow button's resolved glow-source light (the first-ON one), or null
+  // when nothing usable is on. This is the color the button "follows".
+  _presetLiveColor(state) {
+    if (state && state.state === 'on') {
+      const a = state.attributes || {};
+      let rgb = Array.isArray(a.rgb_color) ? a.rgb_color
+        : (Array.isArray(a.xy_color) ? ColorUtils.xyToRgb(a.xy_color[0], a.xy_color[1]) : null);
+      if (!rgb) { const k = attrsToKelvin(a); if (k !== undefined) rgb = ColorUtils.kelvinToRgb(k); }
+      if (rgb) return ColorUtils.rgbToHex(...rgb);
+    }
+    return null;
+  }
+  // Resolve the { bodyColor, glowColor } a scene/follow button renders with. The two are
+  // INDEPENDENT (change #2):
+  //   • body — if a fixed button Style Color is enabled → that fixed color, ALWAYS. Otherwise the
+  //     live follow color, but ONLY when the button is ACTIVE (change #1: an inactive scene button
+  //     must not flicker as its follow-light changes color in the background); when inactive → the
+  //     button's fixed Style Color if set, else a neutral grey.
+  //   • glow — if a fixed Glow Color is enabled → that fixed color. Otherwise the live follow color
+  //     (→ the fixed Style Color → grey as fallbacks). The glow only actually shows when_active per
+  //     the style's glow condition, so it doesn't need the active-gate the body does.
+  _presetAppearance(preset, state) {
+    const live = this._presetLiveColor(state);
+    const active = isPresetActiveFor(this._effectivePreset(preset), state, this._config && this._config.temperature_output_format, this._lastPressedPresetId, presetSelectsActive(preset, this._hass));
+    // Fixed colors follow the existing "presence = enabled" convention (the checkbox adds/removes
+    // the key). button_style_color = fixed BODY color; button_glow_style_color = fixed GLOW color.
+    const bodyFixed = preset.button_style_color || null;
+    const glowFixed = preset.button_glow_style_color || null;
+    const bodyColor = bodyFixed
+      ? bodyFixed
+      : (active && live ? live : '#424242');
+    const glowColor = glowFixed
+      ? glowFixed
+      : (live || bodyFixed || '#424242');
+    return { bodyColor, glowColor };
   }
 
   // Calls a light service on a specific set of ids (defaults to all card entities).
@@ -2571,6 +3140,14 @@ class ColorLightManagerCard extends HTMLElement {
   // Legacy additive fields (scenes[]/turn_off_entities[]) are preserved in config but NOT fired.
   _applyPreset(rawPreset) {
     if (!rawPreset) return;
+
+    // Scene selects: set each bound input_select to its option. Applies to EVERY button kind and
+    // runs alongside the button's primary action below (a "Sports" button can set the helper in
+    // several rooms; an Off button can reset several helpers). Fired first so the option is marked
+    // even if a later action early-returns.
+    this._applyPresetSelects(rawPreset);
+    // Section default scene reset: a non-scene button diverges the room, so mark the group off-scene.
+    this._applyDefaultSceneReset(rawPreset);
 
     // Scene mode: fire exactly the referenced scene, nothing else.
     if (buttonMode(rawPreset) === 'scene') {
@@ -2621,6 +3198,58 @@ class ColorLightManagerCard extends HTMLElement {
         });
       }
     }
+  }
+
+  // Fire the button's input_select "scene selects": one input_select.select_option per binding.
+  // Skips bindings whose entity is missing or whose option isn't among the helper's current options
+  // (avoids HA errors from a stale/renamed option). Safe no-op when the button has no selects.
+  _applyPresetSelects(preset) {
+    const binds = presetSelects(preset);
+    if (!binds.length || !this._hass) return;
+    binds.forEach(b => {
+      const st = this._hass.states[b.entity];
+      if (!st) { console.warn(`${LOG_PREFIX} scene select: ${b.entity} not found`); return; }
+      const opts = (st.attributes && Array.isArray(st.attributes.options)) ? st.attributes.options : null;
+      if (opts && !opts.includes(b.option)) { console.warn(`${LOG_PREFIX} scene select: "${b.option}" not an option of ${b.entity}`); return; }
+      if (DEBUG) debugLog(`PRESS "${preset.name}": select_option ${b.entity} → "${b.option}"`);
+      this._hass.callService('input_select', 'select_option', { entity_id: b.entity, option: b.option })
+        .catch(e => console.warn(`${LOG_PREFIX} input_select.select_option failed`, e));
+    });
+  }
+
+  // Section default scene reset (press-driven divergence). When a button's section defines
+  // default_scene_group, pressing a button that diverges the room marks that group off-scene (its
+  // default_scene_option, typically '-none-'), de-highlighting the active scene. Skipped when:
+  //   • the button is a SCENE button (it's setting a scene, not diverging),
+  //   • the button already binds this group in its own Scene Selects (its explicit intent wins),
+  //   • the button opts out via no_scene_reset (Scene Selects panel).
+  // Deterministic and press-driven — never compares live light state.
+  _applyDefaultSceneReset(preset) {
+    if (!preset || !this._hass) return;
+    if (preset.no_scene_reset) { if (DEBUG) debugLog(`RESET "${preset.name}": skipped (no_scene_reset opt-out)`); return; }
+    if (buttonMode(preset) === 'scene') { if (DEBUG) debugLog(`RESET "${preset.name}": skipped (scene-mode button)`); return; }
+    const section = this._sectionForPreset(preset);
+    const group = section && section.default_scene_group;
+    if (!group) { if (DEBUG) debugLog(`RESET "${preset.name}": skipped (section has no default_scene_group)`); return; }
+    // Explicit binding to this group wins — don't override the button's own intent.
+    if (presetSelects(preset).some(b => b.entity === group)) { if (DEBUG) debugLog(`RESET "${preset.name}": skipped (button binds ${group} itself)`); return; }
+    const st = this._hass.states[group];
+    if (!st) { console.warn(`${LOG_PREFIX} default scene reset: ${group} not found`); return; }
+    const option = section.default_scene_option || '-none-';
+    const opts = (st.attributes && Array.isArray(st.attributes.options)) ? st.attributes.options : null;
+    if (opts && !opts.includes(option)) { console.warn(`${LOG_PREFIX} default scene reset: "${option}" not an option of ${group}`); return; }
+    if (DEBUG) debugLog(`RESET "${preset.name}": FIRING → set ${group} = "${option}" (was "${st.state}")`);
+    this._hass.callService('input_select', 'select_option', { entity_id: group, option })
+      .catch(e => console.warn(`${LOG_PREFIX} default scene reset failed`, e));
+  }
+
+  // The buttons section a preset belongs to (mirrors _presetsForSection's fallback: a missing/stale
+  // section_id resolves to the FIRST buttons section; unassigned buttons have no section).
+  _sectionForPreset(preset) {
+    if (!preset || preset.section_id === '__none__') return null;
+    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+    if (!buttonsSections.length) return null;
+    return buttonsSections.find(s => s.id === preset.section_id) || buttonsSections[0];
   }
 
   _setBrightness(pct, ids) {
@@ -3155,7 +3784,10 @@ class ColorLightManagerCard extends HTMLElement {
     const currentRgb = attrs.rgb_color || [255, 255, 255];
     const layoutClass = `layout-${cfg.layout || 'columns'}`;
     const gap = Number(cfg.gap) || 8;
-    const presetsHtml = (cfg.presets || []).map(p => this._renderPresetButton(p)).join('');
+    // NOTE: buttons are rendered per-section (see _renderSection → _renderPresetButton(p, bstyle)),
+    // which applies each section's Button Style. There is no card-level preset list in the DOM, so
+    // we do NOT pre-render one here — doing so ran a full (style-less) render pass over every button
+    // on every renderCard() whose output was discarded, and logged phantom glowEnabled=false lines.
 
     const scale = Number(cfg.scale) || 1.0;
     const vertical = cfg.slider_orientation === 'vertical';
@@ -3286,6 +3918,10 @@ class ColorLightManagerCard extends HTMLElement {
         .cpc-preset-btn.cpc-tile ha-icon { --mdc-icon-size:calc(26px * ${scale}); color:var(--cpc-tile-icon-color, var(--primary-text-color)); flex-shrink:0; }
         .cpc-preset-btn.cpc-tile .cpc-tile-name { font-size:calc(${buttonFontSize}px * ${scale}); }
         .cpc-preset-btn.cpc-tile:hover { transform:translateY(-1px); box-shadow:0 4px 14px rgba(0,0,0,0.35); }
+        /* Scene Tracker styled tile: name + current-scene sub-line stacked. */
+        .cpc-preset-btn .cpc-btn-labelwrap { display:flex; flex-direction:column; align-items:flex-start; min-width:0; }
+        .cpc-preset-btn.cpc-tile .cpc-btn-labelwrap { align-items:center; }
+        .cpc-preset-btn .cpc-btn-sublabel { font-size:calc(11px * ${scale}); color:var(--secondary-text-color); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
         .cpc-sliders { display:flex; width:100%; box-sizing:border-box; ${vertical ? `flex-direction:row; align-items:flex-start; gap:calc(16px * ${scale}); ${verticalAlignmentCss}` : `flex-direction:column; gap:calc(10px * ${scale});`} }
         .cpc-slider-row { display:flex; flex-direction:column; gap:4px; ${vertical ? `width:calc(${sliderWidth}px * ${scale});` : `width:${sliderLength}%;`} }
         .cpc-bar-slider {
@@ -3342,6 +3978,16 @@ class ColorLightManagerCard extends HTMLElement {
         /* Each body section is wrapped in .cpc-section; consistent spacing lives here. */
         .cpc-section { margin-bottom:calc(14px * ${scale}); }
         .cpc-section:last-child { margin-bottom:0; }
+        /* Scene Tracker: a responsive grid of read-only Area status tiles. */
+        .cpc-scene-tracker { display:grid; grid-template-columns:repeat(auto-fill, minmax(calc(140px * ${scale}), 1fr)); gap:calc(8px * ${scale}); }
+        .cpc-scene-tracker-empty { font-size:calc(12px * ${scale}); color:var(--secondary-text-color); padding:calc(8px * ${scale}) 0; }
+        .cpc-area-tile { display:flex; align-items:center; gap:calc(8px * ${scale}); padding:calc(8px * ${scale}) calc(10px * ${scale}); border-radius:calc(10px * ${scale}); background:var(--secondary-background-color, rgba(255,255,255,0.04)); min-width:0; }
+        .cpc-area-tile.cpc-area-unavailable { opacity:0.5; }
+        .cpc-area-dot { flex:0 0 auto; width:calc(8px * ${scale}); height:calc(8px * ${scale}); border-radius:50%; }
+        .cpc-area-icon { flex:0 0 auto; --mdc-icon-size:calc(20px * ${scale}); }
+        .cpc-area-text { display:flex; flex-direction:column; min-width:0; }
+        .cpc-area-name { font-size:calc(13px * ${scale}); color:var(--primary-text-color); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .cpc-area-option { font-size:calc(11px * ${scale}); color:var(--secondary-text-color); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .cpc-current-values {
           display:grid; grid-template-columns:repeat(2, 1fr); gap:calc(6px * ${scale}) calc(14px * ${scale});
           font-size:calc(12px * ${scale}); color:var(--secondary-text-color);
@@ -3499,156 +4145,29 @@ class ColorLightManagerCard extends HTMLElement {
   // Whether a preset's target matches the light's current live state, used to
   // decide "when_active" button glow. Off presets match when the light is off;
   // color/temp presets match when the corresponding attribute equals the preset's.
-  _isPresetActive(preset, state) {
-    if (!state) return false;
-    const attrs = state.attributes || {};
-    const mode = presetMode(preset);
-    if (mode === 'off') return state.state === 'off';
-    if (state.state !== 'on') return false;
-    // Compare the preset's color to the light's current color. Prefer comparing in the SAME
-    // native format both sides report (xy↔xy, hs↔hs) to avoid lossy cross-conversion — a
-    // gamut-shifting controller's xy→rgb differs from ours, which made XY presets never match.
-    // Otherwise fall back to an RGB approximation with a generous tolerance for such controllers.
-    const fmt = presetColorFormat(preset);
-    const near = (a, b, tol) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) <= tol);
-    const colorMatches = () => {
-      if (fmt === 'xy' && Array.isArray(attrs.xy_color)) return near(preset.xy_color, attrs.xy_color, 0.05);
-      if (fmt === 'hs' && Array.isArray(attrs.hs_color)) return near(preset.hs_color, attrs.hs_color, 8);
-      // RGB comparison fallback (tolerance widened to 32 for controllers that gamut-shift).
-      const target = presetColorToRgb(preset);
-      const cur = Array.isArray(attrs.rgb_color) ? attrs.rgb_color
-        : (Array.isArray(attrs.xy_color) ? ColorUtils.xyToRgb(attrs.xy_color[0], attrs.xy_color[1]) : null);
-      return near(target, cur, 32);
-    };
-    const tempMatches = () => {
-      const k = attrsToKelvin(attrs);
-      if (k !== undefined) return Math.abs(k - preset.color_kelvin) <= 40;
-      // The light is driven in a color mode (the configured temperature send format) and
-      // reports no kelvin. Compare in that same format where possible to avoid lossy math.
-      const outFmt = this._config.temperature_output_format;
-      if (outFmt === 'xy' && Array.isArray(attrs.xy_color)) return near(ColorUtils.kelvinToXy(preset.color_kelvin), attrs.xy_color, 0.05);
-      if (outFmt === 'hs' && Array.isArray(attrs.hs_color)) return near(ColorUtils.kelvinToHs(preset.color_kelvin), attrs.hs_color, 8);
-      const target = ColorUtils.kelvinToRgb(preset.color_kelvin);
-      const cur = Array.isArray(attrs.rgb_color) ? attrs.rgb_color
-        : (Array.isArray(attrs.xy_color) ? ColorUtils.xyToRgb(attrs.xy_color[0], attrs.xy_color[1]) : null);
-      return near(target, cur, 32);
-    };
-    if (mode === 'color') return colorMatches();
-    if (mode === 'temp') return tempMatches();
-    return false;
+  // Thin wrappers over the shared module renderer (see renderPresetButtonHtml et al.), passing the
+  // card's temperature_output_format. The editor preview calls the module functions directly.
+  _isPresetActive(preset, state) { return isPresetActiveFor(preset, state, this._config && this._config.temperature_output_format, this._lastPressedPresetId, presetSelectsActive(preset, this._hass)); }
+
+  _presetBorderAndGlowCss(preset, state, bstyle, btnColorOverride) {
+    return presetBorderAndGlowCssFor(preset, state, bstyle || this._config, this._config && this._config.temperature_output_format, btnColorOverride, this._lastPressedPresetId, presetSelectsActive(preset, this._hass));
   }
 
-  _presetBorderAndGlowCss(preset, state, bstyle) {
-    const cfg = bstyle || this._config;   // section's effective button style (Card Default = config)
-    const parts = { border: '', boxShadow: 'none' };
-    if (cfg.button_border_enabled) {
-      const w = Number(cfg.button_border_width) || 1;
-      let color = cfg.button_border_color || '#2196F3';
-      // "Match Button Color": border = a lighter shade of this button's own preset color
-      // (mix ~45% toward white), matching the room-card look where the outline is the
-      // lightest shade of the tile. Off presets (no color) keep the fixed/theme color.
-      if (cfg.button_border_color_mode === 'match') {
-        const isOff = preset.action === 'turn_off';
-        if (!isOff) {
-          const rgb = presetColorToRgb(preset);
-          if (rgb) color = ColorUtils.rgbToHex(...ColorUtils.mixRgb(rgb, [255, 255, 255], 0.45));
-        }
-      }
-      parts.border = buttonBorderCss(w, color, buttonBorderSides(cfg));
-    }
-    // Box-shadow can carry BOTH a colored glow and a plain drop shadow (comma-separated).
-    const shadows = [];
-    if (cfg.button_glow_enabled) {
-      const condition = cfg.button_glow_condition || 'never';
-      const shouldGlow = condition === 'always' || (condition === 'when_active' && this._isPresetActive(preset, state));
-      if (shouldGlow) {
-        let color = cfg.button_glow_color || '#2196F3';
-        // "match" mode uses the light's current color (falls back to the fixed color when off/unknown).
-        if (cfg.button_glow_color_mode === 'match') {
-          const attrs = (state && state.attributes) || {};
-          let rgb = Array.isArray(attrs.rgb_color) ? attrs.rgb_color
-            : (Array.isArray(attrs.xy_color) ? ColorUtils.xyToRgb(attrs.xy_color[0], attrs.xy_color[1]) : null);
-          if (!rgb) { const k = attrsToKelvin(attrs); if (k !== undefined) rgb = ColorUtils.kelvinToRgb(k); }
-          if (rgb && state && state.state === 'on') color = ColorUtils.rgbToHex(...rgb);
-        }
-        const intensity = Number(cfg.button_glow_intensity) || 1.0;
-        shadows.push(`0 0 ${12 * intensity}px ${-2 * intensity}px ${color}`);
-      }
-    }
-    // Plain drop shadow (parity with the card's), independent of the glow.
-    if (cfg.button_shadow_enabled) {
-      const op = clamp(Number(cfg.button_shadow_opacity), 0, 1);
-      shadows.push(`${Number(cfg.button_shadow_x)||0}px ${Number(cfg.button_shadow_y)||0}px ${Number(cfg.button_shadow_blur)||0}px ${Number(cfg.button_shadow_spread)||0}px ${ColorUtils.hexToRgba(cfg.button_shadow_color || '#000000', Number.isFinite(op) ? op : 0.35)}`);
-    }
-    if (shadows.length) parts.boxShadow = shadows.join(', ');
-    return parts;
-  }
-
-  _renderPresetButton(preset, bstyle) {
-    // `bstyle` is the section's effective button style (Card Default = this._config). All button
-    // APPEARANCE reads go through `cfg` here so a section's preset overrides them per-section.
+  _renderPresetButton(preset, bstyle, stateOverride) {
+    // `bstyle` is the section's effective button style (Card Default = this._config). The look
+    // resolves through any referenced library profile; name/icon/id stay button-owned. `stateOverride`
+    // (optional) lets the editor preview supply a fake light state so it renders through this exact
+    // path. Delegates to the shared module renderer so card + preview never drift.
     const cfg = bstyle || this._config;
-    // Visual look (color/action) resolves through any referenced library profile; name/icon/
-    // id stay button-owned (read from `preset`).
     const look = this._effectivePreset(preset);
-    const isOff = look.action === 'turn_off';
-    // Styling color: an explicit per-button style color overrides the look-derived color
-    // (so scene-only/None buttons can still look intentional); else derive from the look.
-    const styleOverride = preset.button_style_color ? ColorUtils.hexToRgb(preset.button_style_color) : null;
-    const rgb = styleOverride || presetColorToRgb(look);
-    const bg = ColorUtils.rgbToHex(...rgb);
-    const hasStyleOverride = !!styleOverride;
-    // Active-state/glow follows the preset's OWN target light, not the card's primary.
-    const state = this._presetPrimaryState(preset);
-    const { border, boxShadow } = this._presetBorderAndGlowCss(look, state, cfg);
-    const radius = Number(cfg.button_border_radius);
-    const icon = escapeHtml(resolvePresetIcon(preset, buttonMode(preset)));
-    // Raise glowing buttons above neighbors so their halo isn't overpainted (see .cpc-glowing).
-    const glowCls = boxShadow && boxShadow !== 'none' ? ' cpc-glowing' : '';
-
-    // Universal gradient-border layers (background-image lines) painted over the button's fill.
-    // Match color for gradient 'match' stops = the button's own display color when it has one
-    // (so the gradient tracks each button), else the configured fixed border color.
-    const gbMatch = (!isOff || hasStyleOverride) ? bg : (cfg.button_border_color || '#2196F3');
-    const gb = gradientBorderBackground(cfg.button_border_gradient, gbMatch);
-
-    // Tinted style: a large card-style button with a subtle color-tinted gradient background
-    // and a colored icon (the "room card" look). The preset color drives the tint + icon;
-    // for Off (no color) we fall back to a neutral tile with theme text color.
-    // (Accepts legacy value "tile" for backward compatibility with older configs.)
-    if (cfg.button_style === 'tinted' || cfg.button_style === 'tile') {
-      const radiusCss = Number.isFinite(radius) ? `border-radius:${radius}px;` : '';
-      let fillImage, iconColor;
-      if (isOff && !hasStyleOverride) {
-        fillImage = 'linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02))';
-        iconColor = 'var(--secondary-text-color)';
-      } else {
-        fillImage = `linear-gradient(135deg, ${ColorUtils.hexToRgba(bg, 0.35)}, ${ColorUtils.hexToRgba(bg, 0.06)})`;
-        iconColor = bg;
-      }
-      // Border-line layers go FIRST (on top), then the tint fill behind them. NOTE: the longhand
-      // background-image path must also reset background-color to transparent — the base
-      // .cpc-preset-btn rule sets background:#fff, and longhand doesn't clear that component, so
-      // the white would leak through the tint's semi-transparent areas.
-      const bgCss = gb
-        ? `background-image:${gb.image}, ${fillImage}; background-size:${gb.size}, auto; background-position:${gb.position}, center; background-repeat:${gb.repeat}, no-repeat; background-color:transparent;`
-        : `background:${fillImage};`;
-      const styleAttr = `style="${bgCss}${border}${radiusCss}box-shadow:${boxShadow};--cpc-tile-icon-color:${iconColor};"`;
-      return `<button class="cpc-preset-btn cpc-tile${glowCls} ${isOff ? 'off-style' : ''}" data-preset-id="${escapeHtml(preset.id)}" ${styleAttr}><ha-icon icon="${icon}"></ha-icon><span class="cpc-tile-name cpc-btn-label">${escapeHtml(preset.name)}</span></button>`;
-    }
-
-    const radiusCss = Number.isFinite(radius) ? `border-radius:${radius}px;` : '';
-    const fill = (isOff && !hasStyleOverride) ? null : bg;   // solid fill color, or none for Off
-    let bgCss;
-    if (gb) {
-      // Border-line layers on top; solid fill (or transparent) behind. Always set
-      // background-color explicitly so the base .cpc-preset-btn `background:#fff` never leaks.
-      bgCss = `background-image:${gb.image}; background-size:${gb.size}; background-position:${gb.position}; background-repeat:${gb.repeat}; background-color:${fill || 'transparent'};`;
-    } else {
-      bgCss = fill ? `background:${fill};` : '';
-    }
-    const styleAttr = `style="${bgCss}${border}${radiusCss}box-shadow:${boxShadow};"`;
-    return `<button class="cpc-preset-btn${glowCls} ${isOff ? 'off-style' : ''}" data-preset-id="${escapeHtml(preset.id)}" ${styleAttr}><ha-icon icon="${icon}"></ha-icon><span class="cpc-btn-label">${escapeHtml(preset.name)}</span></button>`;
+    const state = stateOverride !== undefined ? stateOverride : this._presetPrimaryState(preset);
+    // Scene buttons (and any button set to follow glow_entities) resolve an independent
+    // { bodyColor, glowColor } pair: body follows the live color only when ACTIVE (else its fixed
+    // Style Color / neutral); glow follows its own fixed Glow Color or the live color. Other button
+    // kinds keep the look/style-color path (appearance undefined).
+    const followsColor = buttonMode(preset) === 'scene' || (Array.isArray(preset.glow_entities) && preset.glow_entities.length > 0);
+    const appearance = followsColor ? this._presetAppearance(preset, state) : undefined;
+    return renderPresetButtonHtml(look, preset, cfg, state, this._config && this._config.temperature_output_format, this._lastPressedPresetId, presetSelectsActive(preset, this._hass), appearance);
   }
 
   // Maps a left/center/right position choice to a justify-content rule, for
@@ -3828,8 +4347,10 @@ class ColorLightManagerCard extends HTMLElement {
         // color the card most recently applied (pure intent — independent of live light state).
         if (preset) this._lastPressedPresetId = preset.id;
         this._applyPreset(preset);
-        // Refresh glow/header immediately so "active" color mode reflects this press.
-        if (this._config.card_glow_color_mode === 'active' || this._config.icon_color_mode === 'active') this.updateStates();
+        // Refresh glow/header immediately so "active" reflects this press. Always call updateStates
+        // so a scene (mode 'none') button — whose "active" is purely last-pressed — repaints its
+        // glow right away (not just when card/icon 'active' color mode is on).
+        this.updateStates();
       };
     });
 
@@ -4058,19 +4579,65 @@ class ColorLightManagerCard extends HTMLElement {
   }
 
   // The effective button-appearance settings for a buttons section. Resolution order:
-  //   1. the section's referenced stack (style_preset: 'lib:<slug>' — a preset or Built-In)
-  //   2. else the system-wide default (the ★ pointer → a preset or Built-In; never nothing)
+  //   1. the section's referenced stack (style_preset: 'lib:<slug>' — a preset or built-in)
+  //   2. else Basic Theme (the neutral built-in floor — never nothing)
   // The chosen stack's ACTIVE layers are flattened (last-writer-wins) over the card defaults, so
   // a sparse stack still fills in. Conditions are evaluated per the section's context.
+  // The raw button-style STACK for a section: its explicit per-section preset (built-in or stored),
+  // else Basic Theme. Every section names a concrete style now — there is no system-default pointer;
+  // an unset/missing ref simply resolves to Basic Theme (the safe neutral built-in).
+  _sectionButtonStack(section) {
+    const slug = fixtureRefSlug(section && section.style_preset);   // 'lib:<slug>' → slug
+    return (slug && buttonStyleStack(slug)) ? buttonStyleStack(slug) : builtinButtonStack(BTN_STYLE_BASIC_SLUG);
+  }
+  // Section-level effective style: layout/metrics + all SECTION-scoped conditional layers applied.
+  // Per-button conditions (button_active) evaluate false here — they resolve per button in
+  // _buttonStyleForPreset at render time. Used for the section's scoped CSS + layout class.
   _sectionButtonStyle(section) {
     const cfg = this._config;
-    const slug = fixtureRefSlug(section && section.style_preset);   // 'lib:<slug>' → slug
-    // Explicit per-section preset (Built-In or a stored one), else the system-wide default (which
-    // itself resolves to a preset or Built-In — never nothing).
-    const stack = (slug && buttonStyleStack(slug)) ? buttonStyleStack(slug) : buttonStyleDefaultStack();
+    const stack = this._sectionButtonStack(section);
     if (!stack) return cfg;
     const isActive = (when) => this._buttonConditionActive(when, section);
     return { ...cfg, ...extractButtonAppearance(flattenButtonStack(stack, isActive)) };
+  }
+  // Per-BUTTON effective style: re-flattens the section's stack for one preset so a `button_active`
+  // overlay applies only to the button whose scene is currently live on its target. Section-scoped
+  // conditions (light_on/off, entity_state) delegate to _buttonConditionActive; button_active is
+  // resolved via _isPresetActive against THIS preset's own target state.
+  _buttonStyleForPreset(stack, section, preset) {
+    if (!stack) return this._config;
+    const isActive = (when) => {
+      if (when && when.type === 'button_active') {
+        // Selects-bound buttons use the deterministic all-match signal; others fall back to the
+        // color/state/last-pressed logic inside _isPresetActive.
+        const sa = presetSelectsActive(preset, this._hass);
+        if (sa !== null) return sa;
+        return this._isPresetActive(this._effectivePreset(preset), this._presetPrimaryState(preset));
+      }
+      // "Button Off": this specific button is a turn-off (Light Off) button — applies to it
+      // regardless of light state, so its Off look can be styled independently per button.
+      if (when && when.type === 'button_off') {
+        return this._effectivePreset(preset).action === 'turn_off';
+      }
+      // Light-state conditions on a FOLLOW-COLOR button (scene, or one with glow_entities) follow
+      // THIS button's own glow-source light — so a light_on-gated glow layer doesn't collapse when a
+      // scene turns the SECTION's representative light off while the scene's own lights are on (the
+      // Dinner-glow-dies bug). This is scoped to follow buttons ONLY; every other button kind (Off,
+      // color, temp, profile) keeps the section-level evaluation unchanged — otherwise an Off button
+      // whose target a scene turns off would wrongly light up (the "Off goes active" regression).
+      const followsColor = buttonMode(preset) === 'scene' || (Array.isArray(preset.glow_entities) && preset.glow_entities.length > 0);
+      if (followsColor && when && (when.type === 'light_on' || when.type === 'light_off' || when.type === 'light_unavailable')) {
+        const st = this._presetPrimaryState(preset);
+        if (st) {
+          if (when.type === 'light_on') return st.state === 'on';
+          if (when.type === 'light_off') return st.state === 'off';
+          return st.state === 'unavailable' || st.state === 'unknown';
+        }
+        // No own light resolved → fall through to the section-level evaluation.
+      }
+      return this._buttonConditionActive(when, section);
+    };
+    return { ...this._config, ...extractButtonAppearance(flattenButtonStack(stack, isActive)) };
   }
 
   // Evaluate a layer condition for a buttons section. No condition (or unknown type) = always-on.
@@ -4082,6 +4649,10 @@ class ColorLightManagerCard extends HTMLElement {
     if (!when || typeof when !== 'object' || !when.type) return true;
     const hass = this._hass;
     switch (when.type) {
+      // Per-button conditions: never true at the SECTION level (a section has no single button).
+      // Resolved per button in _buttonStyleForPreset; here they mean "base look only".
+      case 'button_active': return false;
+      case 'button_off': return false;
       case 'light_on': { const st = this._sectionPrimaryState(section); return !!st && st.state === 'on'; }
       case 'light_off': { const st = this._sectionPrimaryState(section); return !!st && st.state === 'off'; }
       case 'light_unavailable': { const st = this._sectionPrimaryState(section); return !st || st.state === 'unavailable' || st.state === 'unknown'; }
@@ -4174,8 +4745,11 @@ class ColorLightManagerCard extends HTMLElement {
       const div = '';   // legacy auto-dividers removed — dividers are their own sections now
       // Per-section style overrides (scoped CSS) — empty when the section uses Card Default.
       const overrideCss = this._sectionButtonStyleCss(section, bstyle);
-      // Presets belonging to this section render with THIS section's effective style.
-      const presetsHtml = this._presetsForSection(section.id).filter(p => !p.hidden).map(p => this._renderPresetButton(p, bstyle)).join('');
+      // Each button re-flattens the stack for ITSELF so a `button_active` overlay applies only to
+      // the button whose scene is live (section-scoped conditions still resolve the same for all).
+      const stack = this._sectionButtonStack(section);
+      const presetsHtml = this._presetsForSection(section.id).filter(p => !p.hidden)
+        .map(p => this._renderPresetButton(p, this._buttonStyleForPreset(stack, section, p))).join('');
       const body = this._wrapSectionBody(section, `<div class="cpc-presets ${layoutClass}">${presetsHtml}</div>`);
       return `${overrideCss}<div class="cpc-section${div}" data-section-id="${section.id}">${heading}${body}</div>`;
     }
@@ -4207,7 +4781,121 @@ class ColorLightManagerCard extends HTMLElement {
       const body = this._wrapSectionBody(section, this._currentValuesBlock(st, section.id));
       return `<div class="cpc-section${div}" data-section-id="${section.id}">${heading}${body}</div>`;
     }
+    if (section.type === 'scene_tracker') {
+      const body = this._wrapSectionBody(section, this._renderSceneTracker(section));
+      return `<div class="cpc-section" data-section-id="${section.id}">${heading}${body}</div>`;
+    }
     return '';
+  }
+
+  // Scene Tracker: a read-only status board — one tile per Area. Each Area names an input_select
+  // (its scene state) and optionally a representative light (for a live color/brightness readout).
+  // Tiles reflect the current option + a status color; they never write state (v1 read-only).
+  _renderSceneTracker(section) {
+    const areas = Array.isArray(section.areas) ? section.areas : [];
+    if (!areas.length) return `<div class="cpc-scene-tracker-empty">No areas configured. Add areas in the section settings.</div>`;
+    // Optional Button Style binding: when the section names a style_preset, tiles render as styled
+    // buttons (that style's border/glow/gradient/background), reusing the exact button renderer so
+    // the tracker matches the buttons. Otherwise tiles use the default chip layout.
+    const styleSlug = fixtureRefSlug(section.style_preset);
+    const styled = styleSlug ? (buttonStyleStack(styleSlug) || null) : null;
+    if (styled) {
+      // Render EXACTLY like a buttons section: same `.cpc-presets` flex container + layout class +
+      // scoped style CSS, and NO `.cpc-scene-tracker` grid (which would override the button layout).
+      const bstyle = this._sectionButtonStyle(section);
+      const overrideCss = this._sectionButtonStyleCss(section, bstyle);
+      const layoutClass = `layout-${bstyle.layout || 'columns'}`;
+      return `${overrideCss}<div class="cpc-presets ${layoutClass}">${areas.map(a => this._renderAreaTileStyled(a, section, styled)).join('')}</div>`;
+    }
+    return `<div class="cpc-scene-tracker">${areas.map(a => this._renderAreaTile(a)).join('')}</div>`;
+  }
+  // Find the Scene button whose Scene Select binding matches this (entity, option) — i.e. the button
+  // that PUTS the group in this state. The Scene Tracker borrows that button's own color + icon so a
+  // tile looks exactly like the button that produced its current scene. Returns the preset or null.
+  _buttonForOption(entity, option) {
+    if (!entity || !option) return null;
+    return (this._config.presets || []).find(p => presetSelects(p).some(b => b.entity === entity && b.option === option)) || null;
+  }
+  // Shared: resolve an Area's live status into { option, unavailable, color, icon, sub, isOff, isActive }.
+  // Color priority: MATCHING scene button's own color/icon (so the tile mirrors the button that set
+  // this scene) → live light color → option→color map → neutral.
+  _resolveAreaStatus(area) {
+    const hass = this._hass;
+    const selSt = (area && area.entity && hass && hass.states) ? hass.states[area.entity] : null;
+    const option = selSt ? String(selSt.state) : '';
+    const unavailable = !selSt || option === 'unavailable' || option === 'unknown';
+    const lightSt = (area && area.light && hass && hass.states) ? hass.states[area.light] : null;
+    // The Scene button that drives this area's current option (if any) — its color/icon lead.
+    const srcBtn = this._buttonForOption(area && area.entity, option);
+    let color = null;
+    if (srcBtn) {
+      if (srcBtn.button_style_color && /^#[0-9a-f]{6}$/i.test(srcBtn.button_style_color)) color = srcBtn.button_style_color;
+      else { const rgb = presetColorToRgb(this._effectivePreset(srcBtn)); if (rgb && !(srcBtn.look_none || srcBtn.action === 'turn_off')) color = ColorUtils.rgbToHex(...rgb); }
+    }
+    const optColor = (area && area.option_colors && typeof area.option_colors === 'object') ? area.option_colors[option] : null;
+    // Live light color only when the matching button didn't already provide one (button color leads,
+    // per the explicit design: the tile mirrors the button that set this scene).
+    if (!color && lightSt && lightSt.state === 'on') {
+      const attrs = lightSt.attributes || {};
+      let rgb = Array.isArray(attrs.rgb_color) ? attrs.rgb_color
+        : (Array.isArray(attrs.xy_color) ? ColorUtils.xyToRgb(attrs.xy_color[0], attrs.xy_color[1]) : null);
+      if (!rgb) { const k = attrsToKelvin(attrs); if (k !== undefined) rgb = ColorUtils.kelvinToRgb(k); }
+      if (rgb) color = ColorUtils.rgbToHex(...rgb);
+    }
+    if (!color && optColor) color = optColor;
+    const isOff = !option || /^(-?off-?|none|off)$/i.test(option);
+    // Icon: matching button's own icon → per-option map → area icon → generic.
+    const btnIcon = srcBtn ? resolvePresetIcon(srcBtn, buttonMode(srcBtn)) : null;
+    const iconMap = (area && area.icon_map && typeof area.icon_map === 'object') ? area.icon_map : null;
+    const icon = normalizeIcon(btnIcon || (iconMap && iconMap[option]) || (area && area.icon) || 'mdi:palette-outline');
+    let sub = '';
+    if (lightSt) {
+      if (lightSt.state === 'on') { const bri = lightSt.attributes && lightSt.attributes.brightness; sub = bri != null ? `${Math.round((bri / 255) * 100)}%` : 'On'; }
+      else if (lightSt.state === 'off') sub = 'Off';
+    }
+    // "Active" for tracker glow = the area is on a real (non-off, available) scene.
+    const isActive = !unavailable && !isOff;
+    return { option, unavailable, color, icon, sub, isOff, isActive, lightSt };
+  }
+  // Default chip tile (no Button Style bound).
+  _renderAreaTile(area) {
+    const st = this._resolveAreaStatus(area);
+    const color = st.color || (st.isOff ? 'var(--secondary-text-color)' : 'var(--primary-color)');
+    const name = escapeHtml((area && area.name) || (area && area.entity) || 'Area');
+    const optionLabel = st.unavailable ? '—' : escapeHtml(st.option || '—');
+    return `<div class="cpc-area-tile${st.unavailable ? ' cpc-area-unavailable' : ''}">
+      <span class="cpc-area-dot" style="background:${color};"></span>
+      <ha-icon class="cpc-area-icon" icon="${st.icon}" style="color:${color};"></ha-icon>
+      <span class="cpc-area-text"><span class="cpc-area-name">${name}</span><span class="cpc-area-option">${optionLabel}${st.sub ? ` · ${escapeHtml(st.sub)}` : ''}</span></span>
+    </div>`;
+  }
+  // Styled tile: renders through the SAME button renderer as real buttons, using the bound Button
+  // Style's flattened look. The area's status color becomes the tile's button color; the active-glow
+  // (button_active layer / when_active glow) fires when the area is on a real scene (isActive).
+  _renderAreaTileStyled(area, section, stack) {
+    const st = this._resolveAreaStatus(area);
+    // Flatten the style with button_active resolved to THIS tile's active state; other section-scoped
+    // conditions evaluate against the section context.
+    const isActive = (when) => {
+      if (when && when.type === 'button_active') return st.isActive;
+      if (when && when.type === 'button_off') return st.isOff;
+      return this._buttonConditionActive(when, section);
+    };
+    const cfg = { ...this._config, ...extractButtonAppearance(flattenButtonStack(stack, isActive)) };
+    // Render IDENTICALLY to a button using this style: name is just the Area name (the current scene
+    // shows on the sub-line). The tile's color is the one resolved in _resolveAreaStatus — which now
+    // LEADS with the matching Scene button's own color, so the tile mirrors that button's look
+    // (match-mode glow/border/gradient resolve against the same color the button uses). No color
+    // (no matching button, no light) → colorless, exactly as the equivalent button would render.
+    const name = (area && area.name) || (area && area.entity) || 'Area';
+    const subLabel = st.unavailable ? '—' : (st.option || '');   // current scene shown on a second line
+    const colorHex = (st.color && /^#[0-9a-f]{6}$/i.test(st.color)) ? st.color : null;
+    const preset = { id: `area-${escapeHtml((area && area.entity) || name)}`, name, _sublabel: subLabel, icon: st.icon, mode: st.isOff ? 'off' : 'scene', look_none: !st.isOff, ...(st.isOff ? { action: 'turn_off' } : {}), ...(colorHex ? { button_style_color: colorHex } : {}) };
+    const look = st.isOff ? { action: 'turn_off' } : (colorHex ? { rgb_color: ColorUtils.hexToRgb(colorHex) } : { look_none: true });
+    // Pass the Area's representative light state so 'match'-mode glow/border track the live light,
+    // exactly as a real button pointed at that light would. selectsActive overrides active-detection
+    // for the glow: true when the area is on a real scene.
+    return renderPresetButtonHtml(look, preset, cfg, st.lightSt || null, this._config && this._config.temperature_output_format, null, st.isActive);
   }
 
   // Presets assigned to a section. A preset's section_id names its section; presets with no
@@ -4218,6 +4906,7 @@ class ColorLightManagerCard extends HTMLElement {
     const firstButtonsId = buttonsSections.length ? buttonsSections[0].id : null;
     const validIds = new Set(buttonsSections.map(s => s.id));
     return presets.filter(p => {
+      if (p.section_id === '__none__') return false;   // unassigned: never rendered on the card
       const sid = validIds.has(p.section_id) ? p.section_id : firstButtonsId;
       return sid === sectionId;
     });
@@ -4295,29 +4984,68 @@ class ColorLightManagerCard extends HTMLElement {
     // so a section preset that enables glow works even if the card default doesn't.
     {
       const byId = new Map((cfg.presets || []).map(p => [p.id, p]));
-      // Map each section id → its effective button style, so per-button lookup is cheap.
-      const styleBySection = new Map();
-      this._orderedSectionsRaw().filter(s => s.type === 'buttons').forEach(s => styleBySection.set(s.id, this._sectionButtonStyle(s)));
+      // Map each section id → its raw button-style STACK, so per-button re-flatten is cheap. We
+      // resolve the PER-BUTTON style here (not the section style) so button_active / button_off
+      // overlays are honored — otherwise this fast-path would strip them and revert the glow.
+      const stackBySection = new Map();
+      const sectionById = new Map();
+      this._orderedSectionsRaw().filter(s => s.type === 'buttons').forEach(s => { stackBySection.set(s.id, this._sectionButtonStack(s)); sectionById.set(s.id, s); });
       const btns = this.querySelectorAll('.cpc-preset-btn');
-      const rows = DEBUG ? [] : null;
       btns.forEach(btn => {
         const preset = byId.get(btn.dataset.presetId);
         if (!preset) return;
         const sectionEl = btn.closest('.cpc-section');
-        const bstyle = (sectionEl && styleBySection.get(sectionEl.dataset.sectionId)) || cfg;
-        if (!(bstyle.button_glow_enabled && (bstyle.button_glow_condition === 'when_active' || bstyle.button_glow_color_mode === 'match'))) return;
+        const sid = sectionEl && sectionEl.dataset.sectionId;
+        const stack = sid ? stackBySection.get(sid) : null;
+        const section = sid ? sectionById.get(sid) : null;
+        // Per-button effective style (base + button_active/button_off overlays for THIS button).
+        const bstyle = stack ? this._buttonStyleForPreset(stack, section, preset) : cfg;
         try {
-          const look = this._effectivePreset(preset);
           const st = this._presetPrimaryState(preset);
+          // A "follows color" button (scene, or any button with glow_entities) drives its WHOLE
+          // appearance — fill, glow, gradient border, icon accents — from one resolved live color.
+          // So a glow-only patch would leave the fill stale; re-render the whole button instead so
+          // every effect tracks the new color together (exactly like a single-color button).
+          const followsColor = buttonMode(preset) === 'scene' || (Array.isArray(preset.glow_entities) && preset.glow_entities.length > 0);
+          if (followsColor) {
+            // A follow button's whole appearance (fill + glow + accents) can change with the resolved
+            // color. But updateStates() runs on EVERY hass tick, and a followed light re-reports
+            // attributes constantly — so replace the node ONLY when its appearance actually changed.
+            // We key on a compact signature (body/glow color + active + glowing) rather than full
+            // HTML (attribute-order/whitespace differences would make HTML compare unreliable).
+            // Rebuilding every tick would destroy the click handler mid-press — the "takes several
+            // clicks to activate" bug.
+            const app = this._presetAppearance(preset, st);
+            const active = isPresetActiveFor(this._effectivePreset(preset), st, this._config && this._config.temperature_output_format, this._lastPressedPresetId, presetSelectsActive(preset, this._hass));
+            const sig = `${app.bodyColor}|${app.glowColor}|${active ? 1 : 0}|${bstyle.button_glow_enabled ? 1 : 0}|${bstyle.button_glow_condition || ''}`;
+            if (btn.dataset.followSig === sig) return;   // unchanged → leave the node (+ its handler) alone
+            const tmp = document.createElement('template');
+            tmp.innerHTML = this._renderPresetButton(preset, bstyle).trim();
+            const fresh = tmp.content.firstElementChild;
+            if (fresh) {
+              fresh.dataset.followSig = sig;
+              // Re-bind the press handler the freshly-rendered node lacks (listeners are attached
+              // per-element in the initial render, not delegated).
+              fresh.onclick = () => {
+                const p = (this._config.presets || []).find(x => x.id === fresh.dataset.presetId);
+                if (p) this._lastPressedPresetId = p.id;
+                this._applyPreset(p);
+                this.updateStates();
+              };
+              btn.replaceWith(fresh);
+            }
+            return;
+          }
+          if (!(bstyle.button_glow_enabled && (bstyle.button_glow_condition === 'when_active' || bstyle.button_glow_color_mode === 'match'))) return;
+          const look = this._effectivePreset(preset);
           const { boxShadow } = this._presetBorderAndGlowCss(look, st, bstyle);
           btn.style.boxShadow = boxShadow;
-          btn.classList.toggle('cpc-glowing', !!boxShadow && boxShadow !== 'none');
-          if (rows) rows.push({ name: preset.name, mode: presetMode(look), active: this._isPresetActive(look, st), glow: boxShadow !== 'none' });
+          const glowing = !!boxShadow && boxShadow !== 'none';
+          btn.classList.toggle('cpc-glowing', glowing);
         } catch (e) {
           console.warn(`${LOG_PREFIX} glow update failed for preset ${btn.dataset.presetId}:`, e);
         }
       });
-      if (rows) { debugLog('glow refresh (per-section styles)'); console.table(rows); }
     }
 
     // Re-apply card + section frames so any conditional Frame Style re-evaluates
@@ -4422,11 +5150,170 @@ class ColorLightManagerCardEditor extends HTMLElement {
     sections.forEach(s => { if (!order.includes(s.id)) ordered.push(s); });
     return ordered;
   }
+  // The buttons section a preset belongs to (mirror of the card-class helper; used by
+  // _renderPresetSelects to decide whether the default-scene opt-out applies).
+  _sectionForPreset(preset) {
+    if (!preset || preset.section_id === '__none__') return null;
+    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+    if (!buttonsSections.length) return null;
+    return buttonsSections.find(s => s.id === preset.section_id) || buttonsSections[0];
+  }
 
   // Persists an updated sections array (also normalizes section_order to match).
   _updateSections(sections) {
     const order = sections.map(s => s.id);
     this._updateConfig({ sections, section_order: order });
+  }
+
+  // The preset buttons that belong to a section id, applying the SAME fallback the card uses (a
+  // missing/stale section_id resolves to the first buttons section). Returns [] for non-buttons.
+  _presetsBelongingTo(sectionId) {
+    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+    const src = buttonsSections.find(s => s.id === sectionId);
+    if (!src) return [];   // non-buttons section (or unknown) → no bundled buttons
+    const firstButtonsId = buttonsSections.length ? buttonsSections[0].id : null;
+    const validIds = new Set(buttonsSections.map(s => s.id));
+    return (this._config.presets || []).filter(p => (validIds.has(p.section_id) ? p.section_id : firstButtonsId) === sectionId);
+  }
+  _nowIso() { try { return new Date().toISOString().slice(0, 10); } catch (e) { return ''; } }
+  // Clipboard helpers with a legacy fallback. navigator.clipboard needs a secure context (HTTPS or
+  // localhost); when it's absent, writing falls back to a hidden textarea + execCommand, and reading
+  // rejects so callers can prompt for a paste instead.
+  // Build + show a modal overlay containing `contentEl`. Returns { close } and closes on backdrop
+  // click or Escape. Programmatic clipboard access is unreliable in HA's editor dialog (the async
+  // API rejects with "Document is not focused"; execCommand's user-gesture expires in async
+  // callbacks), so JSON transfer is done through a VISIBLE textarea the user can select/copy/paste
+  // — the textarea itself is the focused element, sidestepping the whole focus problem.
+  _showModal(contentEl) {
+    // Use a native <dialog> + showModal(): it renders in the browser's TOP LAYER, which is above
+    // HA's own <ha-dialog> (the config editor also lives in the top layer, so a plain z-index div
+    // on document.body renders BEHIND it — the "modal hides behind the editor" bug). The top layer
+    // has no z-index race: the most-recently-shown modal dialog is always on top.
+    const dlg = document.createElement('dialog');
+    dlg.style.cssText = 'padding:0;border:none;background:transparent;max-width:none;max-height:none;';
+    // Backdrop styling via a scoped <style> (::backdrop can't be set inline).
+    const st = document.createElement('style');
+    st.textContent = 'dialog::backdrop{background:rgba(0,0,0,0.55);}';
+    dlg.appendChild(st);
+    const box = document.createElement('div');
+    box.style.cssText = 'background:var(--ha-card-background,var(--card-background-color,#1c1c1c));color:var(--primary-text-color,#e1e1e1);border:1px solid var(--divider-color,#444);border-radius:12px;max-width:640px;width:min(640px,92vw);max-height:85vh;overflow:auto;padding:16px;box-sizing:border-box;box-shadow:0 8px 40px rgba(0,0,0,0.5);';
+    box.appendChild(contentEl);
+    dlg.appendChild(box);
+    const close = () => { try { dlg.close(); } catch (e) {} if (dlg.parentNode) dlg.parentNode.removeChild(dlg); };
+    // Backdrop click (the dialog element itself, outside the inner box) closes.
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) close(); });
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); close(); });   // Esc
+    document.body.appendChild(dlg);
+    try { dlg.showModal(); } catch (e) { /* showModal unsupported → dialog still shows via [open] */ dlg.setAttribute('open', ''); }
+    return { close, box };
+  }
+  // Best-effort clipboard write for the modal's Copy button (the textarea is already focused +
+  // selected, so execCommand runs inside the click gesture and reliably works here).
+  _tryCopyTextarea(ta) {
+    try { ta.focus(); ta.select(); ta.setSelectionRange(0, ta.value.length); return document.execCommand('copy'); }
+    catch (e) { return false; }
+  }
+  // Unified JSON export: open a modal with the JSON in a selectable textarea + a Copy button. No
+  // truncation (textarea, not prompt), and copying works because the textarea holds focus.
+  _exportJson(text, note) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Export</div>
+      <div style="font-size:12px;color:var(--secondary-text-color,#888);margin-bottom:10px;">${escapeHtml(note || 'Copy this JSON.')}</div>
+      <textarea readonly style="width:100%;box-sizing:border-box;height:220px;font-family:var(--code-font-family,monospace);font-size:12px;padding:8px;border-radius:6px;border:1px solid var(--divider-color,#444);background:var(--secondary-background-color,#2a2a2a);color:var(--primary-text-color,#e1e1e1);resize:vertical;"></textarea>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;">
+        <button class="cpce-modal-copy" style="padding:8px 14px;border:none;border-radius:6px;background:var(--primary-color,#2196F3);color:#fff;cursor:pointer;font-size:13px;">Copy to clipboard</button>
+        <button class="cpce-modal-close" style="padding:8px 14px;border:1px solid var(--divider-color,#444);border-radius:6px;background:transparent;color:var(--primary-text-color,#e1e1e1);cursor:pointer;font-size:13px;">Close</button>
+      </div>`;
+    const ta = wrap.querySelector('textarea');
+    ta.value = text;
+    const modal = this._showModal(wrap);
+    // Pre-select so a manual Ctrl/Cmd+C works immediately even without the button.
+    setTimeout(() => { ta.focus(); ta.select(); }, 50);
+    const copyBtn = wrap.querySelector('.cpce-modal-copy');
+    copyBtn.onclick = () => {
+      const ok = this._tryCopyTextarea(ta) || (navigator.clipboard && navigator.clipboard.writeText && (navigator.clipboard.writeText(ta.value), true));
+      copyBtn.textContent = ok ? 'Copied ✓' : 'Press Ctrl/Cmd+C';
+      setTimeout(() => { copyBtn.textContent = 'Copy to clipboard'; }, 1500);
+    };
+    wrap.querySelector('.cpce-modal-close').onclick = () => modal.close();
+  }
+  // Unified JSON import: open a modal with an empty textarea to paste into + an Import button.
+  // Calls onText(raw) with the pasted string; blank → no-op.
+  _importJson(promptLabel, onText) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Import</div>
+      <div style="font-size:12px;color:var(--secondary-text-color,#888);margin-bottom:10px;">${escapeHtml(promptLabel || 'Paste the exported JSON below.')}</div>
+      <textarea placeholder="Paste JSON here…" style="width:100%;box-sizing:border-box;height:220px;font-family:var(--code-font-family,monospace);font-size:12px;padding:8px;border-radius:6px;border:1px solid var(--divider-color,#444);background:var(--secondary-background-color,#2a2a2a);color:var(--primary-text-color,#e1e1e1);resize:vertical;"></textarea>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;">
+        <button class="cpce-modal-paste" style="padding:8px 14px;border:1px solid var(--divider-color,#444);border-radius:6px;background:transparent;color:var(--primary-text-color,#e1e1e1);cursor:pointer;font-size:13px;margin-right:auto;">Paste from clipboard</button>
+        <button class="cpce-modal-import" style="padding:8px 14px;border:none;border-radius:6px;background:var(--primary-color,#2196F3);color:#fff;cursor:pointer;font-size:13px;">Import</button>
+        <button class="cpce-modal-close" style="padding:8px 14px;border:1px solid var(--divider-color,#444);border-radius:6px;background:transparent;color:var(--primary-text-color,#e1e1e1);cursor:pointer;font-size:13px;">Cancel</button>
+      </div>`;
+    const ta = wrap.querySelector('textarea');
+    const modal = this._showModal(wrap);
+    setTimeout(() => ta.focus(), 50);
+    // Paste button: pull from the clipboard when the browser allows it (secure context + permission);
+    // otherwise nudge the user to paste manually. The textarea is always there as the reliable path.
+    const pasteBtn = wrap.querySelector('.cpce-modal-paste');
+    pasteBtn.onclick = () => {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        navigator.clipboard.readText()
+          .then(txt => { if (txt) { ta.value = txt; ta.focus(); } else { pasteBtn.textContent = 'Press Ctrl/Cmd+V'; setTimeout(() => { pasteBtn.textContent = 'Paste from clipboard'; }, 1500); } })
+          .catch(() => { ta.focus(); pasteBtn.textContent = 'Press Ctrl/Cmd+V'; setTimeout(() => { pasteBtn.textContent = 'Paste from clipboard'; }, 1500); });
+      } else { ta.focus(); pasteBtn.textContent = 'Press Ctrl/Cmd+V'; setTimeout(() => { pasteBtn.textContent = 'Paste from clipboard'; }, 1500); }
+    };
+    wrap.querySelector('.cpce-modal-import').onclick = () => {
+      const txt = ta.value;
+      modal.close();
+      if (txt && txt.trim()) onText(txt);
+    };
+    wrap.querySelector('.cpce-modal-close').onclick = () => modal.close();
+  }
+
+  // Import a section (+ its bundled buttons) from a parsed envelope. Re-IDs the section and every
+  // button (repointing section_id) so nothing collides, appends the section to the order, and adds
+  // the buttons to cfg.presets. Buttons arrive fully configured and already assigned — no manual
+  // re-assignment. Library refs (style_preset/profile_ref/frame/header) and entity ids ride along
+  // as-is: they resolve on this instance and degrade gracefully if absent.
+  _importSection(section, presets) {
+    const ordered = this._orderedSections();
+    const copy = JSON.parse(JSON.stringify(section));
+    copy.id = newSectionId(copy.type || 'section');
+    if (copy.type !== 'divider') copy.name = `${copy.name || copy.type} (imported)`;
+    // Never inherit a stale hidden flag as a surprise; keep everything else the section carried.
+    ordered.push(copy);
+    let allPresets = this._config.presets || [];
+    if (copy.type === 'buttons' && Array.isArray(presets) && presets.length) {
+      const clones = presets.map(p => { const c = JSON.parse(JSON.stringify(p)); c.id = newPresetId(); c.section_id = copy.id; return c; });
+      allPresets = [...allPresets, ...clones];
+    }
+    this._updateConfig({ sections: ordered, section_order: ordered.map(s => s.id), presets: dedupePresetIds(allPresets) });
+    this._render();
+    // Honest post-import note: flag referenced Button Styles / Fixture Profiles this instance lacks.
+    const missing = this._missingRefsFor(copy, (copy.type === 'buttons' ? presets : []) || []);
+    const n = (copy.type === 'buttons' && Array.isArray(presets)) ? presets.length : 0;
+    let msg = `Imported “${copy.name || copy.type}”${copy.type === 'buttons' ? ` with ${n} button${n === 1 ? '' : 's'}` : ''}.`;
+    if (missing.length) msg += `\n\nNot present on this system (they'll fall back until fixed):\n• ${missing.join('\n• ')}`;
+    window.alert(msg);
+  }
+
+  // Collect library refs an imported section/buttons point at that DON'T exist on this instance —
+  // for an honest "these will fall back" note. Only checks the genuinely-shared, possibly-missing
+  // bits (Button Styles + Fixture Profiles); entity ids are left to HA to resolve.
+  _missingRefsFor(section, presets) {
+    const missing = [];
+    const btnLib = buttonStyleLibraryMap();
+    const styleSlug = fixtureRefSlug(section.style_preset);
+    if (styleSlug && !isBuiltinButtonSlug(styleSlug) && !btnLib[styleSlug]) missing.push(`Button Style “${styleSlug}”`);
+    const fixLib = (typeof fixtureLibraryMap === 'function') ? fixtureLibraryMap((this._config && this._config.fixture_library_scope) || 'system') : {};
+    const seen = new Set();
+    (presets || []).forEach(p => {
+      const slug = fixtureRefSlug(p && p.profile_ref);
+      if (slug && !seen.has(slug) && !(fixLib && fixLib[slug])) { seen.add(slug); missing.push(`Fixture Profile “${slug}”`); }
+    });
+    return missing;
   }
 
   // Duplicate a section by id: deep-copy with a fresh id + "(copy)" name, insert right after the
@@ -4473,7 +5360,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // profile picker reflect it live (re-render on updates), regardless of any ref existing.
     ensureFixtureLibrary(hass, (this._config && this._config.fixture_library_scope) || 'system', () => this._render());
     // Load + live-sync the shared Button Appearance preset library so the list reflects it.
-    ensureButtonStyleLibrary(hass, () => { this._seedDefaultButtonStack(); this._render(); });
+    ensureButtonStyleLibrary(hass, () => { this._migrateSectionDefaults(); this._render(); });
     // Load + live-sync the shared Frame Style library so the Frame Styles panel
     // shows every System frame (incl. those authored in the Easy Entity Styler
     // card) — always, regardless of whether this card references one yet.
@@ -4482,6 +5369,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // shows every System rule set (incl. those authored in the Easy Entity Styler
     // card — same `ltek_header_library` key) — always, like the Frame library.
     ensureHeaderLibrary(hass, (this._config && this._config.header_library_scope) || 'system', () => this._render());
+    // Load the input_select storage-helper collection once (to know which helpers are editable in
+    // the Scene Groups panel). Admin-gated at use; a non-admin/unsupported list just yields [].
+    this._ensureSceneHelpers();
     // hass updates fire on nearly every state change anywhere in Home Assistant.
     // Only rebuild the checkbox list when the actual set of light entities changes
     // (e.g. a device added) — otherwise it wipes out checkboxes the user just ticked
@@ -4984,6 +5874,16 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this.dispatchEvent(new CustomEvent('config-changed', { detail: { config }, bubbles: true, composed: true }));
   }
   _updateConfig(patch) { const next = { ...this._config, ...patch }; this._config = next; this._fire(next); }
+  // Nudge HA's own editor PREVIEW pane to re-render after a shared button-style save. Button styles
+  // live in the shared WS store (not in the card's config), so the save doesn't change config. The
+  // preview card DOES subscribe to the store and re-renders on update — but to guarantee an immediate
+  // repaint we also broadcast a DOM event the live card listens for (belt-and-suspenders), bypassing
+  // setConfig's byte-identical guard (which would swallow a re-fired unchanged config).
+  _nudgeHaPreview() {
+    try {
+      window.dispatchEvent(new CustomEvent('clm-button-styles-saved', { detail: { ts: 0 } }));
+    } catch (e) { /* no-op */ }
+  }
 
   _section(icon, title, id, bodyHtml, desc) {
     const collapsed = this._openSection === id ? '' : ' collapsed';
@@ -5000,6 +5900,21 @@ class ColorLightManagerCardEditor extends HTMLElement {
   _subpanel(key, title, bodyHtml) {
     const open = this._openSubpanels.has(key);
     return `<div class="cpce-collapse-head cpce-subpanel-head${open ? '' : ' collapsed'}" data-subpanel="${escapeHtml(key)}"><span class="cpce-subpanel-name">${escapeHtml(title)}</span><ha-icon icon="mdi:chevron-down"></ha-icon></div>${open ? `<div class="cpce-subpanel-body">${bodyHtml}</div>` : ''}`;
+  }
+  // A Style-Builder subpanel bound to a button-style GROUP. On an overlay layer it carries an
+  // include checkbox: unchecked = this layer doesn't define the group (inherits from below);
+  // checked = this layer owns the whole group (controls shown). On the base layer (Layer 1) the
+  // group is always owned, so no checkbox — just the normal subpanel. `subKey` is the collapse id.
+  _btnGroupSubpanel(subKey, group, title, bodyHtml) {
+    const editingBase = this._editingLayer && this._editingLayer.idx === 0;
+    const owned = !this._layerOwned || this._layerOwned.has(group);
+    if (editingBase) return this._subpanel(subKey, title, bodyHtml);   // base: always full, no toggle
+    const open = this._openSubpanels.has(subKey) && owned;
+    // The include checkbox sits at the FAR LEFT (before the title). When unchecked (disabled) the
+    // group is inherited from the base — no controls to expand, so the chevron is hidden and the
+    // header isn't clickable-to-open.
+    const check = `<label class="cpce-group-include" title="${owned ? 'This layer defines ' + escapeHtml(title) + ' — uncheck to inherit from the base' : 'Enable ' + escapeHtml(title) + ' on this layer'}" onclick="event.stopPropagation();"><input type="checkbox" class="cpce-btn-group-toggle" data-group="${escapeHtml(group)}" ${owned ? 'checked' : ''}></label>`;
+    return `<div class="cpce-collapse-head cpce-subpanel-head${open ? '' : ' collapsed'}${owned ? '' : ' cpce-subpanel-inherited cpce-subpanel-nochevron'}" data-subpanel="${escapeHtml(subKey)}">${check}<span class="cpce-subpanel-name">${escapeHtml(title)}</span>${owned ? '<ha-icon icon="mdi:chevron-down"></ha-icon>' : ''}</div>${open ? `<div class="cpce-subpanel-body">${bodyHtml}</div>` : ''}`;
   }
 
   // ----- entity picker -----
@@ -5458,7 +6373,56 @@ class ColorLightManagerCardEditor extends HTMLElement {
   }
 
   // ----- preset editor rows -----
+  // Editor-local copies of the renderer's glow-source resolution (the editor class doesn't share the
+  // card's methods). Kept intentionally minimal — only what the swatch + follow-lights preview need:
+  // explicit glow_entities → HA-native scene members → []. No section-target fallback (matches the
+  // card's no-fallback rule for scene buttons).
+  _glowSourceIds(preset) {
+    const follow = Array.isArray(preset && preset.glow_entities) ? preset.glow_entities.filter(Boolean) : [];
+    if (follow.length) return follow;
+    if (buttonMode(preset) === 'scene') return this._sceneMemberLightIds(preset);
+    return [];
+  }
+  _sceneMemberLightIds(preset) {
+    const ref = preset && preset.scene_ref;
+    const st = ref && this._hass && this._hass.states[ref];
+    const members = (st && st.attributes && Array.isArray(st.attributes.entity_id)) ? st.attributes.entity_id : [];
+    return members.filter(id => typeof id === 'string' && id.startsWith('light.'));
+  }
+  _presetPrimaryState(preset) {
+    const use = this._glowSourceIds(preset);
+    if (!use.length || !this._hass) return null;
+    let firstOn = null;
+    for (const id of use) { const st = this._hass.states[id]; if (st && st.state === 'on') { firstOn = st; break; } }
+    return firstOn || this._hass.states[use[0]] || null;
+  }
+  _presetLiveColor(state) {
+    if (state && state.state === 'on') {
+      const a = state.attributes || {};
+      let rgb = Array.isArray(a.rgb_color) ? a.rgb_color
+        : (Array.isArray(a.xy_color) ? ColorUtils.xyToRgb(a.xy_color[0], a.xy_color[1]) : null);
+      if (!rgb) { const k = attrsToKelvin(a); if (k !== undefined) rgb = ColorUtils.kelvinToRgb(k); }
+      if (rgb) return ColorUtils.rgbToHex(...rgb);
+    }
+    return null;
+  }
+  // Editor mirror of the card's body-color resolution: fixed Style Color → (live only when active)
+  // → grey. Used for the summary swatch so it matches what renders on the card.
+  _presetBodyColor(preset, state) {
+    const bodyFixed = preset.button_style_color || null;
+    if (bodyFixed) return bodyFixed;
+    const live = this._presetLiveColor(state);
+    // The editor has no last-pressed signal; scene "active" is deterministic via selectsActive (all
+    // bound helpers match), which needs only hass — so a null activeId is fine here.
+    const active = isPresetActiveFor(this._effectivePreset(preset), state, this._config && this._config.temperature_output_format, null, presetSelectsActive(preset, this._hass));
+    return (active && live) ? live : '#424242';
+  }
   _presetSwatch(preset) {
+    // Scene / follow-color buttons: the swatch mirrors the card body color (fixed Style Color →
+    // live-when-active → grey), so the editor summary matches what shows.
+    if (buttonMode(preset) === 'scene' || (Array.isArray(preset.glow_entities) && preset.glow_entities.length > 0)) {
+      return this._presetBodyColor(preset, this._presetPrimaryState(preset));
+    }
     // Explicit button style color wins (used for scene-only / None buttons).
     if (preset.button_style_color) { const rgb = ColorUtils.hexToRgb(preset.button_style_color); if (rgb) return ColorUtils.rgbToHex(...rgb); }
     const look = this._effectivePreset(preset);
@@ -5476,26 +6440,33 @@ class ColorLightManagerCardEditor extends HTMLElement {
   //   Scene(s)          → mdi:palette
   _presetLinkIcon(preset) {
     const badges = [];
-    // Color Entity link
+    // Section chip (no icon): which buttons section this button lives in — or "Unassigned" for a
+    // tile-only button. Purely informational; always shown first.
+    const unassigned = preset.section_id === '__none__';
+    if (unassigned) {
+      badges.push(`<span class="cpce-summary-chip" title="Not shown on the card — tile look only">Unassigned</span>`);
+    } else {
+      const sec = this._sectionForPreset(preset);
+      const secName = (sec && sec.name) || 'Buttons';
+      badges.push(`<span class="cpce-summary-chip" title="In button section “${escapeHtml(secName)}”">${escapeHtml(secName)}</span>`);
+    }
+    // Color Entity link → a chip showing the bound entity's NAME, prefixed with a link icon.
     const linked = preset.input_color_entity;
     if (linked) {
       const exists = this._allInputColorEntities.includes(linked);
-      badges.push(exists
-        ? `<ha-icon class="cpce-link-indicator" icon="mdi:link-variant" title="Linked to Color Entity ${escapeHtml(linked)}"></ha-icon>`
-        : `<ha-icon class="cpce-link-indicator cpce-link-broken" icon="mdi:link-variant-off" title="Broken link — Color Entity ${escapeHtml(linked)} no longer exists"></ha-icon>`);
+      const nm = exists ? friendlyName(this._hass, linked) : linked;
+      badges.push(`<span class="cpce-summary-chip${exists ? '' : ' cpce-chip-broken'}" title="${exists ? 'Bound to Color Entity ' + escapeHtml(linked) : 'Broken link — ' + escapeHtml(linked) + ' no longer exists'}"><ha-icon icon="${exists ? 'mdi:link-variant' : 'mdi:link-variant-off'}"></ha-icon>${escapeHtml(nm)}</span>`);
     }
-    // Fixture Profile reference
+    // Fixture Profile reference → a chip with the profile name, prefixed with a link icon.
     const slug = fixtureRefSlug(preset.profile_ref);
     if (slug) {
       const entry = fixtureLibraryMap(this._config && this._config.fixture_library_scope)[slug];
-      badges.push(entry
-        ? `<ha-icon class="cpce-link-indicator" icon="mdi:palette-swatch" title="Uses Fixture Profile “${escapeHtml(entry.name || slug)}”"></ha-icon>`
-        : `<ha-icon class="cpce-link-indicator cpce-link-broken" icon="mdi:palette-swatch" title="References missing Fixture Profile “${escapeHtml(slug)}”"></ha-icon>`);
+      badges.push(`<span class="cpce-summary-chip${entry ? '' : ' cpce-chip-broken'}" title="${entry ? 'Uses Fixture Profile ' + escapeHtml(entry.name || slug) : 'Missing Fixture Profile ' + escapeHtml(slug)}"><ha-icon icon="${entry ? 'mdi:link-variant' : 'mdi:link-variant-off'}"></ha-icon>${escapeHtml(entry ? (entry.name || slug) : slug)}</span>`);
     }
-    // Scene(s)
-    const scenes = (preset.scenes || []).filter(s => (this._config.scenes || []).includes(s));
-    if (scenes.length) {
-      badges.push(`<ha-icon class="cpce-link-indicator" icon="mdi:palette" title="Triggers ${scenes.length} scene${scenes.length === 1 ? '' : 's'}"></ha-icon>`);
+    // Scene Selects → a chip "N scene(s)" (count of input_select bindings). Replaces the palette icon.
+    const nSel = presetSelects(preset).length;
+    if (nSel) {
+      badges.push(`<span class="cpce-summary-chip" title="Bound to ${nSel} scene helper${nSel === 1 ? '' : 's'} (Scene Selects)"><ha-icon icon="mdi:link-variant"></ha-icon>${nSel} scene${nSel === 1 ? '' : 's'}</span>`);
     }
     return badges.join('');
   }
@@ -5567,43 +6538,61 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // A small live preview of the current Card Default button look — two sample buttons (a colored
   // one + an Off one) built from the same cfg the live card reads, so the Builder isn't styled
   // blind. Reflects style (solid/tinted), border, gradient border, glow, radius, and sizing.
-  // Renders the two sample buttons (colored + Off) for a given appearance cfg. Shared by both
-  // previews (Builder preview B and the saved-preset preview A).
-  _renderButtonSampleRow(cfg) {
+  // Scoped copy of the card's .cpc-preset-btn CSS so the editor preview (a SEPARATE element that
+  // lacks the card's <style>) renders buttons identically. Scoped under .cpce-btn-preview so it
+  // never leaks. Mirrors the metric rules in the card's global block (bg/border/glow/name are
+  // emitted inline by _renderPresetButton, so only layout/padding/font/tile rules live here).
+  _buttonPreviewScopedCss(cfg) {
     const scale = Number(cfg.scale) || 1.0;
-    const radius = Number.isFinite(Number(cfg.button_border_radius)) ? `border-radius:${Number(cfg.button_border_radius)}px;` : '';
     const fs = Number(cfg.button_font_size) || 14;
     const fw = cfg.button_name_weight || '600';
     const h = Number(cfg.button_height) || 44;
-    const gap = Number.isFinite(Number(cfg.button_icon_gap)) ? Number(cfg.button_icon_gap) : 8;
-    const gbMatch = cfg.button_border_color || '#2196F3';
-    const gb = gradientBorderBackground(cfg.button_border_gradient, gbMatch);
-    const tinted = (cfg.button_style === 'tinted' || cfg.button_style === 'tile');
-    const solidBorder = cfg.button_border_enabled ? buttonBorderCss(Number(cfg.button_border_width)||1, cfg.button_border_color||'#2196F3', buttonBorderSides(cfg)) : 'border:none;';
-    const shadowParts = [];
-    if (cfg.button_glow_enabled) shadowParts.push(`0 0 ${12*(Number(cfg.button_glow_intensity)||1)}px ${-2*(Number(cfg.button_glow_intensity)||1)}px ${cfg.button_glow_color||'#2196F3'}`);
-    if (cfg.button_shadow_enabled) { const op = clamp(Number(cfg.button_shadow_opacity),0,1); shadowParts.push(`${Number(cfg.button_shadow_x)||0}px ${Number(cfg.button_shadow_y)||0}px ${Number(cfg.button_shadow_blur)||0}px ${Number(cfg.button_shadow_spread)||0}px ${ColorUtils.hexToRgba(cfg.button_shadow_color||'#000000', Number.isFinite(op)?op:0.35)}`); }
-    const glow = shadowParts.length ? `box-shadow:${shadowParts.join(', ')};` : '';
-    const sample = (label, color, off) => {
-      const bgHex = color;
-      let bgCss;
-      if (off) {
-        bgCss = tinted ? 'background:linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));' : 'background:transparent;';
-      } else if (tinted) {
-        const fill = `linear-gradient(135deg, ${ColorUtils.hexToRgba(bgHex,0.35)}, ${ColorUtils.hexToRgba(bgHex,0.06)})`;
-        bgCss = gb ? `background-image:${gb.image}, ${fill};background-size:${gb.size}, auto;background-position:${gb.position}, center;background-repeat:${gb.repeat}, no-repeat;background-color:transparent;` : `background:${fill};`;
-      } else {
-        bgCss = gb ? `background-image:${gb.image};background-size:${gb.size};background-position:${gb.position};background-repeat:${gb.repeat};background-color:${bgHex};` : `background:${bgHex};`;
-      }
-      const iconColor = off ? 'var(--secondary-text-color)' : (tinted ? bgHex : '#000');
-      const textColor = tinted ? 'var(--primary-text-color)' : (off ? 'var(--primary-text-color)' : '#000');
-      return `<div style="display:flex;align-items:center;justify-content:${tinted?'flex-start':'center'};gap:calc(${gap}px * ${scale});padding:calc(${h}px * ${scale} / 3.15) calc(16px * ${scale});${bgCss}${off?'border:2px solid var(--divider-color);':solidBorder}${radius}${glow}min-width:90px;font-size:calc(${fs}px * ${scale});font-weight:${fw};color:${textColor};">
-        <ha-icon icon="mdi:palette" style="--mdc-icon-size:calc(${tinted?26:18}px * ${scale});color:${iconColor};"></ha-icon><span>${label}</span></div>`;
+    const iconGap = Number.isFinite(Number(cfg.button_icon_gap)) ? Number(cfg.button_icon_gap) : 8;
+    const wrap = cfg.button_name_wrap === true;
+    return `<style>
+      .cpce-btn-preview .cpc-presets { display:flex; gap:${Number(cfg.gap)||8}px; flex-wrap:wrap; }
+      .cpce-btn-preview .cpc-preset-btn { display:flex; align-items:center; justify-content:center; gap:calc(${iconGap}px * ${scale}); padding:calc(${h}px * ${scale} / 3.15) calc(18px * ${scale}); border-radius:10px; border:none; font-size:calc(${fs}px * ${scale}); font-weight:${fw}; color:#000; background:#fff; position:relative; z-index:0; min-width:90px; }
+      .cpce-btn-preview .cpc-preset-btn .cpc-btn-label { font-weight:${fw}; ${wrap ? 'white-space:normal; overflow-wrap:anywhere; text-align:center;' : 'white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'} }
+      .cpce-btn-preview .cpc-preset-btn.cpc-glowing { z-index:1; }
+      .cpce-btn-preview .cpc-preset-btn.off-style { background:transparent; border:2px solid var(--divider-color); color:var(--primary-text-color); }
+      .cpce-btn-preview .cpc-preset-btn ha-icon { --mdc-icon-size:calc(18px * ${scale}); }
+      .cpce-btn-preview .cpc-preset-btn.cpc-tile { flex-direction:row; justify-content:flex-start; align-items:center; gap:calc(${iconGap}px * ${scale}); min-height:calc(${h}px * ${scale} * 1.6); padding:calc(14px * ${scale}) calc(16px * ${scale}); border-radius:calc(18px * ${scale}); color:var(--primary-text-color); text-align:left; }
+      .cpce-btn-preview .cpc-preset-btn.cpc-tile ha-icon { --mdc-icon-size:calc(26px * ${scale}); color:var(--cpc-tile-icon-color, var(--primary-text-color)); flex-shrink:0; }
+      .cpce-btn-preview .cpc-preset-btn.cpc-tile .cpc-tile-name { font-size:calc(${fs}px * ${scale}); }
+    </style>`;
+  }
+  // Renders two sample buttons by driving the REAL renderer with fake presets + fake states — so the
+  // preview is byte-for-byte the same as the live card (no drift). Sample = an active colored button;
+  // Off = an inactive turn-off button. `stack` is the layer stack; each sample flattens it through
+  // its OWN condition evaluation (Sample → button_active true; Off → button_off true), so per-button
+  // overlays isolate to the right sample — exactly like the live card. Falls back to the Built-In
+  // look only when a sample's flatten is fully empty. Shared by all three preview callers.
+  _renderButtonSampleRow(stack, baseCfg) {
+    const samplePreset = { id: '__preview_sample__', name: 'Sample', icon: 'mdi:palette', mode: 'color', rgb_color: [33, 150, 243] };
+    const sampleState = { state: 'on', attributes: { rgb_color: [33, 150, 243] } };
+    const offPreset = { id: '__preview_off__', name: 'Off', icon: 'mdi:palette', mode: 'off', action: 'turn_off' };
+    const offState = { state: 'on', attributes: {} };
+    // Per-sample condition evaluator: mirrors _buttonStyleForPreset. button_active is true only for
+    // the colored Sample; button_off is true only for the Off sample; section-scoped conditions
+    // (light_on/off, entity_state) are treated as active so authored looks are visible in preview.
+    const cfgFor = (preset, activeType) => {
+      const isActive = (when) => {
+        if (!when || !when.type) return true;
+        if (when.type === 'button_active') return activeType === 'active';
+        if (when.type === 'button_off') return activeType === 'off';
+        return true;   // section-scoped conditions: show in preview
+      };
+      return { ...baseCfg, ...extractButtonAppearance(flattenButtonStack(stack, isActive)) };
     };
-    return `<div style="display:flex;gap:${Number(cfg.gap)||8}px;flex-wrap:wrap;padding:10px;border:1px dashed var(--divider-color,#333);border-radius:6px;margin-bottom:8px;background:var(--ha-card-background,#1a1a1a);">
-        ${sample('Sample', '#2196F3', false)}
-        ${sample('Off', '#888', true)}
-      </div>`;
+    const sampleCfg = cfgFor(samplePreset, 'active');
+    const offCfg = cfgFor(offPreset, 'off');
+    // Scoped CSS uses layout/metric keys, which are the same across samples → use the Sample's cfg.
+    return `${this._buttonPreviewScopedCss(sampleCfg)}<div class="cpce-btn-preview" style="padding:10px;border:1px dashed var(--divider-color,#333);border-radius:6px;margin-bottom:8px;background:var(--ha-card-background,#1a1a1a);">
+      <div class="cpc-presets">
+        ${renderPresetButtonHtml(samplePreset, samplePreset, sampleCfg, sampleState, sampleCfg.temperature_output_format)}
+        ${renderPresetButtonHtml(offPreset, offPreset, offCfg, offState, offCfg.temperature_output_format)}
+      </div>
+    </div>`;
   }
 
   // Preview B — under the Style Builder. Shows the preset WITH your current unsaved Builder edits:
@@ -5612,49 +6601,31 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // preset editor open, it's just this card's Card Default (the raw Builder settings).
   _renderButtonStylePreview() {
     const draft = this._stackDraft;
-    let cfg = this._config;
-    // With no preset editor open, preview the current system-wide default (whatever the ★ pointer
-    // targets — a preset or Built-In), flattened. Never the card's raw button_* config.
-    const defStack = buttonStyleDefaultStack();
-    let defNm = (defStack && defStack.name) || 'Built-In';
-    let labelHtml = `<span class="cpce-preview-title">DEFAULT PRESET PREVIEW (${escapeHtml(defNm)})</span>`;
-    if (defStack) cfg = { ...this._config, ...extractButtonAppearance(flattenButtonStack(defStack, () => true)) };
+    let stack, labelHtml = '';
     if (draft && draft.slug) {
+      // The edited layer isn't hidden even if its hide toggle is on, so you can see what you're editing.
       const libEntry = buttonStyleLibraryMap()[draft.slug];
-      // Flatten a copy of the draft where the edited layer's groups = live Builder settings.
       const editing = (this._editingLayer && this._editingLayer.slug === draft.slug) ? this._editingLayer.idx : null;
-      const liveGroups = extractButtonAppearance(this._config);
-      const layers = draft.layers.map((l, i) => (i === editing) ? { ...l, groups: (i === 0 ? liveGroups : buttonStyleDelta(liveGroups, buttonStackBaseBelow(draft.layers, i))), hidden: false } : l);
-      const stack = { ...(libEntry || {}), layers };
-      cfg = { ...this._config, ...extractButtonAppearance(flattenButtonStack(stack, () => true)) };
+      const layers = draft.layers.map((l, i) => (i === editing) ? { ...l, hidden: false } : l);
+      stack = { ...(libEntry || {}), layers };
       const nm = (libEntry && libEntry.name) || draft.slug;
       const layerSuffix = (editing != null) ? ` Layer ${editing + 1}` : '';
-      labelHtml = `<span class="cpce-preview-title">UNSAVED EDIT PREVIEW (${escapeHtml(nm)}${layerSuffix})</span>`;
+      labelHtml = `<span class="cpce-preview-title">UNSAVED STYLE CHANGES (${escapeHtml(nm)}${layerSuffix})</span>`;
+    } else {
+      stack = builtinButtonStack(BTN_STYLE_BASIC_SLUG);
+      labelHtml = `<span class="cpce-preview-title">PREVIEW (${escapeHtml(stack.name)})</span>`;
     }
-    return `<div class="cpce-hint">${labelHtml}</div>${this._renderButtonSampleRow(cfg)}`;
-  }
-
-  // The "Save Changes to Layer #" row shown in the Style Builder when a preset layer is loaded
-  // into the Builder for editing. Captures the current Builder settings back into that layer
-  // (full look for Layer 1, delta vs the base beneath it for overlay layers), keeping the draft.
-  _renderLayerSaveRow() {
-    const el = this._editingLayer;
-    if (!el || !this._stackDraftFor(el.slug)) return '';
-    const libEntry = buttonStyleLibraryMap()[el.slug];
-    const nm = (libEntry && libEntry.name) || el.slug;
-    const num = el.idx + 1;
-    return `<div class="cpce-row cpce-layer-save-row" style="gap:8px;align-items:center;">
-      <button class="cpce-create-preset-btn" id="cpce-layer-savechanges" style="flex:1;justify-content:center;" title="Capture these Builder settings back into Layer ${num} of “${escapeHtml(nm)}”"><ha-icon icon="mdi:content-save-arrow-right"></ha-icon> Save Changes to ${escapeHtml(nm)} Layer ${num}</button>
-      <button class="cpce-mini-btn" id="cpce-layer-editcancel" title="Stop editing this layer (keeps the layer as it was)"><ha-icon icon="mdi:close"></ha-icon> Exit Editor</button>
-    </div>`;
+    return `<div class="cpce-hint">${labelHtml}</div>${this._renderButtonSampleRow(stack, this._config)}`;
   }
 
   // Preview A — under a preset's layers. Shows the preset exactly as SAVED in the library (all
   // layers flattened, conditions treated as met, hidden layers skipped): the current saved look.
   _renderSavedPresetPreview(slug) {
     const e = buttonStyleLibraryMap()[slug]; if (!e) return '';
-    const cfg = { ...this._config, ...extractButtonAppearance(flattenButtonStack(e, () => true)) };
-    return `<div class="cpce-hint" style="margin-top:6px;"><span class="cpce-preview-title"><ha-icon icon="mdi:content-save-check-outline" style="--mdc-icon-size:14px;"></ha-icon> SAVED PRESET PREVIEW</span></div>${this._renderButtonSampleRow(cfg)}`;
+    // CURRENT STYLE = the SAVED library look (the "before"). Renders the saved stack straight from
+    // the library (not the draft), so it stays fixed while you edit. Per-sample conditions are
+    // evaluated inside _renderButtonSampleRow.
+    return `<div class="cpce-hint" style="margin-top:6px;"><span class="cpce-preview-title"><ha-icon icon="mdi:content-save-check-outline" style="--mdc-icon-size:14px;"></ha-icon> CURRENT STYLE</span></div>${this._renderButtonSampleRow(e, this._config)}`;
   }
 
   // Frame Styles library panel (Color-card authoring surface). Lists the
@@ -5759,6 +6730,78 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // one or more conditional overlays (each layer's optional `when` decides if it
   // applies; last active layer wins per property). Building/editing frames stays
   // in the Frame Styles library; this only applies them.
+  // Scene Tracker section config: a repeatable Areas list. Each Area = a name + an input_select
+  // (the scene state) + an optional representative light (for a live color/brightness readout).
+  _renderSceneTrackerConfig(s) {
+    const areas = Array.isArray(s.areas) ? s.areas : [];
+    const selects = this._allInputSelectEntities();
+    const lights = (this._hass && this._hass.states) ? Object.keys(this._hass.states).filter(id => id.startsWith('light.')).sort() : [];
+    const row = (a, i) => `<div class="cpce-row cpce-area-row" data-section-id="${s.id}" data-area="${i}" style="gap:6px;flex-wrap:wrap;">
+      <input type="text" class="cpce-area-name" data-section-id="${s.id}" data-area="${i}" placeholder="Area name" value="${escapeHtml((a && a.name) || '')}" style="flex:1;min-width:110px;">
+      <select class="cpce-area-entity" data-section-id="${s.id}" data-area="${i}" style="flex:1.5;min-width:150px;">
+        <option value="">input_select…</option>
+        ${selects.map(x => `<option value="${escapeHtml(x.entity)}" ${a && a.entity === x.entity ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, x.entity))}</option>`).join('')}
+        ${(a && a.entity && !selects.some(x => x.entity === a.entity)) ? `<option value="${escapeHtml(a.entity)}" selected>${escapeHtml(a.entity)} (missing)</option>` : ''}
+      </select>
+      <select class="cpce-area-light" data-section-id="${s.id}" data-area="${i}" style="flex:1.5;min-width:150px;">
+        <option value="">(optional light)</option>
+        ${lights.map(id => `<option value="${escapeHtml(id)}" ${a && a.light === id ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, id))}</option>`).join('')}
+        ${(a && a.light && !lights.includes(a.light)) ? `<option value="${escapeHtml(a.light)}" selected>${escapeHtml(a.light)} (missing)</option>` : ''}
+      </select>
+      <button class="cpce-delete-entity-btn cpce-area-remove" data-section-id="${s.id}" data-area="${i}" title="Remove area"><ha-icon icon="mdi:close"></ha-icon></button>
+    </div>`;
+    // Optional Button Style binding: render the tiles as styled buttons (that style's border/glow/
+    // gradient/background). "Default tiles" = the simple chip layout.
+    const lib = buttonStyleLibraryMap();
+    const curStyle = fixtureRefSlug(s.style_preset) || '';
+    const styleEntries = [...Object.keys(BUILTIN_BUTTON_STYLES).map(bs => ({ slug: bs, name: BUILTIN_BUTTON_STYLES[bs].name })),
+      ...Object.keys(lib).map(sl => ({ slug: sl, name: lib[sl].name || sl }))].sort((a, b) => a.name.localeCompare(b.name));
+    return `<div class="cpce-sub-title">Tile Style</div>
+      <div class="cpce-row"><label class="lbl">Button Style</label>
+        <select class="cpce-tracker-style" data-id="${s.id}">
+          <option value="" ${!curStyle ? 'selected' : ''}>Default tiles (status chips)</option>
+          ${styleEntries.map(e => `<option value="lib:${escapeHtml(e.slug)}" ${curStyle === e.slug ? 'selected' : ''}>${escapeHtml(e.name)}</option>`).join('')}
+          ${(curStyle && !isBuiltinButtonSlug(curStyle) && !lib[curStyle]) ? `<option value="lib:${escapeHtml(curStyle)}" selected>${escapeHtml(curStyle)} (missing)</option>` : ''}
+        </select>
+      </div>
+      <div class="cpce-hint">Bind a <strong>Button Style</strong> to render the Area tiles like buttons (border, glow, gradient). The active-scene glow fires when an Area is on a real (non-off) scene. Leave as “Default tiles” for the simple chip look.</div>
+      <div class="cpce-sub-title">Areas</div>
+      <div class="cpce-hint">Each Area shows the current option of its <code>input_select</code>. Add an optional light to show its live color/brightness. Read-only status board.</div>
+      ${areas.map((a, i) => row(a, i)).join('')}
+      <button class="cpce-mini-btn cpce-area-add" data-section-id="${s.id}"><ha-icon icon="mdi:plus"></ha-icon> Add area</button>
+      ${selects.length ? '' : '<div class="cpce-hint">No <code>input_select</code> helpers found — create one in Home Assistant first.</div>'}`;
+  }
+
+  // Section default scene reset: when set, any NON-scene button in this section (color / profile /
+  // temp / Off) that doesn't already bind this group will, on press, set the group to the chosen
+  // option (default '-none-'). This de-highlights the active scene when the room diverges — press-
+  // driven, not light-state detection. A scene-mode button, or a button that binds this group itself,
+  // is unaffected; a per-button "Leave scene group alone" opt-out (Scene Selects panel) also skips it.
+  _renderSectionDefaultScene(s) {
+    const groups = this._allInputSelectEntities();   // respects the Scene Group filter
+    const cur = s.default_scene_group || '';
+    const curGroup = groups.find(g => g.entity === cur);
+    const opts = curGroup ? curGroup.options : [];
+    const curOpt = s.default_scene_option || '';
+    const optionList = (curOpt && !opts.includes(curOpt)) ? [curOpt, ...opts] : opts;
+    return `<div class="cpce-sub-title">Default scene reset</div>
+      <div class="cpce-hint">When a color/profile/Off button here is <strong>pressed</strong>, set this Scene Group to the option below — so the active scene de-highlights once the room diverges. Scene buttons (and any button that sets this group itself) are unaffected. Leave as “(none)” to disable.</div>
+      <div class="cpce-row"><label class="lbl">Scene Group</label>
+        <select class="cpce-sn-default-group" data-id="${escapeHtml(s.id)}">
+          <option value="">(none — no reset)</option>
+          ${groups.map(g => `<option value="${escapeHtml(g.entity)}" ${g.entity === cur ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, g.entity))}</option>`).join('')}
+          ${(cur && !groups.some(g => g.entity === cur)) ? `<option value="${escapeHtml(cur)}" selected>${escapeHtml(cur)} (filtered/missing)</option>` : ''}
+        </select>
+      </div>
+      ${cur ? `<div class="cpce-row"><label class="lbl">Reset to</label>
+        <select class="cpce-sn-default-option" data-id="${escapeHtml(s.id)}">
+          ${optionList.map(o => `<option value="${escapeHtml(o)}" ${o === curOpt ? 'selected' : ''}>${escapeHtml(o)}</option>`).join('')}
+          ${optionList.length ? '' : '<option value="">(group has no options)</option>'}
+        </select>
+      </div>
+      <div class="cpce-hint">Tip: use your Scene Group's <code>-none-</code> option so nothing highlights when the room is off-scene.</div>` : ''}`;
+  }
+
   _renderSectionFramePicker(s) {
     const lib = frameLibraryMap((this._config && this._config.frame_library_scope) || 'system');
     const slugs = Object.keys(lib).sort((a, b) => (lib[a].name || a).localeCompare(lib[b].name || b));
@@ -5947,7 +6990,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
                     const posV = clamp(Number(s.pos)||0,0,100);
                     return `<div class="cpce-row cpce-fb-stop">
                     <input type="range" class="fb-edge-stop-pos" data-fb-id="${escapeHtml(id)}" data-fb-side="${side}" data-fb-idx="${i}" min="0" max="100" step="1" value="${posV}" style="flex:1;"><span class="cpce-strength-val fb-edge-stop-pos-val" data-fb-id="${escapeHtml(id)}" data-fb-side="${side}" data-fb-idx="${i}">${posV}%</span>
-                    <input type="color" class="fb-edge-stop-color" data-fb-id="${escapeHtml(id)}" data-fb-side="${side}" data-fb-idx="${i}" value="${/^#[0-9a-f]{6}$/i.test(s.color||'')?s.color:'#2196F3'}" ${(isMatch||isT)?'disabled':''} style="width:44px;">
+                    <input type="color" class="fb-edge-stop-color" data-fb-id="${escapeHtml(id)}" data-fb-side="${side}" data-fb-idx="${i}" value="${/^#[0-9a-f]{6}$/i.test(s.color||'')?s.color:'#2196F3'}" style="width:44px;${(isMatch||isT)?'display:none;':''}">
                     <select class="fb-edge-stop-mode" data-fb-id="${escapeHtml(id)}" data-fb-side="${side}" data-fb-idx="${i}" title="Stop color source">
                       <option value="color" ${(!isMatch&&!isT)?'selected':''}>Color</option>
                       <option value="match" ${isMatch?'selected':''}>Match</option>
@@ -6212,32 +7255,38 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
   _renderButtonStylePresets() {
     const lib = buttonStyleLibraryMap();
-    const defaultSlug = buttonStyleDefaultSlug();
-    // Stored presets, alphabetical; the synthetic Built-In is prepended (always first).
-    const storedSlugs = Object.keys(lib).sort((a, b) => (lib[a].name || a).localeCompare(lib[b].name || b));
-    const rowsData = [{ slug: BTN_STYLE_BUILTIN_SLUG, entry: builtinButtonStack(), builtin: true },
+    // Built-ins first, then stored presets alphabetical; the open one is floated to the BOTTOM so it
+    // sits directly above the Style Builder — a clearer "you're editing this one" connection.
+    const openSlug = this._openButtonStack;
+    const storedSlugs = Object.keys(lib)
+      .sort((a, b) => (lib[a].name || a).localeCompare(lib[b].name || b))
+      .sort((a, b) => (a === openSlug ? 1 : 0) - (b === openSlug ? 1 : 0));   // open one → last
+    const rowsData = [...Object.keys(BUILTIN_BUTTON_STYLES).map(bs => ({ slug: bs, entry: builtinButtonStack(bs), builtin: true })),
       ...storedSlugs.map(s => ({ slug: s, entry: lib[s], builtin: false }))];
-    // Which stacks are referenced by this card's sections (usage badge).
-    const usedSlugs = new Set(this._orderedSectionsRaw().map(s => fixtureRefSlug(s && s.style_preset)).filter(Boolean));
-    const defName = (buttonStyleStack(defaultSlug) || {}).name || (defaultSlug === BTN_STYLE_BUILTIN_SLUG ? 'Built-In' : defaultSlug);
+    // Which stacks are referenced by this card's sections (usage badge). A section with no explicit
+    // style_preset resolves to Basic Theme, so that counts as "in use" too.
+    const usedSlugs = new Set();
+    this._orderedSectionsRaw().forEach(s => {
+      if (!s || s.type !== 'buttons') return;
+      usedSlugs.add(fixtureRefSlug(s.style_preset) || BTN_STYLE_BASIC_SLUG);
+    });
     return `
-      <div class="cpce-hint">Presets are shared system-wide across all your Color Light &amp; Scene Manager cards. The one marked ★ is the <strong>System-Wide Default</strong> — every card/section uses it unless assigned another preset. <strong>Built-In</strong> is a fixed starting look you can’t edit (duplicate it to customize). Click ★ on any preset to make it the default. Currently: <strong>${escapeHtml(defName)}</strong>.</div>
+      <div class="cpce-hint">Styles are shared across every section (and every Color Light &amp; Scene Manager card) that uses them — edit a style here and all its sections update. <strong>Basic Theme</strong> and <strong>Neon Lux</strong> are fixed built-in looks you can’t edit (duplicate one, or use it as a <em>starter</em> for a new style). Each section picks its own style in Section settings.</div>
       <div class="cpce-row" style="gap:8px; margin-bottom:6px;">
+        <button class="cpce-create-preset-btn" id="cpce-btnstyle-new" title="Create a new style from a chosen starter"><ha-icon icon="mdi:plus"></ha-icon> New style</button>
         <button class="cpce-mini-btn" id="cpce-btnstyle-import"><ha-icon icon="mdi:import"></ha-icon> Import as new preset…</button>
       </div>
       <div class="cpce-manage-list">${rowsData.map(({ slug: s, entry: e, builtin }) => {
-            const isCurDefault = (s === defaultSlug);
             const nLayers = Array.isArray(e.layers) ? e.layers.length : 0;
             const open = this._openButtonStack === s;
             const rowDirty = open && !!(this._stackDraft && this._stackDraft.slug === s && this._stackDraft.dirty);
-            const meta = [isCurDefault ? 'system-wide default' : '', builtin ? 'built-in (read-only)' : '', `${nLayers} layer${nLayers===1?'':'s'}`, e.note ? '📝 ' + e.note : ''].filter(Boolean).join(' · ');
-            return `<div class="cpce-manage-item${rowDirty ? ' cpce-item-unsaved' : ''}${isCurDefault ? ' cpce-item-default' : ''}" data-slug="${escapeHtml(s)}">
+            const starterFrom = (!builtin && e.starter_name) ? `from ${e.starter_name}` : '';
+            const meta = [builtin ? 'built-in (read-only)' : '', `${nLayers} layer${nLayers===1?'':'s'}`, starterFrom, e.note ? '📝 ' + e.note : ''].filter(Boolean).join(' · ');
+            return `<div class="cpce-manage-item${rowDirty ? ' cpce-item-unsaved' : ''}" data-slug="${escapeHtml(s)}">
               <ha-icon icon="${builtin ? 'mdi:lock' : 'mdi:palette-swatch'}" style="color:var(--primary-color);flex-shrink:0;"></ha-icon>
-              <span class="cpce-ce-name">${escapeHtml(e.name || s)}${rowDirty ? ' <span class="cpce-unsaved-dot" title="Unsaved changes">●</span>' : ''}<span class="cpce-entity-id">${rowDirty ? 'UNSAVED CHANGES · ' : ''}${escapeHtml(meta)}</span></span>
+              <span class="cpce-ce-name">${escapeHtml(e.name || s)}${rowDirty ? ' <span class="cpce-unsaved-dot" title="Unsaved changes">●</span>' : ''}<span class="cpce-entity-id">${escapeHtml(meta)}</span></span>
               ${usedSlugs.has(s) ? '<span class="cpce-order-type">in use</span>' : ''}
-              <button class="cpce-icon-btn cpce-btnstyle-setdefault" data-slug="${escapeHtml(s)}" title="${isCurDefault ? 'This is the system-wide default' : 'Set as system-wide default'}" style="color:${isCurDefault ? 'var(--warning-color,#ffb300)' : 'var(--secondary-text-color)'};"><ha-icon icon="${isCurDefault ? 'mdi:star' : 'mdi:star-outline'}"></ha-icon></button>
               ${builtin ? '' : `<button class="cpce-icon-btn cpce-btnstyle-layers${open?' active':''}" data-slug="${escapeHtml(s)}" title="Edit layers &amp; conditions"><ha-icon icon="mdi:pencil"></ha-icon></button>`}
-              <button class="cpce-icon-btn cpce-btnstyle-apply" data-slug="${escapeHtml(s)}" title="Load this preset's look into the Builder below"><ha-icon icon="mdi:tray-arrow-down"></ha-icon></button>
               <button class="cpce-icon-btn cpce-btnstyle-duplicate" data-slug="${escapeHtml(s)}" title="Duplicate this preset"><ha-icon icon="mdi:content-duplicate"></ha-icon></button>
               <button class="cpce-icon-btn cpce-btnstyle-export" data-slug="${escapeHtml(s)}" title="Export JSON"><ha-icon icon="mdi:download"></ha-icon></button>
               ${builtin ? '' : `<button class="cpce-delete-entity-btn cpce-btnstyle-delete" data-slug="${escapeHtml(s)}" title="Delete preset"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>`}
@@ -6258,30 +7307,37 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const dirty = !!(draft && draft.dirty);
     const opts = BTN_STYLE_CONDITIONS.filter(c => c.kinds.includes(kind));
     const editingIdx = (this._editingLayer && this._editingLayer.slug === slug) ? this._editingLayer.idx : null;
+    const groupTitles = { layout: 'Layout', background: 'Background', border: 'Line Border', gradient: 'Gradient', glow: 'Glow', shadow: 'Shadow', text: 'Text', icon: 'Icon', sizing: 'Button Shape' };
     const rows = layers.map((l, i) => {
       const when = l.when || null;
-      const nKeys = l.groups ? Object.keys(l.groups).length : 0;
       const isBase = i === 0;
-      const countLabel = isBase ? `${nKeys} setting${nKeys === 1 ? '' : 's'}` : `${nKeys} change${nKeys === 1 ? '' : 's'}`;
+      // Whole-group model: show which GROUPS this layer defines, not a raw key count. Base = "All Settings".
+      const owned = [...layerOwnedGroups(l.groups)].map(g => groupTitles[g] || g);
+      const countLabel = isBase ? 'All Settings' : (owned.length ? owned.join(', ') : 'inherits all');
       const selType = when ? when.type : '';
       const isEnt = selType === 'entity_state';
       const hidden = !!l.hidden;
       const isEditing = i === editingIdx;
-      // A single pencil per layer is the edit toggle: it opens this layer for editing (unlocks its
-      // condition + loads its look into the Style Builder). Click again (or "Exit Editor") to close.
+      // A single pencil per layer is the edit toggle: it opens this layer for editing (loads its look
+      // into the Style Builder + reveals its condition/label controls). Click again to close.
+      // Header row = Layer #, label pill, condition PILL (read-only summary), then the icon controls.
+      // The editable condition <select> moves into the expanded (edit-mode) area, like the Label.
       return `<div class="cpce-stack-layer${hidden ? ' cpce-layer-off' : ''}${isEditing ? ' cpce-layer-editing' : ''}" data-slug="${escapeHtml(slug)}" data-idx="${i}">
         <div class="cpce-stack-layer-hd">
           <span class="cpce-stack-layer-num">Layer ${i + 1}${l.label ? `<span class="cpce-stack-layer-label" title="Layer label">${escapeHtml(l.label)}</span>` : ''}</span>
-          <button class="cpce-icon-btn cpce-layer-edit" data-idx="${i}" title="${isEditing ? 'Editing — click to close the editor' : 'Edit this layer (unlock condition + load its look into the Style Builder)'}" style="color:${isEditing ? 'var(--cpce-editing,#ffb300)' : 'var(--secondary-text-color)'};"><ha-icon icon="${isEditing ? 'mdi:pencil' : 'mdi:pencil-outline'}"></ha-icon></button>
-          <select class="cpce-layer-cond" data-idx="${i}" ${isEditing ? '' : 'disabled'}>
-            ${opts.map(c => `<option value="${c.type}" ${c.type === selType ? 'selected' : ''}>${escapeHtml(c.label)}</option>`).join('')}
-          </select>
-          <span class="cpce-stack-layer-count" title="${escapeHtml(btnStyleConditionLabel(when))}">${countLabel}</span>
+          <span class="cpce-stack-cond-pill" title="Condition: ${escapeHtml(btnStyleConditionLabel(when))}">${escapeHtml(btnStyleConditionLabel(when))}</span>
+          <span class="cpce-stack-layer-spacer"></span>
+          <button class="cpce-icon-btn cpce-layer-edit" data-idx="${i}" title="${isEditing ? 'Editing — click to close the editor' : 'Edit this layer (load its look into the Style Builder)'}" style="color:${isEditing ? 'var(--cpce-editing,#ffb300)' : 'var(--secondary-text-color)'};"><ha-icon icon="${isEditing ? 'mdi:pencil' : 'mdi:pencil-outline'}"></ha-icon></button>
+          <button class="cpce-icon-btn cpce-layer-duplicate" data-idx="${i}" title="Duplicate this layer"><ha-icon icon="mdi:content-duplicate"></ha-icon></button>
           <button class="cpce-icon-btn cpce-layer-hide" data-idx="${i}" title="${hidden ? 'Layer hidden — click to show' : 'Hide this layer (preview without it)'}"><ha-icon icon="${hidden ? 'mdi:eye-off' : 'mdi:eye'}"></ha-icon></button>
-          <button class="cpce-icon-btn cpce-layer-up" data-idx="${i}" title="Move up" ${i === 0 ? 'disabled' : ''}><ha-icon icon="mdi:chevron-up"></ha-icon></button>
-          <button class="cpce-icon-btn cpce-layer-down" data-idx="${i}" title="Move down" ${i === layers.length - 1 ? 'disabled' : ''}><ha-icon icon="mdi:chevron-down"></ha-icon></button>
+          <button class="cpce-icon-btn cpce-layer-up" data-idx="${i}" title="Move up" ${i === 0 ? 'disabled' : ''}><ha-icon icon="mdi:arrow-up-bold"></ha-icon></button>
+          <button class="cpce-icon-btn cpce-layer-down" data-idx="${i}" title="Move down" ${i === layers.length - 1 ? 'disabled' : ''}><ha-icon icon="mdi:arrow-down-bold"></ha-icon></button>
           <button class="cpce-delete-entity-btn cpce-layer-remove" data-idx="${i}" title="Remove layer" ${layers.length <= 1 ? 'disabled' : ''}><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>
         </div>
+        <div class="cpce-stack-layer-groups">${countLabel}</div>
+        ${isEditing ? `<div class="cpce-row" style="gap:6px;"><label class="lbl" style="flex:0 0 auto;">Condition</label><select class="cpce-layer-cond" data-idx="${i}" style="flex:1;min-width:150px;">
+            ${opts.map(c => `<option value="${c.type}" ${c.type === selType ? 'selected' : ''}>${escapeHtml(c.label)}</option>`).join('')}
+          </select></div>` : ''}
         ${isEnt && isEditing ? `<div class="cpce-row cpce-layer-entrow" style="gap:6px;flex-wrap:wrap;">
           <input type="text" class="cpce-layer-ent" data-idx="${i}" placeholder="entity_id (e.g. light.desk)" value="${escapeHtml(when.entity || '')}" style="flex:2;min-width:150px;">
           <input type="text" class="cpce-layer-attr" data-idx="${i}" placeholder="attribute (optional)" value="${escapeHtml(when.attr || '')}" style="flex:1;min-width:110px;">
@@ -6291,25 +7347,37 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <input type="text" class="cpce-layer-val" data-idx="${i}" placeholder="${when.attr ? 'value' : 'state (default: on)'}" value="${escapeHtml(when.attr ? (when.value != null ? when.value : '') : (when.state != null ? when.state : ''))}" style="flex:1;min-width:90px;">
         </div>` : ''}
         ${isEditing ? `<div class="cpce-row" style="gap:6px;"><label class="lbl" style="flex:0 0 auto;">Label</label><input type="text" class="cpce-layer-label" data-idx="${i}" placeholder="optional layer name (e.g. Active glow)" value="${escapeHtml(l.label || '')}" style="flex:1;min-width:150px;"></div>` : ''}
-        ${isEditing ? `<div class="cpce-row"><span class="cpce-editing-tag"><ha-icon icon="mdi:arrow-down" style="--mdc-icon-size:14px;"></ha-icon> Adjust the look in the Style Builder below, then Save.</span></div>` : ''}
       </div>`;
     }).join('');
-    const isCurDefault = (slug === buttonStyleDefaultSlug());
+    const usedByCount = this._orderedSectionsRaw().filter(s => s && s.type === 'buttons' && (fixtureRefSlug(s.style_preset) || BTN_STYLE_BASIC_SLUG) === slug).length;
     return `
-      ${isCurDefault ? '<div class="cpce-hint">★ This preset is the current <strong>system-wide default</strong> — editing it restyles every card that follows the default.</div>' : ''}
+      ${usedByCount ? `<div class="cpce-hint">Editing this style updates the <strong>${usedByCount} section${usedByCount === 1 ? '' : 's'}</strong> using it (and any other card that uses it).</div>` : ''}
       <div class="cpce-row"><label class="lbl">Preset Name</label><input type="text" class="cpce-btnstyle-rename" data-slug="${escapeHtml(slug)}" value="${escapeHtml(entry.name || slug)}" placeholder="Style name"></div>
       <div class="cpce-row"><label class="lbl">Note</label><input type="text" class="cpce-btnstyle-note" data-slug="${escapeHtml(slug)}" value="${escapeHtml(entry.note || '')}" placeholder="optional note"></div>
-      <div class="cpce-hint">Layers stack bottom-to-top — a later layer overrides earlier ones where they set the same thing. <strong>Layer 1</strong> (condition <em>Always</em>) is the full look; layers on top store <strong>only what changes</strong> (the delta) and apply when their condition is met. Click a layer's ✏️ to edit it (unlocks its condition and loads its look into the Style Builder), adjust the look below, then <strong>Save</strong> from the Builder. The 👁 button hides a layer so you can preview without it.</div>
-      ${dirty ? `<div class="cpce-unsaved-banner"><ha-icon icon="mdi:alert-circle"></ha-icon> Unsaved changes — click <strong>Save this System Preset</strong> to apply them (system-wide).</div>` : ''}
-      ${rows}
+      <div class="cpce-hint">Layers stack bottom-to-top — a later layer overrides earlier ones where they set the same thing. <strong>Layer 1</strong> always sets <strong>All Settings</strong> (the full look); layers on top enable only the settings groups you check and apply when their condition is met. Click a layer's ✏️ to edit it (loads its look into the Style Builder below). The 👁 button hides a layer so you can preview without it.</div>
+      ${dirty ? `<div class="cpce-unsaved-banner">
+        <div class="cpce-unsaved-banner-msg"><ha-icon icon="mdi:alert-circle"></ha-icon> Unsaved changes</div>
+        <div class="cpce-row" style="gap:8px;margin-top:8px;">
+          <button class="cpce-create-preset-btn cpce-layer-save cpce-unsaved" data-slug="${escapeHtml(slug)}" style="flex:1;justify-content:center;" title="Save these layers to the shared library (applies system-wide to every card that uses this preset)"><ha-icon icon="mdi:content-save"></ha-icon> Save Changes</button>
+          <button class="cpce-mini-btn cpce-layer-discard" data-slug="${escapeHtml(slug)}" title="Undo unsaved layer edits — reloads the layers as currently saved"><ha-icon icon="mdi:undo"></ha-icon> Discard changes</button>
+        </div>
+      </div>` : ''}
       <div class="cpce-row" style="gap:8px;margin-top:6px;">
         <button class="cpce-mini-btn cpce-layer-add" data-slug="${escapeHtml(slug)}"><ha-icon icon="mdi:plus"></ha-icon> Add layer</button>
-        <button class="cpce-mini-btn cpce-layer-import" data-slug="${escapeHtml(slug)}" title="Paste Button Appearance JSON and append it as new layer(s) to this preset"><ha-icon icon="mdi:import"></ha-icon> Import as layer…</button>
-        <span style="flex:1;"></span>
-        ${dirty ? `<button class="cpce-mini-btn cpce-layer-discard" data-slug="${escapeHtml(slug)}" title="Undo unsaved layer edits — reloads the layers as currently saved"><ha-icon icon="mdi:undo"></ha-icon> Discard changes</button>` : ''}
-        ${dirty ? `<button class="cpce-create-preset-btn cpce-layer-save cpce-unsaved" data-slug="${escapeHtml(slug)}" title="Save these layers to the shared library (applies system-wide to every card)"><ha-icon icon="mdi:content-save-alert"></ha-icon> Unsaved — Save this System Preset</button>` : ''}
+        <button class="cpce-mini-btn cpce-layer-import" data-slug="${escapeHtml(slug)}" title="Paste Button Appearance JSON and append it as new layer(s) to this preset"><ha-icon icon="mdi:import"></ha-icon> Import a Layer</button>
       </div>
-      ${this._renderSavedPresetPreview(slug)}`;
+      ${this._renderSavedPresetPreview(slug)}
+      ${dirty ? this._renderDraftPreview(slug) : ''}
+      ${rows}`;
+  }
+  // The "after" preview: the DRAFT flattened (all conditions active, hidden layers skipped), so
+  // layer hide/show, reorder, add and unsaved edits are all reflected. Shown next to CURRENT STYLE
+  // while there are unsaved changes, so previewing-without-a-layer (the 👁 button) always has effect.
+  _renderDraftPreview(slug) {
+    const d = this._stackDraftFor(slug); if (!d) return '';
+    const libEntry = buttonStyleLibraryMap()[slug];
+    const stack = { ...(libEntry || {}), layers: d.layers };
+    return `<div class="cpce-hint" style="margin-top:6px;"><span class="cpce-preview-title"><ha-icon icon="mdi:eye-outline" style="--mdc-icon-size:14px;"></ha-icon> UNSAVED STYLE CHANGES</span></div>${this._renderButtonSampleRow(stack, this._config)}`;
   }
 
   // Reusable gradient-border editor. `g` is the spec object; `ns` a namespace used in element
@@ -6351,7 +7419,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
               <option value="custom" ${(!isMatch&&!isT)?'selected':''}>Custom</option>
               <option value="transparent" ${isT?'selected':''}>Transparent</option>
             </select>
-            <input type="color" class="${ns}-stop-color" data-idx="${i}" value="${/^#[0-9a-f]{6}$/i.test(st.color||'')?st.color:mc}"${(isT||isMatch)?' disabled':''}>
+            <input type="color" class="${ns}-stop-color" data-idx="${i}" value="${/^#[0-9a-f]{6}$/i.test(st.color||'')?st.color:mc}"${(isT||isMatch)?' style="display:none;"':''}>
             <button class="cpce-delete-entity-btn ${ns}-stop-remove" data-idx="${i}" title="Remove stop"><ha-icon icon="mdi:close"></ha-icon></button>
           </div>`;
         }).join('')}</div>
@@ -6398,8 +7466,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
       const stops = stopsOf(); const i = Number(col.dataset.idx); if (stops[i]) { stops[i].color = col.value; setG({ stops, pattern: undefined }); refreshPreview(); }
     }));
     // Stop kind: Match (track border color) / Custom (own color) / Transparent. Match & Transparent
-    // disable the color picker; switching to Custom seeds it from the match color. Re-render to
-    // reflect the picker's enabled state.
+    // hide the color picker (no color to pick); switching to Custom seeds it from the match color.
+    // Re-render to reflect the picker's visibility.
     root.querySelectorAll(`.${ns}-stop-kind`).forEach(sel => sel.addEventListener('change', () => {
       const stops = stopsOf(); const i = Number(sel.dataset.idx); if (!stops[i]) return;
       if (sel.value === 'match') stops[i].color = 'match';
@@ -6444,9 +7512,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // add handler. `pickerCls` marks the wrapper so wiring can scope to it.
   _renderEntitySearchPicker(candidates, chosen, pickerCls, placeholder) {
     const remaining = (candidates || []).filter(id => !(chosen || []).includes(id));
+    // The list starts collapsed (hidden) and opens on focus/typing — see _wireEntitySearchPicker.
+    // Keeps long entity lists from dominating the panel until you actually want to pick something.
     return `<div class="cpce-search-picker ${pickerCls}">
       <input type="text" class="cpce-sp-input" placeholder="${placeholder}" autocomplete="off">
-      <div class="cpce-sp-list">
+      <div class="cpce-sp-list collapsed">
         ${remaining.map(id => `<div class="cpce-sp-item" data-id="${escapeHtml(id)}" data-search="${escapeHtml((friendlyName(this._hass, id) + ' ' + id).toLowerCase())}"><span class="cpce-sp-name">${escapeHtml(friendlyName(this._hass, id))}</span><span class="cpce-entity-id">${escapeHtml(id)}</span></div>`).join('')}
         ${remaining.length ? '' : '<div class="cpce-hint" style="padding:8px;">Nothing left to add.</div>'}
       </div>
@@ -6457,12 +7527,21 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const picker = root.querySelector(`.${pickerCls}`);
     if (!picker) return;
     const input = picker.querySelector('.cpce-sp-input');
+    const list = picker.querySelector('.cpce-sp-list');
     const items = [...picker.querySelectorAll('.cpce-sp-item')];
-    if (input) input.addEventListener('input', () => {
-      const q = input.value.trim().toLowerCase();
-      items.forEach(it => { it.style.display = (!q || it.dataset.search.includes(q)) ? '' : 'none'; });
-    });
-    items.forEach(it => it.addEventListener('click', () => onPick(it.dataset.id)));
+    const openList = () => { if (list) list.classList.remove('collapsed'); };
+    const closeList = () => { if (list) list.classList.add('collapsed'); };
+    if (input) {
+      input.addEventListener('focus', openList);
+      input.addEventListener('input', () => {
+        openList();
+        const q = input.value.trim().toLowerCase();
+        items.forEach(it => { it.style.display = (!q || it.dataset.search.includes(q)) ? '' : 'none'; });
+      });
+      // Close when focus leaves the picker (delay so an item click lands before we hide the list).
+      input.addEventListener('blur', () => setTimeout(() => { if (!picker.contains(document.activeElement)) closeList(); }, 150));
+    }
+    items.forEach(it => it.addEventListener('click', () => { onPick(it.dataset.id); if (input) input.value = ''; closeList(); }));
   }
 
   // Per-divider appearance config (in a Section Order divider's gear panel). Layout: a live
@@ -6509,7 +7588,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
              const isTheme = (st.color === 'theme');
              return `<div class="cpce-row cpce-div-stop-row">
                <input type="range" class="cpce-div-stop-pos" data-id="${did}" data-idx="${i}" min="0" max="100" value="${clamp(Number(st.pos)||0,0,100)}"><span class="cpce-strength-val cpce-div-stop-pos-val">${clamp(Number(st.pos)||0,0,100)}%</span>
-               <input type="color" class="cpce-div-stop-color" data-id="${did}" data-idx="${i}" value="${/^#[0-9a-f]{6}$/i.test(st.color||'')?st.color:'#2196F3'}"${(isT||isTheme)?' disabled':''}>
+               <input type="color" class="cpce-div-stop-color" data-id="${did}" data-idx="${i}" value="${/^#[0-9a-f]{6}$/i.test(st.color||'')?st.color:'#2196F3'}"${(isT||isTheme)?' style="display:none;"':''}>
                <select class="cpce-div-stop-mode" data-id="${did}" data-idx="${i}" title="Stop color source">
                  <option value="color" ${(!isT&&!isTheme)?'selected':''}>Color</option>
                  <option value="theme" ${isTheme?'selected':''}>Theme</option>
@@ -6828,13 +7907,18 @@ class ColorLightManagerCardEditor extends HTMLElement {
           </div>
           ${(() => {
             const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
-            const firstId = buttonsSections.length ? buttonsSections[0].id : '';
-            const current = buttonsSections.some(s => s.id === preset.section_id) ? preset.section_id : firstId;
+            // A button may be UNASSIGNED (section_id === '__none__'): it's not shown on the card, but
+            // still defines a Scene-tile look (color/icon) the Scene Tracker borrows via Scene Selects.
+            // A missing/blank section_id defaults to the first buttons section (legacy behavior).
+            const unassigned = preset.section_id === '__none__';
+            const current = unassigned ? '__none__' : (buttonsSections.some(s => s.id === preset.section_id) ? preset.section_id : (buttonsSections[0] && buttonsSections[0].id) || '');
             return `<div class="cpce-row"><label class="lbl">In Button Section</label>
               <select class="cpce-preset-section" data-index="${index}">
                 ${buttonsSections.map(s => `<option value="${s.id}" ${s.id===current?'selected':''}>${escapeHtml(s.name || 'Buttons')}</option>`).join('')}
+                <option value="__none__" ${unassigned?'selected':''}>None — not shown on card (tile look only)</option>
               </select>
-            </div>`;
+            </div>
+            ${unassigned ? '<div class="cpce-hint">This button is <strong>hidden from the card</strong>. It still defines a look the Scene Tracker can borrow (via its Scene Selects binding) — use it to style a scene tile without exposing a button.</div>' : ''}`;
           })()}
           <div class="cpce-row"><label class="lbl">Mode</label>
             <select class="cpce-preset-mode">
@@ -6846,6 +7930,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
             </select>
           </div>
           ${isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:palette"></ha-icon>Scene</div>${this._renderPresetScenePicker(preset, index)}` : ''}
+          ${isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:lightbulb-on-outline"></ha-icon>Follow Lights for Color</div>${this._renderPresetGlowFollow(preset, index)}` : ''}
           ${showButtonStyle ? this._renderButtonStyling(preset, index) : ''}
 
           ${isProfile ? `<div class="cpce-subgroup"><ha-icon icon="mdi:link-variant"></ha-icon>Fixture Profile</div>
@@ -6859,36 +7944,125 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-check"><input type="checkbox" class="cpce-preset-bri-enable" ${hasBrightness ? 'checked' : ''}><label>Set brightness with this button</label></div>
           ${hasBrightness ? `<div class="cpce-temp-editor"><input type="range" class="cpce-preset-bri" min="1" max="100" value="${brightnessPct}"><span class="cpce-bri-val">${brightnessPct}%</span></div>` : `<div class="cpce-hint">When off, this button leaves the light's current brightness unchanged.</div>`}
           ${this._renderPresetExtras(preset, index, false)}
+          <div class="cpce-row" style="margin-top:8px;">
+            <button class="cpce-mini-btn cpce-preset-save-profile" data-index="${index}" title="Save this button's look as a reusable Fixture Profile in the shared library, then point this button at it"><ha-icon icon="mdi:content-save-move-outline"></ha-icon> Save as Fixture Profile</button>
+          </div>
+          <div class="cpce-hint">Promotes this local look to the shared <strong>Fixture Profiles</strong> library so other buttons/cards can reuse it. This button then follows the profile — edit it once, all update.</div>
           ` : ''}
           ${(isColor || isTemp) ? this._renderInputColorLink(preset, index) : ''}
 
           ${!isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:lightbulb-group-outline"></ha-icon>Target Lights</div>
           ${this._renderPresetActions(preset, index, mode)}` : ''}
+
+          <div class="cpce-subgroup"><ha-icon icon="mdi:format-list-bulleted"></ha-icon>Scene Selects</div>
+          ${this._renderPresetSelects(preset, index)}
         </div>
       </div>
     `;
   }
 
-  // Optional Button Styling: an explicit color used ONLY for how the button looks
-  // (swatch/tint/glow/icon), independent of what it does — so scene-only / None-target /
-  // Off buttons can still look intentional. When unset, styling derives from the look.
-  // "Copy From…" clones another button's style color for quick consistency.
-  _renderButtonStyling(preset, index) {
-    const enabled = !!preset.button_style_color;
-    const others = (this._config.presets || [])
-      .map((p, i) => ({ p, i }))
-      .filter(o => o.i !== index && o.p.button_style_color);
+  // Repeatable input_select bindings for a button. On press the card sets each; the button lights up
+  // (active) only when ALL bindings currently match. Works for any button kind — group scenes across
+  // rooms (one "Sports" button → several helpers), or an Off button that resets multiple helpers.
+  _renderPresetSelects(preset, index) {
+    // Render from the RAW array (not sanitized) so an in-progress row — entity chosen but option not
+    // yet — still shows while editing. presetSelects() is the sanitized view used for card behavior.
+    const binds = Array.isArray(preset.selects) ? preset.selects.map(b => ({ entity: (b && b.entity) || '', option: (b && b.option) || '' })) : [];
+    const selects = this._allInputSelectEntities();   // [{entity, options[]}]
+    const rowHtml = (b, i) => {
+      const opts = (selects.find(s => s.entity === b.entity) || {}).options || [];
+      // If the bound option isn't in the (known) list, still show it so it isn't silently dropped.
+      const optionList = (b.option && !opts.includes(b.option)) ? [b.option, ...opts] : opts;
+      return `<div class="cpce-row cpce-select-row" data-index="${index}" data-bind="${i}" style="gap:6px;">
+        <select class="cpce-select-entity" data-index="${index}" data-bind="${i}" style="flex:2;min-width:150px;">
+          <option value="">Choose input_select…</option>
+          ${selects.map(s => `<option value="${escapeHtml(s.entity)}" ${s.entity === b.entity ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, s.entity))}</option>`).join('')}
+          ${(b.entity && !selects.some(s => s.entity === b.entity)) ? `<option value="${escapeHtml(b.entity)}" selected>${escapeHtml(b.entity)} (missing)</option>` : ''}
+        </select>
+        <select class="cpce-select-option" data-index="${index}" data-bind="${i}" style="flex:1;min-width:110px;" ${b.entity ? '' : 'disabled'}>
+          <option value="">Option…</option>
+          ${optionList.map(o => `<option value="${escapeHtml(o)}" ${o === b.option ? 'selected' : ''}>${escapeHtml(o)}</option>`).join('')}
+        </select>
+        <button class="cpce-delete-entity-btn cpce-select-remove" data-index="${index}" data-bind="${i}" title="Remove binding"><ha-icon icon="mdi:close"></ha-icon></button>
+      </div>`;
+    };
+    // Opt-out is only meaningful when this button's section defines a default scene reset AND this
+    // is a non-scene button that doesn't already bind that group (otherwise the reset never fires).
+    const section = this._sectionForPreset(preset);
+    const defGroup = section && section.default_scene_group;
+    const resetApplies = defGroup && buttonMode(preset) !== 'scene' && !binds.some(b => b.entity === defGroup);
     return `
-      <div class="cpce-check"><input type="checkbox" class="cpce-btnstyle-enable" data-index="${index}" ${enabled?'checked':''}><label>Custom button styling color</label></div>
-      ${enabled ? `
-        <div class="cpce-row"><label class="lbl">Style Color</label><input type="color" class="cpce-btnstyle-color" data-index="${index}" value="${preset.button_style_color}"></div>
-        ${others.length ? `<div class="cpce-row"><label class="lbl">Copy From…</label>
-          <select class="cpce-btnstyle-copy" data-index="${index}">
-            <option value="">Choose a button…</option>
-            ${others.map(o => `<option value="${o.p.button_style_color}">${escapeHtml(o.p.name || 'Button')}</option>`).join('')}
-          </select></div>` : ''}
-        <div class="cpce-hint">Overrides the look-derived color for this button's appearance only (not what it sends).</div>
-      ` : `<div class="cpce-hint">Off: the button's appearance follows its profile/look color.</div>`}
+      <div class="cpce-hint">When pressed, this button sets each chosen <code>input_select</code> to its option — and lights up (active) only when all of them currently match. Use for grouping scenes across rooms, or an Off button that resets several helpers.</div>
+      ${binds.map((b, i) => rowHtml(b, i)).join('')}
+      <button class="cpce-mini-btn cpce-select-add" data-index="${index}"><ha-icon icon="mdi:plus"></ha-icon> Add binding</button>
+      ${selects.length ? '' : '<div class="cpce-hint">No <code>input_select</code> helpers found. Create one in Home Assistant (Settings → Devices &amp; Services → Helpers) first.</div>'}
+      ${resetApplies ? `<div class="cpce-check" style="margin-top:8px;"><input type="checkbox" class="cpce-preset-no-reset" data-index="${index}" ${preset.no_scene_reset ? 'checked' : ''}><label>Do Not Set “${escapeHtml(friendlyName(this._hass, defGroup))}” to “${escapeHtml(section.default_scene_option || '-none-')}” on button press</label></div>` : ''}
+    `;
+  }
+  // All input_select entities in HA (as Scene Groups), with their options — for every Scene Selects
+  // picker + tracker Area picker. Filtered by the card-level Scene Group filter (Scene Groups panel):
+  //   • string — the entity_id must contain this substring (default 'scene'); empty = no string filter.
+  //   • label  — the entity must carry this HA label; empty = no label filter.
+  // When BOTH are set a group must match BOTH (AND). One place to set it, every picker respects it.
+  _allInputSelectEntities(ignoreFilter) {
+    if (!this._hass || !this._hass.states) return [];
+    const cfg = this._config || {};
+    const str = ignoreFilter ? '' : (cfg.scene_group_filter_str !== undefined ? String(cfg.scene_group_filter_str) : 'scene').trim().toLowerCase();
+    const label = ignoreFilter ? '' : (cfg.scene_group_filter_label || '');
+    return Object.keys(this._hass.states)
+      .filter(id => id.startsWith('input_select.'))
+      .filter(id => !str || id.toLowerCase().includes(str))
+      .filter(id => !label || getEntityLabels(this._hass, id).includes(label))
+      .sort()
+      .map(id => ({ entity: id, options: (this._hass.states[id].attributes && Array.isArray(this._hass.states[id].attributes.options)) ? this._hass.states[id].attributes.options : [] }));
+  }
+
+  // Custom button styling — TWO independent fixed colors, each enabled separately:
+  //   • Button color (button_style_color): when on, the button BODY is always this color, no matter
+  //     what the glow does.
+  //   • Glow color (button_glow_style_color): when on, the GLOW is always this color, no matter what
+  //     the body does.
+  // Either off = that aspect follows the live/look color instead (body follows only when active;
+  // glow follows the live color). Presence of the key = enabled (no separate boolean).
+  _renderButtonStyling(preset, index) {
+    const bodyOn = !!preset.button_style_color;
+    const glowOn = !!preset.button_glow_style_color;
+    return `
+      <div class="cpce-check"><input type="checkbox" class="cpce-btnstyle-enable" data-index="${index}" ${bodyOn?'checked':''}><label>Fixed button color</label></div>
+      ${bodyOn ? `
+        <div class="cpce-row"><label class="lbl">Button Color</label><input type="color" class="cpce-btnstyle-color" data-index="${index}" value="${preset.button_style_color}"></div>
+        <div class="cpce-hint">The button body stays this exact color — independent of the glow.</div>
+      ` : ''}
+      <div class="cpce-check"><input type="checkbox" class="cpce-btnglow-enable" data-index="${index}" ${glowOn?'checked':''}><label>Fixed glow color</label></div>
+      ${glowOn ? `
+        <div class="cpce-row"><label class="lbl">Glow Color</label><input type="color" class="cpce-btnglow-color" data-index="${index}" value="${preset.button_glow_style_color}"></div>
+        <div class="cpce-hint">The glow stays this exact color — independent of the button body.</div>
+      ` : ''}
+      ${!bodyOn && !glowOn ? `<div class="cpce-hint">Off: the button body follows the live color when active; the glow follows the live color.</div>` : ''}
+    `;
+  }
+
+  // "Follow Lights for Color" (scene buttons): pick lights whose LIVE color this scene button
+  // borrows for its whole appearance (fill, glow, accents) — used when the card can't read a
+  // scene's member lights automatically (a Zigbee2MQTT scene.* is a proxy that lists none) or to
+  // override. When empty, an HA-native scene auto-resolves its own member lights; if nothing
+  // resolves, the button falls back to its Custom Style Color, then grey.
+  _renderPresetGlowFollow(preset, index) {
+    const follow = Array.isArray(preset.glow_entities) ? preset.glow_entities.filter(Boolean) : [];
+    const allLights = getLightEntities(this._hass);
+    const autoMembers = this._sceneMemberLightIds(preset);
+    const autoNote = follow.length
+      ? ''
+      : (autoMembers.length
+        ? `<div class="cpce-hint">Auto-following this scene's ${autoMembers.length} member light${autoMembers.length === 1 ? '' : 's'} (read from the scene). Add lights below to override.</div>`
+        : `<div class="cpce-hint">This scene exposes no member lights (e.g. a Zigbee2MQTT scene). Add the lights it turns on so the button's color follows them live; otherwise it uses the Custom Style Color below, then grey.</div>`);
+    return `
+      <div class="cpce-glowfollow" data-index="${index}">
+        ${autoNote}
+        ${allLights.length
+          ? `${this._renderEntitySearchPicker(allLights, follow, 'cpce-gf-picker', 'Search lights to follow…')}${this._renderChips(follow, 'on', 'cpce-gf-chip-x')}`
+          : `<div class="cpce-hint">No <code>light.*</code> entities found.</div>`}
+      </div>
     `;
   }
 
@@ -6953,6 +8127,137 @@ class ColorLightManagerCardEditor extends HTMLElement {
   _sceneCaptureIds() {
     const base = this._sceneCaptureSet != null ? this._sceneCaptureSet : (this._config.entities || []);
     return base.filter(id => sceneDomainSupported(id));
+  }
+
+  // ---- Scene Groups: create & manage input_select helpers (the scene-state helpers buttons bind
+  // to and the Scene Tracker displays). Admin-only (HA restriction). YAML-defined helpers are shown
+  // read-only. Uses this._sceneHelpers (loaded via input_select/list) reconciled with hass.states.
+  _renderSceneGroupsSection() {
+    const isAdmin = !!(this._hass && this._hass.user && this._hass.user.is_admin);
+    // All input_select entities from state (covers YAML + storage helpers).
+    const all = this._allInputSelectEntities();   // [{entity, options[]}]
+    // Storage helpers (editable) come from the collection list; map id→entity best-effort.
+    const storage = Array.isArray(this._sceneHelpers) ? this._sceneHelpers : null;   // null = not loaded yet
+    const storageEntities = new Set();
+    (storage || []).forEach(h => { const eid = this._helperEntityId(h); if (eid) storageEntities.add(eid); });
+    // Reference counts: how many buttons/areas point at each entity (for delete warnings).
+    const refCount = (entity) => {
+      let n = 0;
+      (this._config.presets || []).forEach(p => { if (presetSelects(p).some(b => b.entity === entity)) n++; });
+      ((this._config.sections) || []).forEach(s => { if (s && s.type === 'scene_tracker' && Array.isArray(s.areas)) s.areas.forEach(a => { if (a && a.entity === entity) n++; }); });
+      return n;
+    };
+    const draft = this._sceneHelperDraft || null;   // { name, options:'multiline', initial, icon }
+    const createOpen = !!this._sceneHelperCreateOpen;
+    // Scene Group filter (card-level; every scene picker respects it). String defaults to 'scene'.
+    const cfg = this._config || {};
+    const filterStr = cfg.scene_group_filter_str !== undefined ? String(cfg.scene_group_filter_str) : 'scene';
+    const filterLabel = cfg.scene_group_filter_label || '';
+    const totalCount = this._allInputSelectEntities(true).length;   // unfiltered, for "N of M"
+    const labelIds = getAllLabels(this._hass);
+    const labelName = (id) => (this._hass && this._hass.labels && this._hass.labels[id] && this._hass.labels[id].name) || id;
+    const filterUi = `
+      <div class="cpce-sub-title">Scene Group filter</div>
+      <div class="cpce-hint">Which <code>input_select</code> helpers count as Scene Groups everywhere in this card (button Scene Selects, tracker areas, this list). Both filters apply together.</div>
+      <div class="cpce-row"><label class="lbl">Name contains</label><input type="text" id="cpce-sg-filter-str" placeholder="scene" value="${escapeHtml(filterStr)}"></div>
+      <div class="cpce-row"><label class="lbl">Has label</label>
+        <select id="cpce-sg-filter-label">
+          <option value="" ${!filterLabel ? 'selected' : ''}>(any label)</option>
+          ${labelIds.map(id => `<option value="${escapeHtml(id)}" ${filterLabel === id ? 'selected' : ''}>${escapeHtml(labelName(id))}</option>`).join('')}
+          ${(filterLabel && !labelIds.includes(filterLabel)) ? `<option value="${escapeHtml(filterLabel)}" selected>${escapeHtml(filterLabel)} (missing)</option>` : ''}
+        </select>
+      </div>
+      <div class="cpce-hint">Showing <strong>${all.length}</strong> of ${totalCount} <code>input_select</code> helper${totalCount === 1 ? '' : 's'}.</div>`;
+    const listRows = all.map(({ entity, options }) => {
+      const editable = isAdmin && storageEntities.has(entity);
+      const editing = this._sceneHelperEditing === entity;
+      const refs = refCount(entity);
+      const optsPreview = options.length ? options.join(', ') : '(no options)';
+      const meta = [editable ? '' : 'YAML / read-only', `${options.length} option${options.length===1?'':'s'}`, refs ? `${refs} ref${refs===1?'':'s'}` : ''].filter(Boolean).join(' · ');
+      return `<div class="cpce-manage-item" data-entity="${escapeHtml(entity)}">
+          <ha-icon icon="${editable ? 'mdi:form-select' : 'mdi:lock'}" style="color:var(--primary-color);flex-shrink:0;"></ha-icon>
+          <span class="cpce-ce-name">${escapeHtml(friendlyName(this._hass, entity))}<span class="cpce-entity-id">${escapeHtml(entity)} · ${escapeHtml(meta)}</span></span>
+          ${editable ? `<button class="cpce-icon-btn cpce-sh-edit${editing?' active':''}" data-entity="${escapeHtml(entity)}" title="Edit options"><ha-icon icon="mdi:pencil"></ha-icon></button>
+          <button class="cpce-icon-btn cpce-sh-rename" data-entity="${escapeHtml(entity)}" title="Rename helper"><ha-icon icon="mdi:rename-box"></ha-icon></button>
+          <button class="cpce-delete-entity-btn cpce-sh-delete" data-entity="${escapeHtml(entity)}" title="Delete helper"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>` : ''}
+        </div>
+        ${editing && editable ? `<div class="cpce-order-style-panel">
+          <div class="cpce-sub-title">Options (one per line)</div>
+          <textarea class="cpce-sh-options" data-entity="${escapeHtml(entity)}" rows="${Math.max(3, options.length + 1)}" style="width:100%;box-sizing:border-box;">${escapeHtml(options.join('\n'))}</textarea>
+          <div class="cpce-hint">Changing or removing an option can orphan buttons/tracker areas that reference the old value (${refs} reference${refs===1?'':'s'}). They’ll simply stop matching until repointed.</div>
+          <div class="cpce-row" style="gap:8px;margin-top:6px;"><button class="cpce-create-preset-btn cpce-sh-options-save" data-entity="${escapeHtml(entity)}"><ha-icon icon="mdi:content-save"></ha-icon> Save options</button><button class="cpce-mini-btn cpce-sh-edit" data-entity="${escapeHtml(entity)}">Cancel</button></div>
+        </div>` : ''}`;
+    }).join('');
+    return `
+      <div class="cpce-hint">Manage the <code>input_select</code> helpers that hold each area's current scene. Buttons set them (Scene Selects) and the Scene Tracker displays them. These are standard Home Assistant helpers — usable anywhere.</div>
+      ${filterUi}
+      ${isAdmin ? `
+      <div class="cpce-collapse-head${createOpen ? '' : ' collapsed'}" id="cpce-sh-create-toggle"><span class="cpce-subpanel-name">Create a Scene Group</span><ha-icon icon="mdi:chevron-down"></ha-icon></div>
+      ${createOpen ? `
+        <div class="cpce-row"><label class="lbl">Name</label><input type="text" id="cpce-sh-name" placeholder="e.g. Family Room Scenes" value="${escapeHtml((draft && draft.name) || '')}"></div>
+        <div class="cpce-sub-title">Options (one per line)</div>
+        <textarea id="cpce-sh-new-options" rows="5" style="width:100%;box-sizing:border-box;" placeholder="Sports&#10;Dinner&#10;Bright&#10;Comfort&#10;-none-">${escapeHtml((draft && draft.options) || '')}</textarea>
+        <div class="cpce-row"><label class="lbl">Initial option</label><input type="text" id="cpce-sh-initial" placeholder="(optional — defaults to first)" value="${escapeHtml((draft && draft.initial) || '')}"></div>
+        <div class="cpce-row"><label class="lbl">Icon</label><input type="text" id="cpce-sh-icon" placeholder="mdi:lightbulb-group (optional)" value="${escapeHtml((draft && draft.icon) || '')}"></div>
+        <div class="cpce-row" style="margin-top:6px;"><button class="cpce-create-preset-btn" id="cpce-sh-create"><ha-icon icon="mdi:plus"></ha-icon> Create helper</button></div>
+      ` : ''}` : '<div class="cpce-hint">⚠️ Creating and editing helpers requires an <strong>admin</strong> Home Assistant user. You can still bind buttons to existing helpers.</div>'}
+      <div class="cpce-collapse-head" id="cpce-sh-list-header" style="pointer-events:none;"><span class="cpce-subpanel-name">Scene Groups (${all.length})</span></div>
+      ${all.length ? `<div class="cpce-manage-list">${listRows}</div>` : '<div class="cpce-hint">No input_select helpers yet.</div>'}
+    `;
+  }
+  // Best-effort collection-id → entity_id resolution for a helper from input_select/list. The
+  // storage helper's entity_id is input_select.<id> in the common case; verify against hass.states.
+  _helperEntityId(h) {
+    if (!h || !h.id) return null;
+    const guess = `input_select.${h.id}`;
+    if (this._hass && this._hass.states && this._hass.states[guess]) return guess;
+    // Fallback: match by name against friendly_name.
+    if (this._hass && this._hass.states) {
+      const byName = Object.keys(this._hass.states).find(id => id.startsWith('input_select.') && (this._hass.states[id].attributes || {}).friendly_name === h.name);
+      if (byName) return byName;
+    }
+    return guess;   // last resort
+  }
+  // Reverse of _helperEntityId: entity_id → the collection id needed by update/delete. Matches the
+  // loaded storage-helper list; returns null when the entity isn't an editable storage helper.
+  _helperCollectionId(entity) {
+    const list = Array.isArray(this._sceneHelpers) ? this._sceneHelpers : [];
+    const hit = list.find(h => this._helperEntityId(h) === entity);
+    return hit ? hit.id : null;
+  }
+  // Count references to an input_select entity across button selects + tracker areas.
+  _sceneHelperReferences(entity) {
+    let buttons = 0, areas = 0;
+    (this._config.presets || []).forEach(p => { if (presetSelects(p).some(b => b.entity === entity)) buttons++; });
+    ((this._config.sections) || []).forEach(s => { if (s && s.type === 'scene_tracker' && Array.isArray(s.areas)) s.areas.forEach(a => { if (a && a.entity === entity) areas++; }); });
+    return { buttons, areas, total: buttons + areas };
+  }
+  // Remove every reference to a (deleted) input_select entity: strip matching button selects and
+  // tracker areas so no binding dangles. Writes config once.
+  _cleanupHelperReferences(entity) {
+    const presets = (this._config.presets || []).map(p => {
+      if (!Array.isArray(p.selects)) return p;
+      const kept = p.selects.filter(b => !(b && b.entity === entity));
+      if (kept.length === p.selects.length) return p;
+      const np = { ...p }; if (kept.length) np.selects = kept; else delete np.selects; return np;
+    });
+    const sections = (this._config.sections || []).map(s => {
+      if (!s || s.type !== 'scene_tracker' || !Array.isArray(s.areas)) return s;
+      const areas = s.areas.filter(a => !(a && a.entity === entity));
+      if (areas.length === s.areas.length) return s;
+      return { ...s, areas };
+    });
+    this._updateConfig({ presets, sections });
+  }
+  // Load the storage-helper collection once hass is available (admin only; non-admins can't list-edit
+  // but the list command still returns for read — we only USE it to know which are editable).
+  _ensureSceneHelpers() {
+    if (this._sceneHelpersLoading || this._sceneHelpers) return;
+    if (!this._hass || !this._hass.connection) return;
+    this._sceneHelpersLoading = true;
+    wsInputSelectList(this._hass)
+      .then(list => { this._sceneHelpers = Array.isArray(list) ? list : []; this._sceneHelpersLoading = false; this._render(); })
+      .catch(() => { this._sceneHelpers = []; this._sceneHelpersLoading = false; });   // non-admin/unsupported → empty (all treated read-only)
   }
 
   _renderSceneBuilderSection() {
@@ -7796,6 +9101,23 @@ class ColorLightManagerCardEditor extends HTMLElement {
       container.querySelectorAll('.cpce-cc-chip-x').forEach(x => x.onclick = () =>
         normalizeTargeting({ target_entities: (this._config.presets[index].target_entities || []).filter(id => id !== x.dataset.id) }));
 
+      // "Follow Lights for Color" (scene buttons): edit preset.glow_entities. Absent/empty = auto
+      // (scene members) → style color → grey.
+      const gfPatch = (list) => {
+        const presets = [...(this._config.presets || [])];
+        const p = { ...presets[index] };
+        const clean = [...new Set((list || []).filter(Boolean))];
+        if (clean.length) p.glow_entities = clean; else delete p.glow_entities;
+        presets[index] = p;
+        this._updateConfig({ presets });
+        this._render();
+      };
+      const gfAdd = (val) => { if (val) gfPatch([...(this._config.presets[index].glow_entities || []), val]); };
+      // Searchable list picker (same UX as Default Entities) — click a row to add.
+      this._wireEntitySearchPicker(container, 'cpce-gf-picker', (id) => gfAdd(id));
+      container.querySelectorAll('.cpce-gf-chip-x').forEach(x => x.onclick = () =>
+        gfPatch((this._config.presets[index].glow_entities || []).filter(id => id !== x.dataset.id)));
+
       // Scene mode: single-scene selector (this button activates exactly one scene).
       const sceneSel = container.querySelector('.cpce-preset-scene');
       if (sceneSel) sceneSel.addEventListener('change', () => {
@@ -7816,7 +9138,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
         this._render();
       });
 
-      // Button Styling: enable toggle, color, and Copy From…
+      // Custom button styling — two INDEPENDENT fixed colors (body + glow), each toggled on its own.
+      // Fixed button (body) color.
       const styleEnable = container.querySelector('.cpce-btnstyle-enable');
       if (styleEnable) styleEnable.addEventListener('change', () => {
         const presets = [...(this._config.presets || [])];
@@ -7835,13 +9158,23 @@ class ColorLightManagerCardEditor extends HTMLElement {
         presets[index] = { ...presets[index], button_style_color: styleColor.value };
         this._updateConfig({ presets });
       });
-      const styleCopy = container.querySelector('.cpce-btnstyle-copy');
-      if (styleCopy) styleCopy.addEventListener('change', () => {
-        if (!styleCopy.value) return;
+      // Fixed glow color (independent of the body color).
+      const glowEnable = container.querySelector('.cpce-btnglow-enable');
+      if (glowEnable) glowEnable.addEventListener('change', () => {
         const presets = [...(this._config.presets || [])];
-        presets[index] = { ...presets[index], button_style_color: styleCopy.value };
+        const p = { ...presets[index] };
+        if (glowEnable.checked) {
+          p.button_glow_style_color = p.button_glow_style_color || p.button_style_color || ColorUtils.rgbToHex(...presetColorToRgb(this._effectivePreset(p)));
+        } else delete p.button_glow_style_color;
+        presets[index] = p;
         this._updateConfig({ presets });
         this._render();
+      });
+      const glowColor = container.querySelector('.cpce-btnglow-color');
+      if (glowColor) glowColor.addEventListener('input', () => {
+        const presets = [...(this._config.presets || [])];
+        presets[index] = { ...presets[index], button_glow_style_color: glowColor.value };
+        this._updateConfig({ presets });
       });
 
       // Fixture Profile selector (Mode = Fixture Profile): "" clears the ref (button applies
@@ -7855,6 +9188,54 @@ class ColorLightManagerCardEditor extends HTMLElement {
         this._updateConfig({ presets });
         this._render();
       });
+
+      // Save this button's current inline look as a shared Fixture Profile, then re-point the button.
+      const saveProfileBtn = container.querySelector('.cpce-preset-save-profile');
+      if (saveProfileBtn) saveProfileBtn.onclick = () => this._saveButtonAsProfile(index);
+
+      // Scene Selects: add / remove / edit input_select bindings on this preset. Mutations write a
+      // clean `selects` array (dropping empty rows on entity change is avoided — an in-progress row
+      // with a chosen entity but no option yet is preserved so the option picker can populate).
+      const mutateSelects = (fn) => {
+        const presets = [...(this._config.presets || [])];
+        const cur = Array.isArray(presets[index] && presets[index].selects) ? presets[index].selects.map(b => ({ ...b })) : [];
+        fn(cur);
+        // Keep every row the user is editing — including a freshly-added blank one and an in-progress
+        // row (entity chosen, option pending) — so the pickers can populate. These inert rows are
+        // ignored by read-time presetSelects() (which requires both entity+option), so they never
+        // affect card rendering/active/press. Normalize each row to {entity, option} strings.
+        const rows = cur.map(b => ({ entity: (b && b.entity) || '', option: (b && b.option) || '' }));
+        const p = { ...presets[index] };
+        if (rows.length) p.selects = rows; else delete p.selects;
+        presets[index] = p;
+        this._updateConfig({ presets });
+        this._render();
+      };
+      const addSel = container.querySelector('.cpce-select-add');
+      if (addSel) addSel.onclick = () => mutateSelects(arr => arr.push({ entity: '', option: '' }));
+      container.querySelectorAll('.cpce-select-entity').forEach(sel => sel.addEventListener('change', () => {
+        const bi = Number(sel.dataset.bind);
+        mutateSelects(arr => { if (!arr[bi]) arr[bi] = { entity: '', option: '' }; arr[bi].entity = sel.value; arr[bi].option = ''; });   // reset option when entity changes
+      }));
+      container.querySelectorAll('.cpce-select-option').forEach(sel => sel.addEventListener('change', () => {
+        const bi = Number(sel.dataset.bind);
+        mutateSelects(arr => { if (arr[bi]) arr[bi].option = sel.value; });
+      }));
+      container.querySelectorAll('.cpce-select-remove').forEach(btn => btn.onclick = () => {
+        const bi = Number(btn.dataset.bind);
+        mutateSelects(arr => arr.splice(bi, 1));
+      });
+      // Per-button opt-out from the section's default scene reset.
+      const noReset = container.querySelector('.cpce-preset-no-reset');
+      if (noReset) noReset.addEventListener('change', () => {
+        const presets = [...(this._config.presets || [])];
+        const p = { ...presets[index] };
+        if (noReset.checked) p.no_scene_reset = true; else delete p.no_scene_reset;
+        presets[index] = p;
+        this._updateConfig({ presets });
+        this._render();
+      });
+
       this._wireColorWheel(container, index);
     });
   }
@@ -7862,6 +9243,31 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // Creates a new blank Fixture Profile in the shared library (prompted for a name), then opens
   // its inline editor so the user sets the look. All profile creation/editing lives here now —
   // buttons only reference profiles (Mode = Fixture Profile), they don't create them.
+  // Promote a button's inline look to a shared Fixture Profile, then re-point the button at it
+  // (mode → profile, profile_ref → lib:<slug>). The button keeps its name/icon/targets; only the
+  // LOOK moves to the library. A subsequent edit to the profile updates every button using it.
+  _saveButtonAsProfile(index) {
+    const presets = [...(this._config.presets || [])];
+    const preset = presets[index]; if (!preset) return;
+    const look = extractProfileLook(this._effectivePreset(preset));   // resolved current look (color+bri+effect+transition)
+    if (!look || !Object.keys(look).length) { window.alert('This button has no look to save yet.'); return; }
+    const scope = this._config.fixture_library_scope || 'system';
+    const suggested = preset.name || 'New Profile';
+    const name = window.prompt('Name this Fixture Profile:', suggested);
+    if (!name || !name.trim()) return;
+    const map = { ...fixtureLibraryMap(scope) };
+    let slug = fixtureLibSlug(name);
+    if (map[slug]) { let n = 2; while (map[`${slug}_${n}`]) n++; slug = `${slug}_${n}`; }
+    map[slug] = { name: name.trim(), look };
+    // Re-point the button: switch to profile mode, clear the now-migrated inline look fields.
+    const p = { ...preset, mode: 'profile', profile_ref: `lib:${slug}` };
+    PROFILE_LOOK_KEYS.forEach(k => delete p[k]);
+    delete p.input_color_entity;   // a profile-mode button isn't entity-linked
+    presets[index] = p;
+    saveFixtureLibrary(this._hass, scope, map)
+      .then(() => { this._updateConfig({ presets }); this._openProfile = slug; this._render(); })
+      .catch(e => { console.error(`${LOG_PREFIX} save button as profile failed`, e); window.alert(`Could not save profile: ${formatWsError(e)}`); });
+  }
   _addFixtureProfile() {
     const scope = this._config.fixture_library_scope || 'system';
     const name = window.prompt('Name the new Fixture Profile:', 'New Profile');
@@ -7878,47 +9284,26 @@ class ColorLightManagerCardEditor extends HTMLElement {
       .catch(e => { console.error(`${LOG_PREFIX} create profile failed`, e); window.alert(`Could not create the profile: ${formatWsError(e)}`); });
   }
 
-  // Establish the system-wide-default POINTER once per session, if not already stored:
-  //   - legacy __default__ stack present → point at it (preserves the user's current Default look)
-  //   - fresh install → point at the synthetic Built-In
-  // No stack is baked from card config anymore; the pointer is the single source of truth and the
-  // user can move it to any preset (or Built-In) with the ★ button.
-  _seedDefaultButtonStack() {
-    if (this._seededDefaultStack) return;
-    const st = BTN_STYLE_LIBRARY.system;
-    if (!st.loaded) return;                       // wait until the library is known
-    this._seededDefaultStack = true;              // attempt once per editor session
-    if (st.defaultSlug && (st.defaultSlug === BTN_STYLE_BUILTIN_SLUG || buttonStyleLibraryMap()[st.defaultSlug])) return;  // pointer already set
-    const target = buttonStyleLibraryMap()[BTN_STYLE_DEFAULT_SLUG] ? BTN_STYLE_DEFAULT_SLUG : BTN_STYLE_BUILTIN_SLUG;
-    st.defaultSlug = target;   // reflect immediately for this render
-    saveButtonStyleLibrary(this._hass, buttonStyleLibraryMap(), target).catch(e => console.warn(`${LOG_PREFIX} seed default pointer failed`, e));
+  // One-time migration: the old "(system default)" section value stored an EMPTY style_preset that
+  // resolved dynamically through the ★ pointer. That pointer is gone — so pin every such section to
+  // the CONCRETE style the default used to resolve to, preserving its current look. Runs once per
+  // editor session, only when the library is loaded and at least one section needs it. Writes the
+  // card config (config-changed) so the pin persists.
+  _migrateSectionDefaults() {
+    if (this._migratedSectionDefaults) return;
+    if (!BTN_STYLE_LIBRARY.system.loaded) return;   // wait until the library (and legacy pointer) is known
+    this._migratedSectionDefaults = true;
+    const sections = Array.isArray(this._config && this._config.sections) ? this._config.sections : null;
+    if (!sections) return;
+    const legacySlug = legacyDefaultResolvedSlug();
+    let changed = false;
+    const next = sections.map(s => {
+      if (s && s.type === 'buttons' && !fixtureRefSlug(s.style_preset)) { changed = true; return { ...s, style_preset: `lib:${legacySlug}` }; }
+      return s;
+    });
+    if (changed) this._updateConfig({ sections: next });
   }
 
-  _saveButtonStylePreset(name) {
-    if (!name || !name.trim()) return;
-    let slug = fixtureLibSlug(name);
-    const map = { ...buttonStyleLibraryMap() };
-    if (map[slug] && !window.confirm(`A preset "${slug}" already exists — overwrite it?`)) return;
-    // Save as a single-layer stack (the current card look, no condition).
-    map[slug] = { name: name.trim(), kind: 'button', layers: [{ groups: extractButtonAppearance(this._config) }] };
-    saveButtonStyleLibrary(this._hass, map)
-      .then(() => this._render())
-      .catch(e => { console.error(`${LOG_PREFIX} save button style failed`, e); window.alert(`Could not save the preset: ${formatWsError(e)}`); });
-  }
-  // Apply a saved stack's flattened (always-on) look onto this card's button_* settings.
-  _applyButtonStylePreset(slug) {
-    const e = buttonStyleStack(slug); if (!e) return;
-    if (!window.confirm(`Apply "${e.name || slug}" — overwrite this card's button appearance settings?`)) return;
-    this._updateConfig({ ...extractButtonAppearance({ ...this._config, ...flattenButtonStack(e, () => true) }) });
-    this._render();
-  }
-  // Apply a raw settings object (from imported JSON), keeping only recognized keys.
-  _applyButtonAppearanceSettings(settings) {
-    const clean = extractButtonAppearance(settings || {});
-    if (!Object.keys(clean).length) { window.alert('No recognized Button Appearance settings found in that JSON.'); return; }
-    this._updateConfig(clean);
-    this._render();
-  }
   // Normalize arbitrary imported JSON into a list of layers. Accepts three shapes:
   //   - a full stack export `{ layers:[{groups,when?,hidden?,label?}, …] }` → those layers verbatim
   //     (each layer's groups filtered to recognized keys);
@@ -7966,6 +9351,14 @@ class ColorLightManagerCardEditor extends HTMLElement {
         const layer = { ...l };
         if (!layer.when) layer.when = { type: 'light_on' };
         if (label && i === 0) layer.label = label;
+        // Whole-group model: an imported overlay OWNS whichever groups its JSON touches (completed to
+        // the full group key-set from the import's own values). Groups it doesn't mention fall through
+        // to the base. So a partial import stays scoped; a full look owns everything.
+        const src = layer.groups || {};
+        const owned = layerOwnedGroups(src);
+        const groups = {};
+        owned.forEach(g => BUTTON_STYLE_GROUPS[g].forEach(k => { if (src[k] !== undefined) groups[k] = src[k]; }));
+        layer.groups = groups;
         arr.push(layer);
       });
     });
@@ -7977,6 +9370,24 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const host = this.querySelector('#cpce-btnstyle-preview-host');
     if (host) host.innerHTML = this._renderButtonStylePreview();
   }
+  // Update each layer row's group-list text in place (no full re-render, so Builder control focus is
+  // preserved as edits fold into the draft). Mirrors the label logic in _renderButtonStackLayers.
+  _refreshLayerRowCounts(slug) {
+    const d = this._stackDraftFor(slug); if (!d) return;
+    const panel = this.querySelector(`.cpce-btnstyle-layers-panel[data-slug="${slug}"]`);
+    if (!panel) return;
+    const titles = { layout: 'Layout', background: 'Background', border: 'Line Border', gradient: 'Gradient', glow: 'Glow', shadow: 'Shadow', text: 'Text', icon: 'Icon', sizing: 'Button Shape' };
+    panel.querySelectorAll('.cpce-stack-layer').forEach(row => {
+      const i = parseInt(row.dataset.idx, 10);
+      const l = d.layers[i]; if (!l) return;
+      const owned = [...layerOwnedGroups(l.groups)].map(g => titles[g] || g);
+      const countEl = row.querySelector('.cpce-stack-layer-groups');
+      if (countEl) countEl.textContent = i === 0 ? 'All Settings' : (owned.length ? owned.join(', ') : 'inherits all');
+    });
+    // Reflect the now-dirty state (banner/Save button appear) without stealing focus mid-edit:
+    // only re-render if the dirty banner isn't already shown.
+    if (d.dirty && !this.querySelector('.cpce-unsaved-banner')) this._render();
+  }
 
   // ---- Conditional-layer stack editing (draft model) ----
   // Open the layer editor for a stack, seeding an editable draft (deep copy) from the library.
@@ -7987,24 +9398,138 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this._stackDraft = { slug, kind: e.kind === 'frame' ? 'frame' : 'button', layers: JSON.parse(JSON.stringify(e.layers || [{ groups: {} }])), dirty: false };
     this._render();
   }
-  _closeStackEditor() { this._openButtonStack = null; this._stackDraft = null; this._editingLayer = null; this._render(); }
+  // Load one layer of an open stack into the Style Builder for editing: unlocks its condition and
+  // seeds the EDIT BUFFER (this._layerEditCfg) with the layer's EFFECTIVE look (base beneath +
+  // this layer's delta). The buffer — NOT this._config — is what the Builder controls read/write,
+  // so editing a style never touches the live card. Toggling the same layer closes the Builder.
+  // Shared by the pencil and "New style". Ensures the stack's draft is open first.
+  _editLayer(slug, idx) {
+    if (this._editingLayer && this._editingLayer.slug === slug && this._editingLayer.idx === idx) {
+      this._editingLayer = null; this._layerEditCfg = null; this._layerOwned = null; this._render(); return;
+    }
+    if (this._openButtonStack !== slug) this._openStackEditor(slug);
+    const d = this._stackDraftFor(slug); if (!d) return;
+    // The Builder controls show the layer's EFFECTIVE look (base beneath + this layer's own groups),
+    // so every control has a sensible value. But the layer only OWNS (stores) whole groups it defines.
+    const effective = { ...buttonStackBaseBelow(d.layers, idx), ...(d.layers[idx] && d.layers[idx].groups || {}) };
+    this._editingLayer = { slug, idx };
+    this._layerEditCfg = { ...extractButtonAppearance(this._config), ...extractButtonAppearance(effective) };
+    // Groups this layer owns. Layer 1 (base) always owns ALL groups (it's the full look). Overlays
+    // own only the groups their stored `groups` object carries keys for.
+    this._layerOwned = (idx === 0) ? new Set(BUTTON_STYLE_GROUP_KEYS) : layerOwnedGroups(d.layers[idx] && d.layers[idx].groups);
+    this._render();
+  }
+  // The cfg the Builder controls render FROM while editing a layer: card config overlaid with the
+  // live edit buffer. Falls back to this._config when not editing (defensive).
+  _builderCfg() {
+    return this._layerEditCfg ? { ...this._config, ...this._layerEditCfg } : this._config;
+  }
+  // Write path for every Builder control: merge the patch into the edit buffer, fold the result
+  // into the layer's draft (full look for Layer 1, delta vs base beneath for overlays), mark dirty,
+  // and refresh ONLY the preview + layer count — never this._config, never the live card.
+  _builderPatch(patch) {
+    if (!this._editingLayer || !this._layerEditCfg) return;
+    Object.assign(this._layerEditCfg, patch);
+    // Touching any control auto-includes its whole group (Frame-style ownership) — so editing a
+    // glow control means this layer now owns the Glow group. Then rebuild the layer's stored groups.
+    Object.keys(patch).forEach(k => { const g = BUTTON_KEY_GROUP[k]; if (g && this._layerOwned) this._layerOwned.add(g); });
+    this._commitOwnedGroups();
+  }
+  // Rebuild the edited layer's `groups` = the full key-set of every group it OWNS, read from the
+  // live buffer. Whole-group storage (no per-key deltas): a group is present in full or absent.
+  _commitOwnedGroups() {
+    const el = this._editingLayer; if (!el) return;
+    const d = this._stackDraftFor(el.slug); if (!d || !d.layers[el.idx]) return;
+    const owned = this._layerOwned || new Set();
+    const groups = {};
+    BUTTON_STYLE_GROUP_KEYS.forEach(g => {
+      if (!owned.has(g)) return;
+      BUTTON_STYLE_GROUPS[g].forEach(k => { if (this._layerEditCfg[k] !== undefined) groups[k] = this._layerEditCfg[k]; });
+    });
+    // Only flag dirty when the layer's stored groups actually changed — loading a layer into the
+    // Builder re-commits its current groups verbatim, which must NOT count as an edit.
+    const changed = JSON.stringify(d.layers[el.idx].groups) !== JSON.stringify(groups);
+    d.layers[el.idx].groups = groups;
+    if (changed) d.dirty = true;
+    this._refreshButtonStylePreview();
+    this._refreshLayerRowCounts(el.slug);
+  }
+  // Include/exclude a whole group on the edited layer (the subpanel's include checkbox). Excluding
+  // drops the group (falls through to the base beneath); including captures its current buffer values.
+  _toggleBuilderGroup(group, include) {
+    if (!this._editingLayer || !this._layerOwned) return;
+    if (include) this._layerOwned.add(group); else this._layerOwned.delete(group);
+    this._commitOwnedGroups();
+    this._render();   // reveal/hide the group's controls
+  }
+  // Create a brand-new style as a COPY of a chosen STARTER (built-in or existing style), and open its
+  // Layer 1 in the Builder. The starter's slug/name are recorded as provenance (shown in the Library).
+  // The starter list = built-ins + every stored style; the user picks by number.
+  _newButtonStyle() {
+    const lib = buttonStyleLibraryMap();
+    const choices = [...Object.keys(BUILTIN_BUTTON_STYLES).map(bs => ({ slug: bs, name: BUILTIN_BUTTON_STYLES[bs].name })),
+      ...Object.keys(lib).sort((a, b) => (lib[a].name || a).localeCompare(lib[b].name || b)).map(sl => ({ slug: sl, name: lib[sl].name || sl }))];
+    const menu = choices.map((c, i) => `${i + 1}. ${c.name}`).join('\n');
+    const pick = window.prompt(`Create a new style FROM a starter. Enter the number to copy:\n\n${menu}`, '1');
+    if (pick == null) return;                       // cancelled
+    const idx = parseInt(String(pick).trim(), 10) - 1;
+    const starter = choices[idx];
+    if (!starter) { window.alert('Enter a valid number from the list.'); return; }
+    const name = (window.prompt('Name for the new style:', `${starter.name} (copy)`) || '').trim();
+    if (!name) return;
+    let slug = fixtureLibSlug(name); let n = 2;
+    const map = { ...lib };
+    while (map[slug]) { slug = fixtureLibSlug(`${name} ${n++}`); }
+    const src = buttonStyleStack(starter.slug);     // resolves built-in or stored
+    const layers = JSON.parse(JSON.stringify((src && src.layers) || [{ groups: {} }]));
+    map[slug] = { name, kind: 'button', layers, starter: starter.slug, starter_name: starter.name };
+    saveButtonStyleLibrary(this._hass, map)
+      .then(() => { this._openStackEditor(slug); this._editLayer(slug, 0); })
+      .catch(e => { console.error(`${LOG_PREFIX} new style failed`, e); window.alert(`Could not create style: ${formatWsError(e)}`); });
+  }
+  _closeStackEditor() { this._openButtonStack = null; this._stackDraft = null; this._editingLayer = null; this._layerEditCfg = null; this._layerOwned = null; this._render(); }
   _stackDraftFor(slug) { return (this._stackDraft && this._stackDraft.slug === slug) ? this._stackDraft : null; }
-  // Mutate the draft's layers via `fn(layers)`, mark dirty, re-render.
+  // Mutate the draft's layers via `fn(layers)`, and mark dirty ONLY if the content actually changed
+  // (guards against phantom "unsaved" state from no-op mutations — e.g. a control re-emitting its
+  // current value on open). Re-render regardless so UI reflecting the change still updates.
   _mutateStackDraft(slug, fn) {
     const d = this._stackDraftFor(slug); if (!d) return;
-    fn(d.layers); d.dirty = true; this._render();
+    const before = JSON.stringify(d.layers);
+    fn(d.layers);
+    if (JSON.stringify(d.layers) !== before) d.dirty = true;
+    this._render();
+  }
+  // Guarantee the base layer (idx 0) owns ALL settings groups. "Layer 1 = full look" is decided by
+  // POSITION, not stored on the layer — so when layers are reordered (or a partial overlay ends up
+  // at the bottom), the new base could be missing groups and render "inherits all" with nothing
+  // beneath it. This back-fills any groups the base doesn't define from the flattened look of the
+  // ORIGINAL stack (what the user currently sees), falling back to the Built-In look. Idempotent.
+  _ensureBaseFullLook(layers, prevFlat) {
+    if (!Array.isArray(layers) || !layers.length) return;
+    const base = layers[0];
+    const owned = layerOwnedGroups(base.groups);
+    const missing = BUTTON_STYLE_GROUP_KEYS.filter(g => !owned.has(g));
+    if (!missing.length) return;                       // already a full look
+    // Source of truth for the missing groups: the pre-move flattened look if given, else Built-In.
+    const src = { ...extractButtonAppearance(BUILTIN_BASIC_THEME_GROUPS), ...(prevFlat || {}) };
+    const groups = { ...(base.groups || {}) };
+    missing.forEach(g => { BUTTON_STYLE_GROUPS[g].forEach(k => { if (src[k] !== undefined) groups[k] = src[k]; }); });
+    base.groups = groups;
   }
   // Persist the draft to the shared library after a system-wide confirmation.
   _saveStackDraft(slug) {
     const d = this._stackDraftFor(slug); if (!d || !d.dirty) return;
     const e = buttonStyleLibraryMap()[slug]; if (!e) return;
-    const isDefault = (slug === buttonStyleDefaultSlug());
-    const msg = `Save "${e.name || slug}"?\n\nThis is a shared preset${isDefault ? ' and the system-wide DEFAULT' : ''} — the change applies to EVERY card${isDefault ? '' : ' using this preset'} across your Home Assistant, not just this one.`;
+    const msg = `Save preset "${e.name || slug}"?\n\nReminder: Saved Changes apply to ALL Home Assistant cards using this preset - not just this one.`;
     if (!window.confirm(msg)) return;
     const map = { ...buttonStyleLibraryMap() };
-    map[slug] = { ...e, layers: d.layers.map(l => ({ groups: l.groups || {}, ...(l.when ? { when: l.when } : {}) })) };
+    map[slug] = { ...e, layers: d.layers.map(l => ({ groups: l.groups || {}, ...(l.when ? { when: l.when } : {}), ...(l.hidden ? { hidden: true } : {}), ...(l.label != null && String(l.label).trim() ? { label: String(l.label) } : {}) })) };
     saveButtonStyleLibrary(this._hass, map)
-      .then(() => { d.dirty = false; this._render(); })
+      // On save: close the Style Builder AND the layer editor (per #1 — a clear "editing is done"
+      // signal). The preset returns to a clean, collapsed state. Then nudge HA's own preview pane
+      // to re-render the live card with the just-saved style (the WS store update alone doesn't
+      // reliably repaint the editor's preview) — see _nudgeHaPreview.
+      .then(() => { d.dirty = false; this._editingLayer = null; this._layerEditCfg = null; this._layerOwned = null; this._openButtonStack = null; this._stackDraft = null; this._render(); this._nudgeHaPreview(); })
       .catch(err => { console.error(`${LOG_PREFIX} save stack layers failed`, err); window.alert(`Could not save: ${formatWsError(err)}`); });
   }
   // Build a `when` object from a chosen condition type, preserving compatible fields.
@@ -8096,7 +9621,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
   // ----- main render -----
   _render() {
-    const cfg = this._config;
+    // While editing a style layer, `cfg` reflects the layer's edit buffer overlaid on the card
+    // config (so the Builder controls show the LAYER's values). Non-button keys pass through from
+    // this._config unchanged (the buffer holds only button-appearance keys). Not editing → identity.
+    const cfg = this._builderCfg();
     const labels = this._hass ? getAllLabels(this._hass) : [];
     const groups = this._hass ? getAreas(this._hass) : [];
     this.innerHTML = `
@@ -8257,6 +9785,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-selected-item:first-child { border-top:none; }
         .cpce-sel-remove { flex-shrink:0; background:none; border:none; color:var(--ltek-c-error); cursor:pointer; font-size:16px; font-weight:bold; padding:2px 6px; }
         .cpce-preset-editor { border:1px solid var(--divider-color,#333); border-radius:var(--ltek-r-md); margin-bottom:10px; overflow:hidden; }
+        /* Local vs Library grouping dividers in the Buttons list. */
+        .cpce-preset-group-divider { display:flex; align-items:center; gap:var(--ltek-sp-2); margin:6px 0 8px; color:var(--accent-color,var(--primary-color)); font-size:var(--ltek-fs-small); font-weight:var(--ltek-fw-bold); letter-spacing:0.04em; text-transform:uppercase; }
+        .cpce-preset-group-divider::after { content:''; flex:1; height:1px; background:var(--divider-color,#333); margin-left:var(--ltek-sp-2); }
+        .cpce-preset-group-divider ha-icon { --mdc-icon-size:16px; flex:0 0 auto; }
+        .cpce-preset-group-hint { text-transform:none; letter-spacing:0; font-weight:var(--ltek-fw-medium); color:var(--secondary-text-color); font-size:var(--ltek-fs-tiny); flex:0 0 auto; }
         .cpce-preset-summary { display:flex; align-items:center; gap:var(--ltek-sp-3); padding:10px 12px; cursor:pointer; user-select:none; }
         .cpce-preset-summary .chev { margin-left:auto; transition:transform 0.2s ease; color:var(--secondary-text-color); }
         .cpce-preset-editor.collapsed .cpce-preset-summary .chev { transform:rotate(-90deg); }
@@ -8267,7 +9800,15 @@ class ColorLightManagerCardEditor extends HTMLElement {
         /* Keep the summary action icons grouped tightly (the name flexes to fill the gap). */
         .cpce-preset-summary .cpce-delete-entity-btn { margin-left:0; }
         .cpce-preset-summary .chev { margin-left:0; }
+        /* Tighten the action-icon padding in the button summary row so the info chips get more room. */
+        .cpce-preset-summary .cpce-icon-btn,
+        .cpce-preset-summary .cpce-delete-entity-btn { padding:3px; }
+        .cpce-preset-summary { gap:var(--ltek-sp-2); }
         .cpce-link-indicator { --mdc-icon-size:15px; color:var(--primary-color); flex-shrink:0; }
+        /* Summary chips in the button row: section name, Color Entity / profile (link icon), "N scenes". */
+        .cpce-summary-chip { display:inline-flex; align-items:center; gap:3px; flex:0 0 auto; padding:1px 8px; border-radius:999px; background:var(--ltek-c-accent-fade,rgba(33,150,243,0.15)); color:var(--ltek-c-label,var(--primary-color)); font-size:var(--ltek-fs-tiny,11px); font-weight:var(--ltek-fw-medium,500); white-space:nowrap; max-width:140px; overflow:hidden; text-overflow:ellipsis; }
+        .cpce-summary-chip ha-icon { --mdc-icon-size:12px; flex-shrink:0; }
+        .cpce-summary-chip.cpce-chip-broken { background:rgba(244,67,54,0.15); color:var(--ltek-c-error,#f44336); }
         .cpce-shared-link { --mdc-icon-size:18px; color:var(--primary-color); flex-shrink:0; }
         .cpce-link-indicator.cpce-link-broken { color:var(--ltek-c-error); }
         .cpce-preset-body { padding:0 10px 10px; }
@@ -8399,6 +9940,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-search-picker { display:flex; flex-direction:column; gap:var(--ltek-sp-2); }
         .cpce-search-picker .cpce-sp-input { padding:var(--ltek-ctrl-pad); background:var(--secondary-background-color,#2a2a2a); border:1px solid var(--divider-color,#333); border-radius:var(--ltek-r-ctrl); color:var(--primary-text-color); font-size:var(--ltek-fs-label); }
         .cpce-sp-list { max-height:220px; overflow-y:auto; border:1px solid var(--divider-color,#333); border-radius:var(--ltek-r-ctrl); }
+        .cpce-sp-list.collapsed { display:none; }
         .cpce-sp-item { display:flex; flex-direction:column; padding:7px 10px; cursor:pointer; border-top:1px solid var(--divider-color,#333); }
         .cpce-sp-item:first-child { border-top:none; }
         .cpce-sp-item:hover { background:var(--secondary-background-color,#2a2a2a); }
@@ -8418,13 +9960,28 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-btnstyle-layers-panel { padding:8px 10px 10px; border-top:1px dashed var(--divider-color,#333); background:var(--ltek-c-surface-raised); }
         .cpce-stack-layer { border:1px solid var(--divider-color,#333); border-radius:var(--ltek-r-ctrl); padding:6px 8px; margin-bottom:6px; display:flex; flex-direction:column; gap:var(--ltek-sp-2); }
         .cpce-stack-layer.cpce-layer-off { opacity:0.5; border-style:dashed; }
-        .cpce-stack-layer-hd { display:flex; align-items:center; gap:var(--ltek-sp-2); }
-        .cpce-stack-layer-hd .cpce-layer-cond { flex:1; min-width:120px; }
+        .cpce-stack-layer-hd { display:flex; align-items:center; gap:var(--ltek-sp-1); flex-wrap:nowrap; }
+        .cpce-stack-layer-hd .cpce-layer-cond { flex:1 1 auto; min-width:0; }
+        /* Icon buttons in a layer header shrink so all controls (incl. the trash) fit the row. */
+        .cpce-stack-layer-hd .cpce-icon-btn, .cpce-stack-layer-hd .cpce-delete-entity-btn { flex:0 0 auto; width:26px; height:26px; padding:0; display:inline-flex; align-items:center; justify-content:center; }
+        .cpce-stack-layer-hd .cpce-icon-btn ha-icon, .cpce-stack-layer-hd .cpce-delete-entity-btn ha-icon { --mdc-icon-size:18px; }
         .cpce-stack-layer-badge { font-size:var(--ltek-fs-tiny); font-weight:var(--ltek-fw-bold); letter-spacing:.5px; color:var(--primary-color); border:1px solid var(--primary-color); border-radius:var(--ltek-r-ctrl); padding:1px 5px; }
         .cpce-stack-layer-num { font-size:var(--ltek-fs-small); font-weight:var(--ltek-fw-bold); color:var(--primary-color); white-space:nowrap; flex-shrink:0; }
         .cpce-stack-layer-label { margin-left:6px; padding:1px 6px; border-radius:999px; background:var(--ltek-c-accent-fade); color:var(--ltek-c-label); font-size:var(--ltek-fs-tiny); font-weight:var(--ltek-fw-medium); }
         .cpce-stack-layer-count { font-size:var(--ltek-fs-small); color:var(--secondary-text-color); white-space:nowrap; }
-        .cpce-stack-layer.cpce-layer-editing { border-color:var(--ltek-c-warning); box-shadow:0 0 0 2px var(--ltek-c-warning) inset; }
+        /* Read-only condition summary pill (no icon) shown in the collapsed layer header. */
+        .cpce-stack-cond-pill { flex:0 1 auto; min-width:0; padding:1px 8px; border-radius:999px; background:var(--ltek-c-accent-fade); color:var(--ltek-c-label); font-size:var(--ltek-fs-tiny); font-weight:var(--ltek-fw-medium); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        /* Pushes the icon controls to the right so a long condition pill can't shove them off-screen. */
+        .cpce-stack-layer-spacer { flex:1 1 auto; min-width:4px; }
+        /* Second row: the enabled settings-groups summary, small muted text (wraps freely). */
+        .cpce-stack-layer-groups { font-size:var(--ltek-fs-small); color:var(--secondary-text-color); margin-top:2px; padding-left:2px; line-height:1.4; }
+        /* Per-group include toggle on Style-Builder subpanels (overlay layers) — far LEFT, before the title. */
+        .cpce-group-include { display:inline-flex; align-items:center; margin-right:8px; cursor:pointer; flex:0 0 auto; }
+        .cpce-group-include input { margin:0; }
+        /* Inherited (unchecked) group: no chevron, and the title reads as disabled. */
+        .cpce-subpanel-head.cpce-subpanel-nochevron { cursor:default; }
+        .cpce-subpanel-head.cpce-subpanel-inherited .cpce-subpanel-name { opacity:0.55; }
+        .cpce-stack-layer.cpce-layer-editing { border-color:var(--ltek-c-warning); box-shadow:0 0 0 1px var(--ltek-c-warning) inset; }
         .cpce-stack-layer.cpce-layer-editing .cpce-stack-layer-num { color:var(--ltek-c-warning); }
         .cpce-editing-tag { display:inline-flex; align-items:center; gap:var(--ltek-sp-1); font-size:var(--ltek-fs-small); font-weight:var(--ltek-fw-semibold); color:var(--ltek-c-warning); }
         .cpce-layer-save-row { margin-bottom:var(--ltek-sp-3); padding:var(--ltek-sp-2) 0; }
@@ -8601,14 +10158,16 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-add-row">
             <button class="cpce-ees-add-btn" id="cpce-add-buttons-section"><ha-icon icon="mdi:plus"></ha-icon> Buttons</button>
             <button class="cpce-ees-add-btn" id="cpce-add-values-section"><ha-icon icon="mdi:plus"></ha-icon> Color Values</button>
+            <button class="cpce-ees-add-btn" id="cpce-add-tracker-section"><ha-icon icon="mdi:view-grid-plus-outline"></ha-icon> Scene Tracker</button>
             <button class="cpce-ees-add-btn" id="cpce-add-divider-section"><ha-icon icon="mdi:minus"></ha-icon> Divider</button>
+            <button class="cpce-ees-add-btn" id="cpce-import-section"><ha-icon icon="mdi:import"></ha-icon> Import Section…</button>
           </div>
           <div class="cpce-order-list">
             ${this._orderedSections().map((s, i, arr) => {
-              const typeLabel = { buttons: 'Buttons', sliders: 'Sliders', values: 'Color Values', divider: 'Divider' }[s.type] || s.type;
+              const typeLabel = { buttons: 'Buttons', sliders: 'Sliders', values: 'Color Values', divider: 'Divider', scene_tracker: 'Scene Tracker' }[s.type] || s.type;
               const open = this._openSectionStyle === s.id;
               const isDivider = s.type === 'divider';
-              const typeIcon = { buttons:'mdi:gesture-tap-button', sliders:'mdi:tune-variant', values:'mdi:palette', divider:'mdi:minus' }[s.type] || 'mdi:shape-outline';
+              const typeIcon = { buttons:'mdi:gesture-tap-button', sliders:'mdi:tune-variant', values:'mdi:palette', divider:'mdi:minus', scene_tracker:'mdi:view-grid-outline' }[s.type] || 'mdi:shape-outline';
               return `<div class="cpce-order-entry${open?' cpce-order-open':''}">
                 <div class="cpce-order-item${s.hidden?' cpce-order-hidden':''}" data-section-id="${s.id}">
                 ${isDivider
@@ -8617,6 +10176,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
                 <button class="cpce-icon-btn cpce-order-up" data-key="${s.id}" ${i === 0 ? 'disabled' : ''} title="Move up"><ha-icon icon="mdi:arrow-up-bold"></ha-icon></button>
                 <button class="cpce-icon-btn cpce-order-down" data-key="${s.id}" ${i === arr.length - 1 ? 'disabled' : ''} title="Move down"><ha-icon icon="mdi:arrow-down-bold"></ha-icon></button>
                 <button class="cpce-icon-btn cpce-order-duplicate" data-key="${s.id}" title="Duplicate this section"><ha-icon icon="mdi:content-duplicate"></ha-icon></button>
+                <button class="cpce-icon-btn cpce-order-export" data-key="${s.id}" title="Export this section (+ its buttons) as JSON"><ha-icon icon="mdi:download"></ha-icon></button>
                 <button class="cpce-icon-btn cpce-order-hide" data-key="${s.id}" title="${s.hidden?'Show on card':'Hide from card'}"><ha-icon icon="${s.hidden?'mdi:eye-off':'mdi:eye'}"></ha-icon></button>
                 <button class="cpce-delete-entity-btn cpce-order-remove" data-key="${s.id}" title="Remove"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>
               </div>
@@ -8629,23 +10189,31 @@ class ColorLightManagerCardEditor extends HTMLElement {
                 ${s.collapsible ? `<div class="cpce-check"><input type="checkbox" class="cpce-sn-collapsed-default" data-id="${s.id}" ${s.collapsed_default?'checked':''}><label>Start collapsed</label></div>` : ''}` : ''}
                 ${s.type === 'buttons' ? (() => {
                   const lib = buttonStyleLibraryMap();
-                  const bslugs = Object.keys(lib).sort((a, b) => (lib[a].name || a).localeCompare(lib[b].name || b));
-                  const cur = fixtureRefSlug(s.style_preset);
-                  const defName = (buttonStyleDefaultStack() || {}).name || 'Built-In';
+                  // Every section names a concrete style. An unset ref resolves to Basic Theme, so a
+                  // blank selection preselects Basic Theme (the neutral built-in) — no hidden default.
+                  const cur = fixtureRefSlug(s.style_preset) || BTN_STYLE_BASIC_SLUG;
+                  const entries = [...Object.keys(BUILTIN_BUTTON_STYLES).map(bs => ({ slug: bs, name: BUILTIN_BUTTON_STYLES[bs].name })),
+                    ...Object.keys(lib).map(sl => ({ slug: sl, name: lib[sl].name || sl }))];
+                  entries.sort((a, b) => a.name.localeCompare(b.name));
+                  const opts = entries.map(e => {
+                    const value = `lib:${escapeHtml(e.slug)}`;
+                    return `<option value="${value}" ${cur === e.slug ? 'selected' : ''}>${escapeHtml(e.name)}</option>`;
+                  }).join('');
+                  const missing = cur && !isBuiltinButtonSlug(cur) && !lib[cur]
+                    ? `<option value="lib:${escapeHtml(cur)}" selected>${escapeHtml(cur)} (missing)</option>` : '';
                   return `<div class="cpce-sub-title">Button Style</div>
                     <div class="cpce-row"><label class="lbl">Style Preset</label>
                       <select class="cpce-sn-style-preset" data-id="${s.id}">
-                        <option value="" ${!cur?'selected':''}>Use System-Wide Default (${escapeHtml(defName)})</option>
-                        <option value="lib:${BTN_STYLE_BUILTIN_SLUG}" ${cur===BTN_STYLE_BUILTIN_SLUG?'selected':''}>Built-In</option>
-                        ${bslugs.map(sl => `<option value="lib:${escapeHtml(sl)}" ${cur===sl?'selected':''}>${escapeHtml(lib[sl].name || sl)}</option>`).join('')}
-                        ${cur && cur!==BTN_STYLE_BUILTIN_SLUG && !lib[cur] ? `<option value="lib:${escapeHtml(cur)}" selected>${escapeHtml(cur)} (missing)</option>` : ''}
+                        ${opts}${missing}
                       </select>
                     </div>
-                    <div class="cpce-hint">Leave on <strong>Use System-Wide Default</strong> to follow the ★ preset, or pick a specific preset to style just this section.</div>` ;
+                    <div class="cpce-hint">Pick the style for this section. Edit styles in the <strong>Button Styles</strong> library — changes there update every section using that style.</div>
+                    ${this._renderSectionDefaultScene(s)}` ;
                 })() : ''}
                 ${s.type === 'values' ? `<div class="cpce-sub-title">Monitored Lights</div>
                   <div class="cpce-hint">Which light(s) this section reads color values from.</div>
                   ${this._renderTargetPicker(s, `data-vs-target="${s.id}"`)}` : ''}
+                ${s.type === 'scene_tracker' ? this._renderSceneTrackerConfig(s) : ''}
                 ${this._renderSectionFramePicker(s)}
                 ${this._renderSectionHeaderApply(s)}`}
               </div>` : ''}
@@ -8656,7 +10224,22 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
         ${this._section('mdi:lightbulb-multiple-outline', 'Buttons', 'presets', `
           <div class="cpce-hint">Configure the quick-select buttons. Use the color wheel for precise color selection.</div>
-          <div id="cpce-preset-list">${(cfg.presets||[]).map((p, i) => this._renderPresetEditor(p, i)).join('')}</div>
+          <div id="cpce-preset-list">${(() => {
+            // Group buttons by where their look is STORED: Local (inline look on the button) vs Library
+            // (follows a shared Fixture Profile via profile_ref). Original indices are preserved so
+            // each editor still edits the right preset. Each group's header shows whenever that group
+            // is non-empty (so the labels act as organizers even in an all-local setup).
+            const all = (cfg.presets || []).map((p, i) => ({ p, i }));
+            const library = all.filter(x => fixtureRefSlug(x.p.profile_ref));
+            const local = all.filter(x => !fixtureRefSlug(x.p.profile_ref));
+            const div = (icon, label, hint) => `<div class="cpce-preset-group-divider"><ha-icon icon="${icon}"></ha-icon><span>${label}</span><span class="cpce-preset-group-hint">${hint}</span></div>`;
+            let html = '';
+            if (local.length) html += div('mdi:cellphone', 'Local', 'this card only');
+            html += local.map(x => this._renderPresetEditor(x.p, x.i)).join('');
+            if (library.length) html += div('mdi:bookshelf', 'Library', 'shared Fixture Profiles');
+            html += library.map(x => this._renderPresetEditor(x.p, x.i)).join('');
+            return html;
+          })()}</div>
           <button class="cpce-add-btn" id="cpce-add-preset"><ha-icon icon="mdi:plus"></ha-icon> Add Button</button>
         `)}
 
@@ -8881,18 +10464,18 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-group-divider"><ha-icon icon="mdi:bookshelf"></ha-icon>Style Library</div>
           ${this._renderButtonStylePresets()}
 
-          <div class="cpce-group-divider"><ha-icon icon="mdi:gesture-tap-button"></ha-icon>Style Builder</div>
-          <div class="cpce-hint">These settings define <strong>one</strong> button look (previewed below). When you're editing a preset layer, save it back with the button below; otherwise use <strong>Save as new</strong> to store the look as a new preset.</div>
+          ${this._editingLayer ? `
+          <div class="cpce-group-divider"><ha-icon icon="mdi:gesture-tap-button"></ha-icon>Style Builder — Editing Layer ${this._editingLayer.idx + 1}</div>
+          <div class="cpce-hint">Edit on Layer at a time. Layer 1 always sets All Settings. Other layers you use check boxes to enable/dsiable settings groups. Only enabled settings will be saved in the Style itself.</div>
           <div id="cpce-btnstyle-preview-host">${this._renderButtonStylePreview()}</div>
-          ${this._renderLayerSaveRow()}
-          <div class="cpce-row" style="gap:8px;">
-            <input type="text" id="cpce-btnstyle-new-name" placeholder="New preset name (e.g. Neon Tiles)">
-            <button class="cpce-create-preset-btn" id="cpce-btnstyle-save" title="Save the current Builder settings as a new library preset"><ha-icon icon="mdi:content-save-plus"></ha-icon> Save as new</button>
-            <button class="cpce-mini-btn" id="cpce-btnstyle-export-current" title="Export the current Builder settings as JSON"><ha-icon icon="mdi:download"></ha-icon> ${this._editingLayer ? `Export Current Layer` : 'Export current look'}</button>
-            <button class="cpce-mini-btn" id="cpce-btnstyle-import-card" title="Paste Button Appearance JSON to apply directly to THIS card only (does not touch the shared library)"><ha-icon icon="mdi:import"></ha-icon> Apply JSON to this card…</button>
+          <div class="cpce-row" style="gap:8px;margin:6px 0;">
+            ${this._stackDraftFor(this._editingLayer.slug) && this._stackDraftFor(this._editingLayer.slug).dirty ? `
+            <button class="cpce-create-preset-btn cpce-layer-save cpce-unsaved" data-slug="${escapeHtml(this._editingLayer.slug)}" style="flex:1;justify-content:center;" title="Save changes to the shared library (applies system-wide to every card using this preset)"><ha-icon icon="mdi:content-save"></ha-icon> Save Changes</button>
+            <button class="cpce-mini-btn cpce-layer-discard" data-slug="${escapeHtml(this._editingLayer.slug)}" title="Undo unsaved edits — reloads the layers as currently saved"><ha-icon icon="mdi:undo"></ha-icon> Discard changes</button>` : ''}
+            <button class="cpce-mini-btn" id="cpce-btnstyle-export-current" title="Export this layer's settings as JSON"><ha-icon icon="mdi:download"></ha-icon> Export Layer</button>
           </div>
 
-          ${this._subpanel('btn-layout', 'Button Layout', `
+          ${this._btnGroupSubpanel('btn-layout', 'layout', 'Button Layout', `
           <div class="cpce-row"><label class="lbl">Layout Type</label>
             <select id="cpce-layout">
               <option value="stack" ${cfg.layout==='stack'?'selected':''}>Stack (vertical)</option>
@@ -8902,48 +10485,60 @@ class ColorLightManagerCardEditor extends HTMLElement {
           </div>
           <div class="cpce-row"><label class="lbl">Grid Columns</label><input type="range" id="cpce-columns" min="1" max="6" value="${Number(cfg.columns)||3}"><span class="cpce-strength-val" id="cpce-columns-val">${Number(cfg.columns)||3}</span></div>
           <div class="cpce-row"><label class="lbl">Gap (px)</label><input type="range" id="cpce-gap" min="0" max="48" value="${Number(cfg.gap)||8}"><span class="cpce-strength-val" id="cpce-gap-val">${Number(cfg.gap)||8}px</span></div>
-          <div class="cpce-check"><input type="checkbox" id="cpce-wrap" ${cfg.wrap?'checked':''}><label for="cpce-wrap">Allow buttons to wrap</label></div>
-          <div class="cpce-row"><label class="lbl">Icon–Label Spacing</label><input type="range" id="cpce-button-icon-gap" min="0" max="24" value="${Number(cfg.button_icon_gap)??8}"><span class="cpce-strength-val" id="cpce-button-icon-gap-val">${Number(cfg.button_icon_gap)??8}px</span></div>`)}
+          <div class="cpce-check"><input type="checkbox" id="cpce-wrap" ${cfg.wrap?'checked':''}><label for="cpce-wrap">Allow buttons to wrap</label></div>`)}
 
-          ${this._subpanel('btn-style', 'Style', `
-          <div class="cpce-row"><label class="lbl">Button Color Style</label>
+          ${this._btnGroupSubpanel('btn-style', 'background', 'Background', `
+          <div class="cpce-row"><label class="lbl">Background Type</label>
             <select id="cpce-button-style">
-              <option value="solid" ${cfg.button_style!=='tinted'?'selected':''}>Solid</option>
-              <option value="tinted" ${cfg.button_style==='tinted'?'selected':''}>Tinted</option>
+              <option value="solid" ${(cfg.button_style==='solid'||cfg.button_style==='tile'||!['tinted','theme','transparent'].includes(cfg.button_style))?'selected':''}>Solid (button color)</option>
+              <option value="tinted" ${cfg.button_style==='tinted'?'selected':''}>Tinted (color gradient)</option>
+              <option value="theme" ${cfg.button_style==='theme'?'selected':''}>Theme surface</option>
+              <option value="transparent" ${cfg.button_style==='transparent'?'selected':''}>Transparent</option>
             </select>
           </div>`)}
 
-          ${this._subpanel('btn-border', 'Border', `
+          ${this._btnGroupSubpanel('btn-border', 'border', 'Line Border', `
           <div class="cpce-check"><input type="checkbox" id="cpce-button-border-enabled" ${cfg.button_border_enabled?'checked':''}><label for="cpce-button-border-enabled">Enable button border</label></div>
           ${cfg.button_border_enabled ? `
             <div class="cpce-row"><label class="lbl">Border Color</label>
               <select id="cpce-button-border-color-mode">
-                <option value="fixed" ${cfg.button_border_color_mode!=='match'?'selected':''}>Fixed color</option>
                 <option value="match" ${cfg.button_border_color_mode==='match'?'selected':''}>Match button color (lighter shade)</option>
+                <option value="fixed" ${(cfg.button_border_color_mode||'fixed')==='fixed'?'selected':''}>Specific color</option>
+                <option value="none" ${cfg.button_border_color_mode==='none'?'selected':''}>None (disable)</option>
               </select>
             </div>
-            ${cfg.button_border_color_mode !== 'match' ? `<div class="cpce-row"><label class="lbl">Fixed Border Color</label><input type="color" id="cpce-button-border-color" value="${cfg.button_border_color || '#2196F3'}"></div>` : ''}
+            ${(cfg.button_border_color_mode||'fixed')==='fixed' ? `<div class="cpce-row"><label class="lbl">Border Color</label><input type="color" id="cpce-button-border-color" value="${cfg.button_border_color || '#2196F3'}"></div>` : ''}
             <div class="cpce-row"><label class="lbl">Border Weight</label><input type="range" id="cpce-button-border-width" min="1" max="10" value="${Number(cfg.button_border_width)||1}"><span class="cpce-strength-val" id="cpce-button-border-width-val">${Number(cfg.button_border_width)||1}px</span></div>
             <div class="cpce-row"><label class="lbl">Sides</label><span class="cpce-side-toggles">
               ${(() => { const on = buttonBorderSides(cfg); return [['top','Top'],['bottom','Bottom'],['left','Left'],['right','Right']].map(([s,l])=>`<label><input type="checkbox" class="cpce-button-border-side" data-side="${s}" ${on.includes(s)?'checked':''}> ${l}</label>`).join(''); })()}
             </span></div>
-          ` : ''}
-          <div class="cpce-row"><label class="lbl">Corner Radius</label><input type="range" id="cpce-button-border-radius" min="0" max="40" value="${Number(cfg.button_border_radius)||10}"><span class="cpce-strength-val" id="cpce-button-border-radius-val">${Number(cfg.button_border_radius)||10}px</span></div>
-          <div class="cpce-sub-title">Gradient Border</div>
-          <div class="cpce-hint">Applies to every button (universal). Layered gradient lines, independent of the solid border and glow.</div>
+          ` : ''}`)}
+
+          ${this._btnGroupSubpanel('btn-gradient', 'gradient', 'Gradient Border', `
+          <div class="cpce-hint">Layered gradient lines, independent of the solid Line Border and glow.</div>
+          <div class="cpce-row"><label class="lbl">Gradient Color</label>
+            <select id="cpce-button-gradient-color-mode">
+              <option value="match" ${(cfg.button_border_gradient_color_mode||'match')==='match'?'selected':''}>Match button color</option>
+              <option value="fixed" ${cfg.button_border_gradient_color_mode==='fixed'?'selected':''}>Specific color (uses stops below)</option>
+              <option value="none" ${cfg.button_border_gradient_color_mode==='none'?'selected':''}>None (disable)</option>
+            </select>
+          </div>
           ${this._renderGradientBorderEditor(cfg.button_border_gradient, 'btngb', cfg.button_border_color || '#2196F3')}`)}
 
-          ${this._subpanel('btn-glow', 'Glow', `
+          ${this._btnGroupSubpanel('btn-glow', 'glow', 'Glow', `
           <div class="cpce-check"><input type="checkbox" id="cpce-button-glow-enabled" ${cfg.button_glow_enabled?'checked':''}><label for="cpce-button-glow-enabled">Enable button glow</label></div>
           ${cfg.button_glow_enabled ? `
             <div class="cpce-row"><label class="lbl">Glow Color</label>
               <select id="cpce-button-glow-color-mode">
-                <option value="fixed" ${cfg.button_glow_color_mode!=='match'?'selected':''}>Fixed color</option>
-                <option value="match" ${cfg.button_glow_color_mode==='match'?'selected':''}>Match current light color</option>
+                <option value="match" ${cfg.button_glow_color_mode==='match'?'selected':''}>Match button/light color</option>
+                <option value="fixed" ${(cfg.button_glow_color_mode||'fixed')==='fixed'?'selected':''}>Specific color</option>
+                <option value="none" ${cfg.button_glow_color_mode==='none'?'selected':''}>None (disable)</option>
               </select>
             </div>
-            ${cfg.button_glow_color_mode !== 'match' ? `<div class="cpce-row"><label class="lbl">Fixed Glow Color</label><input type="color" id="cpce-button-glow-color" value="${cfg.button_glow_color || '#2196F3'}"></div>` : ''}
-            <div class="cpce-row"><label class="lbl">Glow Intensity</label><input type="range" id="cpce-button-glow-intensity" min="0.2" max="3" step="0.1" value="${Number(cfg.button_glow_intensity)||1.0}"><span class="cpce-strength-val" id="cpce-button-glow-intensity-val">${(Number(cfg.button_glow_intensity)||1.0).toFixed(1)}x</span></div>
+            ${(cfg.button_glow_color_mode||'fixed')==='fixed' ? `<div class="cpce-row"><label class="lbl">Glow Color</label><input type="color" id="cpce-button-glow-color" value="${cfg.button_glow_color || '#2196F3'}"></div>` : ''}
+            <div class="cpce-row"><label class="lbl">Glow Blur</label><input type="range" id="cpce-button-glow-blur" min="0" max="40" value="${Number.isFinite(Number(cfg.button_glow_blur))?Number(cfg.button_glow_blur):12}"><span class="cpce-strength-val" id="cpce-button-glow-blur-val">${Number.isFinite(Number(cfg.button_glow_blur))?Number(cfg.button_glow_blur):12}px</span></div>
+            <div class="cpce-row"><label class="lbl">Glow Spread</label><input type="range" id="cpce-button-glow-spread" min="-10" max="20" value="${Number.isFinite(Number(cfg.button_glow_spread))?Number(cfg.button_glow_spread):2}"><span class="cpce-strength-val" id="cpce-button-glow-spread-val">${Number.isFinite(Number(cfg.button_glow_spread))?Number(cfg.button_glow_spread):2}px</span></div>
+            <div class="cpce-row"><label class="lbl">Glow Opacity</label><input type="range" id="cpce-button-glow-opacity" min="0" max="100" value="${Math.round((Number.isFinite(Number(cfg.button_glow_opacity))?Number(cfg.button_glow_opacity):0.5)*100)}"><span class="cpce-strength-val" id="cpce-button-glow-opacity-val">${Math.round((Number.isFinite(Number(cfg.button_glow_opacity))?Number(cfg.button_glow_opacity):0.5)*100)}%</span></div>
             <div class="cpce-row"><label class="lbl">Glow When</label>
               <select id="cpce-button-glow-condition">
                 <option value="always" ${cfg.button_glow_condition==='always'?'selected':''}>Always on</option>
@@ -8952,7 +10547,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
             </div>
           ` : ''}`)}
 
-          ${this._subpanel('btn-shadow', 'Drop Shadow', `
+          ${this._btnGroupSubpanel('btn-shadow', 'shadow', 'Drop Shadow', `
           <div class="cpce-hint">A plain elevation shadow on each button, separate from the colored glow above.</div>
           <div class="cpce-row"><label class="lbl">Shadow Color</label><input type="color" id="cpce-button-shadow-color" value="${cfg.button_shadow_color || '#000000'}"><label class="cpce-inline-check"><input type="checkbox" id="cpce-button-shadow-enabled" ${cfg.button_shadow_enabled?'checked':''}> Enable</label></div>
           ${cfg.button_shadow_enabled ? `
@@ -8963,20 +10558,49 @@ class ColorLightManagerCardEditor extends HTMLElement {
             <div class="cpce-row"><label class="lbl">Opacity</label><input type="range" id="cpce-button-shadow-opacity" min="0" max="100" value="${Math.round((Number(cfg.button_shadow_opacity)??0.35)*100)}"><span class="cpce-strength-val" id="cpce-button-shadow-opacity-val">${Math.round((Number(cfg.button_shadow_opacity)??0.35)*100)}%</span></div>
           ` : ''}`)}
 
-          ${this._subpanel('btn-sizing', 'Sizing', `
-          <div class="cpce-row"><label class="lbl">Button Text Size</label><input type="range" id="cpce-button-font-size" min="8" max="32" value="${Number(cfg.button_font_size)||14}"><span class="cpce-strength-val" id="cpce-button-font-size-val">${Number(cfg.button_font_size)||14}px</span></div>
+          ${this._btnGroupSubpanel('btn-text', 'text', 'Text', `
+          <div class="cpce-row"><label class="lbl">Name Text Size</label><input type="range" id="cpce-button-font-size" min="8" max="32" value="${Number(cfg.button_font_size)||14}"><span class="cpce-strength-val" id="cpce-button-font-size-val">${Number(cfg.button_font_size)||14}px</span></div>
           <div class="cpce-row"><label class="lbl">Name Text Weight</label>
             <select id="cpce-button-name-weight">
               ${['300','400','500','600','700'].map(w => `<option value="${w}" ${(cfg.button_name_weight||'600')===w?'selected':''}>${w}</option>`).join('')}
             </select>
           </div>
-          <div class="cpce-row"><label class="lbl">Button Height</label><input type="range" id="cpce-button-height" min="24" max="100" value="${Number(cfg.button_height)||44}"><span class="cpce-strength-val" id="cpce-button-height-val">${Number(cfg.button_height)||44}px</span></div>
+          <div class="cpce-row"><label class="lbl">Name Text Color</label>
+            <select id="cpce-button-name-color-mode">
+              <option value="inherit" ${(cfg.button_name_color_mode||'inherit')==='inherit'?'selected':''}>Inherit (theme/default)</option>
+              <option value="match" ${cfg.button_name_color_mode==='match'?'selected':''}>Match button color</option>
+              <option value="fixed" ${cfg.button_name_color_mode==='fixed'?'selected':''}>Specific color</option>
+            </select>
+          </div>
+          ${cfg.button_name_color_mode==='fixed' ? `<div class="cpce-row"><label class="lbl">Name Color</label><input type="color" id="cpce-button-name-color" value="${cfg.button_name_color || '#2196F3'}"></div>` : ''}
           <div class="cpce-check"><input type="checkbox" id="cpce-button-name-wrap" ${cfg.button_name_wrap?'checked':''}><label for="cpce-button-name-wrap">Word-wrap button names (multi-word names break to lines instead of widening)</label></div>
+          <div class="cpce-row"><label class="lbl">Icon–Label Spacing</label><input type="range" id="cpce-button-icon-gap" min="0" max="24" value="${Number(cfg.button_icon_gap)??8}"><span class="cpce-strength-val" id="cpce-button-icon-gap-val">${Number(cfg.button_icon_gap)??8}px</span></div>`)}
+
+          ${this._btnGroupSubpanel('btn-icon', 'icon', 'Icon', `
+          <div class="cpce-row"><label class="lbl">Custom Icon</label><input type="text" id="cpce-button-icon" placeholder="(use each button's icon)" value="${escapeHtml(cfg.button_icon || '')}"></div>
+          <div class="cpce-hint">Leave blank to use each button's own icon; set an <code>mdi:*</code> to force the same icon on every button.</div>
+          <div class="cpce-row"><label class="lbl">Icon Size</label><input type="range" id="cpce-button-icon-size" min="0" max="48" value="${Number(cfg.button_icon_size)||0}"><span class="cpce-strength-val" id="cpce-button-icon-size-val">${Number(cfg.button_icon_size) ? `${Number(cfg.button_icon_size)}px` : 'Auto'}</span></div>
+          <div class="cpce-row"><label class="lbl">Icon Color</label>
+            <select id="cpce-button-icon-color-mode">
+              <option value="" ${!cfg.button_icon_color_mode?'selected':''}>Default (per background)</option>
+              <option value="match" ${cfg.button_icon_color_mode==='match'?'selected':''}>Match button color</option>
+              <option value="fixed" ${cfg.button_icon_color_mode==='fixed'?'selected':''}>Specific color</option>
+              <option value="none" ${cfg.button_icon_color_mode==='none'?'selected':''}>None (leave default)</option>
+            </select>
+          </div>
+          ${cfg.button_icon_color_mode==='fixed' ? `<div class="cpce-row"><label class="lbl">Icon Color</label><input type="color" id="cpce-button-icon-color" value="${cfg.button_icon_color || '#2196F3'}"></div>` : ''}`)}
+
+          ${this._btnGroupSubpanel('btn-sizing', 'sizing', 'Button Shape', `
+          <div class="cpce-row"><label class="lbl">Corner Radius</label><input type="range" id="cpce-button-border-radius" min="0" max="40" value="${Number(cfg.button_border_radius)||10}"><span class="cpce-strength-val" id="cpce-button-border-radius-val">${Number(cfg.button_border_radius)||10}px</span></div>
+          <div class="cpce-row"><label class="lbl">Button Height</label><input type="range" id="cpce-button-height" min="24" max="100" value="${Number(cfg.button_height)||44}"><span class="cpce-strength-val" id="cpce-button-height-val">${Number(cfg.button_height)||44}px</span></div>
           <div class="cpce-row"><label class="lbl">Max Button Width</label><input type="range" id="cpce-button-max-width" min="0" max="300" step="5" value="${Number(cfg.button_max_width)||0}"><span class="cpce-strength-val" id="cpce-button-max-width-val">${Number(cfg.button_max_width) ? `${Number(cfg.button_max_width)}px` : 'Auto'}</span></div>
-          <div class="cpce-hint">Set Max Width (and enable word-wrap) for uniform button sizes; 0 = Auto. Heights are aligned so wrapped buttons match single-line ones.</div>`)}
+          <div class="cpce-hint">Set Max Width (and enable word-wrap in Text) for uniform button sizes; 0 = Auto. Heights are aligned so wrapped buttons match single-line ones.</div>`)}
+          ` : ''}
         `)}
 
         ${this._section('mdi:movie-open-cog-outline', 'Scenes', 'scene-builder', this._renderSceneBuilderSection())}
+
+        ${this._section('mdi:form-dropdown', 'Scene Groups', 'scene-groups', this._renderSceneGroupsSection())}
 
       </div>
     `;
@@ -9052,11 +10676,20 @@ class ColorLightManagerCardEditor extends HTMLElement {
     });
     // Collapsible subpanels (Card/Button Appearance groups) — toggle open state by key.
     this.querySelectorAll('.cpce-subpanel-head').forEach(head => {
-      head.onclick = () => {
+      head.onclick = (ev) => {
+        // Clicks on the group-include checkbox/label are handled separately — don't also toggle collapse.
+        if (ev.target && ev.target.closest && ev.target.closest('.cpce-group-include')) return;
+        // Inherited (unchecked) groups have no body to reveal — the header isn't a collapse toggle.
+        if (head.classList.contains('cpce-subpanel-nochevron')) return;
         const key = head.dataset.subpanel;
         if (this._openSubpanels.has(key)) this._openSubpanels.delete(key); else this._openSubpanels.add(key);
         this._render();
       };
+    });
+    // Per-group "Override" include toggles on overlay-layer Style-Builder subpanels.
+    this.querySelectorAll('.cpce-btn-group-toggle').forEach(cb => {
+      cb.addEventListener('change', (ev) => { ev.stopPropagation(); this._toggleBuilderGroup(cb.dataset.group, cb.checked); });
+      cb.addEventListener('click', (ev) => ev.stopPropagation());
     });
 
     // Entity picker
@@ -9088,6 +10721,18 @@ class ColorLightManagerCardEditor extends HTMLElement {
       const evt = el.type === 'checkbox' ? 'change' : (el.tagName === 'SELECT' ? 'change' : 'input');
       el.addEventListener(evt, () => { let value = el.type === 'checkbox' ? el.checked : el.value; if (transform) value = transform(value); this._updateConfig({ [key]: value }); });
     };
+    // Button-appearance controls write to the LAYER edit buffer (not this._config), so editing a
+    // style never mutates the live card. Same signature as bind(); routes through _builderPatch.
+    const bindBtn = (id, key, transform) => {
+      const el = this.querySelector(id); if (!el) return;
+      const evt = el.type === 'checkbox' ? 'change' : (el.tagName === 'SELECT' ? 'change' : 'input');
+      el.addEventListener(evt, () => { let value = el.type === 'checkbox' ? el.checked : el.value; if (transform) value = transform(value); this._builderPatch({ [key]: value }); });
+    };
+    // A button-appearance mode <select> whose change also re-renders (to reveal/hide a color picker).
+    const bindBtnMode = (id, key) => {
+      const el = this.querySelector(id); if (!el) return;
+      el.addEventListener('change', () => { this._builderPatch({ [key]: el.value }); this._render(); });
+    };
     bind('#cpce-title', 'title');
     // Show/hide title + icon (re-render to reveal/hide dependent styling controls).
     const showTitleEl = this.querySelector('#cpce-show-title');
@@ -9112,11 +10757,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const iconOffModeEl = this.querySelector('#cpce-icon-off-mode');
     if (iconOffModeEl) iconOffModeEl.addEventListener('change', () => { this._updateConfig({ icon_off_color_mode: iconOffModeEl.value }); this._render(); });
     bind('#cpce-icon-off-color', 'icon_off_color');
-    bind('#cpce-layout', 'layout');
-    bind('#cpce-columns', 'columns', v => clamp(parseInt(v,10)||3,1,6));
-    bind('#cpce-gap', 'gap', v => clamp(parseInt(v,10)||0,0,48));
-    bind('#cpce-button-icon-gap', 'button_icon_gap', v => clamp(parseInt(v,10)||0,0,24));
-    bind('#cpce-wrap', 'wrap');
+    bindBtn('#cpce-layout', 'layout');
+    bindBtn('#cpce-columns', 'columns', v => clamp(parseInt(v,10)||3,1,6));
+    bindBtn('#cpce-gap', 'gap', v => clamp(parseInt(v,10)||0,0,48));
+    bindBtn('#cpce-button-icon-gap', 'button_icon_gap', v => clamp(parseInt(v,10)||0,0,24));
+    bindBtn('#cpce-wrap', 'wrap');
     // Section ordering: move a section up/down in the order (by id) and re-render.
     const moveSection = (id, dir) => {
       // Reorder the actual sections array (in the SAME order the list shows — _orderedSections),
@@ -9160,6 +10805,41 @@ class ColorLightManagerCardEditor extends HTMLElement {
       // Per-section Button Style preset: '' = Card Default (clear ref), else lib:<slug>.
       const stylePresetSel = panel.querySelector('.cpce-sn-style-preset');
       if (stylePresetSel) stylePresetSel.addEventListener('change', () => { patchSection(id, { style_preset: stylePresetSel.value || undefined }); this._render(); });
+      // Section default scene reset: group + option.
+      const defGroupSel = panel.querySelector('.cpce-sn-default-group');
+      if (defGroupSel) defGroupSel.addEventListener('change', () => {
+        const g = defGroupSel.value || undefined;
+        // Default the option to '-none-' if that group has it, else its first option.
+        let opt;
+        if (g) {
+          const grp = this._allInputSelectEntities().find(x => x.entity === g);
+          const o = (grp && grp.options) || [];
+          opt = o.includes('-none-') ? '-none-' : (o[0] || '-none-');
+        }
+        patchSection(id, { default_scene_group: g, default_scene_option: g ? opt : undefined });
+        this._render();
+      });
+      const defOptSel = panel.querySelector('.cpce-sn-default-option');
+      if (defOptSel) defOptSel.addEventListener('change', () => { patchSection(id, { default_scene_option: defOptSel.value || undefined }); this._render(); });
+
+      // Scene Tracker Areas: add / edit / remove. Each Area = { name, entity, light? }. Blank-entity
+      // rows are kept while editing (render tolerates them); the card render ignores Areas with no entity.
+      const areasMutate = (fn) => {
+        const cur = this._orderedSectionsRaw().find(x => x.id === id) || {};
+        const arr = Array.isArray(cur.areas) ? cur.areas.map(a => ({ ...a })) : [];
+        fn(arr);
+        patchSection(id, { areas: arr });
+        this._render();
+      };
+      // Scene Tracker: bind (or clear) a Button Style for the tiles.
+      const trackerStyle = panel.querySelector('.cpce-tracker-style');
+      if (trackerStyle) trackerStyle.addEventListener('change', () => { patchSection(id, { style_preset: trackerStyle.value || undefined }); this._render(); });
+      const areaAdd = panel.querySelector('.cpce-area-add');
+      if (areaAdd) areaAdd.onclick = () => areasMutate(arr => arr.push({ name: '', entity: '' }));
+      panel.querySelectorAll('.cpce-area-name').forEach(el => el.addEventListener('change', () => { const i = Number(el.dataset.area); areasMutate(arr => { if (arr[i]) arr[i].name = el.value; }); }));
+      panel.querySelectorAll('.cpce-area-entity').forEach(el => el.addEventListener('change', () => { const i = Number(el.dataset.area); areasMutate(arr => { if (arr[i]) arr[i].entity = el.value; }); }));
+      panel.querySelectorAll('.cpce-area-light').forEach(el => el.addEventListener('change', () => { const i = Number(el.dataset.area); areasMutate(arr => { if (arr[i]) { if (el.value) arr[i].light = el.value; else delete arr[i].light; } }); }));
+      panel.querySelectorAll('.cpce-area-remove').forEach(btn => btn.onclick = () => { const i = Number(btn.dataset.area); areasMutate(arr => arr.splice(i, 1)); });
       // Per-section Frame Style stack (layered, like the Card Frame) — supports
       // a base style plus conditional overlays. Mutates section.frame.presets.
       const sfMutate = (fn) => {
@@ -9276,7 +10956,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         const stops = getStops(); const i = Number(sel.dataset.idx); if (!stops[i]) return;
         stops[i].color = sel.value === 'transparent' ? 'transparent' : sel.value === 'theme' ? 'theme'
           : (/^#[0-9a-f]{6}$/i.test(stops[i].color || '') ? stops[i].color : '#2196F3');
-        patchSection(id, { stops, gradient_pattern: undefined }); this._render();   // structural: toggles the color picker's disabled state
+        patchSection(id, { stops, gradient_pattern: undefined }); this._render();   // structural: toggles the color picker's visibility
       }));
       panel.querySelectorAll('.cpce-div-stop-remove').forEach(btn => btn.onclick = () => {
         const stops = getStops(); stops.splice(Number(btn.dataset.idx), 1); patchSection(id, { stops, gradient_pattern: undefined }); this._render();
@@ -9382,6 +11062,29 @@ class ColorLightManagerCardEditor extends HTMLElement {
       sections.push({ id: newSectionId('divider'), type: 'divider' });
       this._updateSections(sections); this._render();
     };
+    const addTrackerSection = this.querySelector('#cpce-add-tracker-section');
+    if (addTrackerSection) addTrackerSection.onclick = () => {
+      const sections = this._orderedSectionsRaw();
+      sections.push({ id: newSectionId('tracker'), type: 'scene_tracker', name: 'Scene Tracker', areas: [] });
+      this._updateSections(sections); this._render();
+    };
+    // Export a section (+ its buttons) as portable JSON — copied to the clipboard. Buttons are bundled
+    // because they have no shared library (they live inline in cfg.presets), so the payload carries
+    // them. Clipboard, not window.prompt: prompt truncates large payloads (the "..." import bug).
+    this.querySelectorAll('.cpce-order-export').forEach(btn => btn.onclick = () => {
+      const id = btn.dataset.key;
+      const section = this._orderedSectionsRaw().find(s => s.id === id);
+      if (!section) return;
+      const presets = this._presetsBelongingTo(id);   // [] for non-buttons sections
+      const json = serializeSection(section, presets, this._nowIso());
+      this._exportJson(json, `Section JSON (${presets.length} button${presets.length === 1 ? '' : 's'} bundled). Import it into another card via “Import Section…”.`);
+    });
+    const importSection = this.querySelector('#cpce-import-section');
+    if (importSection) importSection.onclick = () => this._importJson('Paste exported Section JSON:', (txt) => {
+      const res = parseSectionBlob(txt);
+      if (!res.ok) { window.alert(`Could not import: ${res.error}`); return; }
+      this._importSection(res.section, res.presets);
+    });
     bind('#cpce-card-show-chevron', 'card_show_chevron');
     // Toggling collapsible shows/hides its sub-options, so it needs a full re-render.
     const collapsibleEl = this.querySelector('#cpce-card-collapsible');
@@ -9424,12 +11127,15 @@ class ColorLightManagerCardEditor extends HTMLElement {
     bind('#cpce-slider-border-radius', 'slider_border_radius', v => clamp(parseInt(v,10)||10, 0, 40));
     bind('#cpce-vertical-slider-alignment', 'vertical_slider_alignment');
     bind('#cpce-scale', 'scale', v => clamp(parseFloat(v)||1.0, 0.6, 1.8));
-    bind('#cpce-button-style', 'button_style');
-    bind('#cpce-button-font-size', 'button_font_size', v => clamp(parseInt(v,10)||14, 8, 32));
-    bind('#cpce-button-name-weight', 'button_name_weight');
-    bind('#cpce-button-name-wrap', 'button_name_wrap');
-    bind('#cpce-button-max-width', 'button_max_width', v => clamp(parseInt(v,10)||0, 0, 300));
-    bind('#cpce-button-height', 'button_height', v => clamp(parseInt(v,10)||44, 24, 100));
+    bindBtn('#cpce-button-style', 'button_style');
+    bindBtn('#cpce-button-font-size', 'button_font_size', v => clamp(parseInt(v,10)||14, 8, 32));
+    bindBtn('#cpce-button-name-weight', 'button_name_weight');
+    bindBtn('#cpce-button-name-color', 'button_name_color');
+    // Mode change re-renders to reveal/hide the Fixed Name Color picker (only shown for 'fixed').
+    bindBtnMode('#cpce-button-name-color-mode', 'button_name_color_mode');
+    bindBtn('#cpce-button-name-wrap', 'button_name_wrap');
+    bindBtn('#cpce-button-max-width', 'button_max_width', v => clamp(parseInt(v,10)||0, 0, 300));
+    bindBtn('#cpce-button-height', 'button_height', v => clamp(parseInt(v,10)||44, 24, 100));
     bind('#cpce-slider-width-horizontal', 'slider_width_horizontal', v => clamp(parseInt(v,10)||44, 24, 100));
     bind('#cpce-slider-length-horizontal', 'slider_length_horizontal', v => clamp(parseInt(v,10)||100, 20, 100));
     bind('#cpce-slider-width-vertical', 'slider_width_vertical', v => clamp(parseInt(v,10)||44, 24, 100));
@@ -9450,29 +11156,28 @@ class ColorLightManagerCardEditor extends HTMLElement {
     bind('#cpce-temperature-show-value', 'temperature_show_value');
     bind('#cpce-rgb-show-label', 'rgb_show_label');
     bind('#cpce-rgb-show-value', 'rgb_show_value');
-    bind('#cpce-button-border-color', 'button_border_color');
-    bind('#cpce-button-border-width', 'button_border_width', v => clamp(parseInt(v,10)||1, 1, 10));
-    // Per-side border toggles → maintain the button_border_sides array. Omit the
-    // key when all four are on (byte-stable: absent = the default all-sides look).
+    bindBtn('#cpce-button-border-color', 'button_border_color');
+    bindBtn('#cpce-button-border-width', 'button_border_width', v => clamp(parseInt(v,10)||1, 1, 10));
+    // Per-side border toggles → maintain the button_border_sides array on the layer edit buffer.
     this.querySelectorAll('.cpce-button-border-side').forEach(el => el.addEventListener('change', () => {
-      const set = new Set(buttonBorderSides(this._config));
+      const set = new Set(buttonBorderSides(this._builderCfg()));
       if (el.checked) set.add(el.dataset.side); else set.delete(el.dataset.side);
       const sides = BUTTON_BORDER_SIDES.filter(s => set.has(s));
-      if (sides.length === 4) { const c = { ...this._config }; delete c.button_border_sides; this._config = c; this._fire(c); }
-      else this._updateConfig({ button_border_sides: sides });
+      // All four selected → store the explicit array (a layer delta needs the concrete value; unlike
+      // the card config we can't rely on "absent = all", since the base beneath may differ).
+      this._builderPatch({ button_border_sides: sides });
     }));
-    bind('#cpce-button-border-radius', 'button_border_radius', v => clamp(parseInt(v,10)||10, 0, 40));
-    // Button gradient border editor (universal — applies to every button).
+    bindBtn('#cpce-button-border-radius', 'button_border_radius', v => clamp(parseInt(v,10)||10, 0, 40));
+    // Button gradient border editor (universal — applies to every button). Reads/writes the layer
+    // edit buffer via _builderCfg/_builderPatch so it never mutates the live card.
     this._wireGradientBorderEditor(this, 'btngb',
-      () => this._config.button_border_gradient || {},
-      (patch) => { const g = { ...(this._config.button_border_gradient || {}), ...patch }; this._updateConfig({ button_border_gradient: g }); },
-      () => this._config.button_border_color || '#2196F3');
+      () => this._builderCfg().button_border_gradient || {},
+      (patch) => { const g = { ...(this._builderCfg().button_border_gradient || {}), ...patch }; this._builderPatch({ button_border_gradient: g }); },
+      () => this._builderCfg().button_border_color || '#2196F3');
 
-    // Button Appearance Presets: save/apply/rename/delete + export/import.
-    const bsSave = this.querySelector('#cpce-btnstyle-save');
-    if (bsSave) bsSave.onclick = () => { const el = this.querySelector('#cpce-btnstyle-new-name'); const nm = el ? el.value.trim() : ''; if (!nm) { window.alert('Enter a name for the preset.'); return; } this._saveButtonStylePreset(nm); };
-    // "Load" pulls a preset's look into the editable settings below (doesn't change the preset).
-    this.querySelectorAll('.cpce-btnstyle-apply').forEach(btn => btn.onclick = () => this._applyButtonStylePreset(btn.dataset.slug));
+    // Button Appearance Presets: new/apply/rename/delete + export/import.
+    const bsNew = this.querySelector('#cpce-btnstyle-new');
+    if (bsNew) bsNew.onclick = () => this._newButtonStyle();
     // Duplicate any preset (incl. the synthetic Built-In) into a new editable "… (copy)" entry.
     this.querySelectorAll('.cpce-btnstyle-duplicate').forEach(btn => btn.onclick = () => {
       const slug = btn.dataset.slug; const e = buttonStyleStack(slug); if (!e) return;
@@ -9482,16 +11187,6 @@ class ColorLightManagerCardEditor extends HTMLElement {
       while (map[newSlug]) { newSlug = fixtureLibSlug(`${baseName} ${n++}`); }
       map[newSlug] = { name: baseName, kind: e.kind === 'frame' ? 'frame' : 'button', layers: JSON.parse(JSON.stringify(e.layers || [{ groups: {} }])) };
       saveButtonStyleLibrary(this._hass, map).then(() => this._render()).catch(err => { console.error(`${LOG_PREFIX} duplicate button style failed`, err); window.alert(`Could not duplicate: ${formatWsError(err)}`); });
-    });
-    // Set a preset (or Built-In) as the system-wide default — moves the stored pointer. Applies to
-    // every card that follows the default; requires acknowledging the system-wide change.
-    this.querySelectorAll('.cpce-btnstyle-setdefault').forEach(btn => btn.onclick = () => {
-      const slug = btn.dataset.slug;
-      if (slug === buttonStyleDefaultSlug()) return;   // already the default
-      const e = buttonStyleStack(slug); const nm = (e && e.name) || slug;
-      if (!window.confirm(`Make "${nm}" the system-wide default button style?\n\nEvery card/section that follows the default will use it — across your whole Home Assistant.`)) return;
-      BTN_STYLE_LIBRARY.system.defaultSlug = slug;   // reflect immediately
-      saveButtonStyleLibrary(this._hass, buttonStyleLibraryMap(), slug).then(() => this._render()).catch(err => { console.error(`${LOG_PREFIX} set default failed`, err); window.alert(`Could not set default: ${formatWsError(err)}`); });
     });
     // Live preview: any Builder control input/change repaints the sample in place (no full re-render).
     const bsSec = this.querySelector('[data-sec-id="button-appearance"] .cpce-sec-body');
@@ -9516,32 +11211,24 @@ class ColorLightManagerCardEditor extends HTMLElement {
     }));
     this.querySelectorAll('.cpce-btnstyle-delete').forEach(btn => btn.onclick = () => {
       const slug = btn.dataset.slug; const e = buttonStyleLibraryMap()[slug];
-      if (slug === buttonStyleDefaultSlug()) { window.alert('This preset is the system-wide default. Set another preset as default (★) before deleting it.'); return; }
-      if (!this._confirmDelete(`Delete the shared preset "${(e && e.name) || slug}"? Sections using it fall back to the system-wide default. This applies system-wide.`)) return;
+      const usedBy = this._orderedSectionsRaw().filter(s => s && s.type === 'buttons' && (fixtureRefSlug(s.style_preset) || BTN_STYLE_BASIC_SLUG) === slug).length;
+      const usedMsg = usedBy ? ` ${usedBy} section${usedBy === 1 ? '' : 's'} using it will fall back to Basic Theme.` : '';
+      if (!this._confirmDelete(`Delete the shared style "${(e && e.name) || slug}"?${usedMsg} This applies to every card that uses it.`)) return;
       const map = { ...buttonStyleLibraryMap() }; delete map[slug];
       saveButtonStyleLibrary(this._hass, map).then(() => this._render()).catch(err => { console.warn(`${LOG_PREFIX} delete button style failed`, err); window.alert(`Could not delete: ${formatWsError(err)}`); });
     });
-    // Export a stack's flattened look as JSON (prompt shows copyable text). "Export look".
+    // Export a stack's flattened look as JSON (copied to clipboard). "Export look".
     this.querySelectorAll('.cpce-btnstyle-export').forEach(btn => btn.onclick = () => {
       const e = buttonStyleStack(btn.dataset.slug); if (!e) return;
-      window.prompt('Copy this Button Appearance JSON (paste into another card via Import):', JSON.stringify(flattenButtonStack(e, () => true)));
+      this._exportJson(JSON.stringify(flattenButtonStack(e, () => true)), 'Button Appearance JSON — paste into another card via Import.');
     });
     const bsExportCur = this.querySelector('#cpce-btnstyle-export-current');
-    if (bsExportCur) bsExportCur.onclick = () => window.prompt('Copy this Button Appearance JSON:', JSON.stringify(extractButtonAppearance(this._config)));
-    const bsImportCard = this.querySelector('#cpce-btnstyle-import-card');
-    if (bsImportCard) bsImportCard.onclick = () => {
-      const txt = window.prompt('Paste Button Appearance JSON to apply to THIS card only (not the shared library):');
-      if (!txt) return;
-      let parsed; try { parsed = JSON.parse(txt); } catch (e) { window.alert('That isn\'t valid JSON.'); return; }
-      this._applyButtonAppearanceSettings(parsed);
-    };
+    if (bsExportCur) bsExportCur.onclick = () => this._exportJson(JSON.stringify(extractButtonAppearance(this._config)), 'Layer Appearance JSON.');
     const bsImport = this.querySelector('#cpce-btnstyle-import');
-    if (bsImport) bsImport.onclick = () => {
-      const txt = window.prompt('Paste Button Appearance JSON to create a NEW shared preset:');
-      if (!txt) return;
+    if (bsImport) bsImport.onclick = () => this._importJson('Paste Button Appearance JSON to create a NEW shared preset:', (txt) => {
       let parsed; try { parsed = JSON.parse(txt); } catch (e) { window.alert('That isn\'t valid JSON.'); return; }
       this._importButtonStyleAsPreset(parsed);
-    };
+    });
 
     // ---- Frame Styles library (shared ltek_frame_library) ----
     const frameScope = () => (this._config && this._config.frame_library_scope) || 'system';
@@ -9574,7 +11261,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // Export one frame as JSON.
     this.querySelectorAll('.cpce-frame-export').forEach(btn => btn.onclick = () => {
       const src = framePresetById(btn.dataset.frameId); if (!src) return;
-      window.prompt('Copy this Frame Style JSON (paste into another card via Import):', serializeFramePresets([src], {}));
+      this._exportJson(serializeFramePresets([src], {}), 'Frame Style JSON — paste into another card via Import.');
     });
     // Delete a System frame (warn if the card uses it).
     this.querySelectorAll('.cpce-frame-delete').forEach(btn => btn.onclick = () => {
@@ -9593,15 +11280,13 @@ class ColorLightManagerCardEditor extends HTMLElement {
     });
     // Import frame JSON into the shared library.
     const frameImport = this.querySelector('#cpce-frame-import');
-    if (frameImport) frameImport.onclick = () => {
-      const txt = window.prompt('Paste exported Frame Style JSON to add to the shared library:');
-      if (!txt) return;
+    if (frameImport) frameImport.onclick = () => this._importJson('Paste exported Frame Style JSON to add to the shared library:', (txt) => {
       const res = parseFramePresetBlob(txt);
       if (!res.ok) { window.alert('Import failed: ' + res.error); return; }
       const scope = frameScope(); const map = { ...frameLibraryMap(scope) };
       res.presets.forEach(p => { let slug = frameLibSlug(p.name); let n = 2; while (map[slug]) { slug = frameLibSlug(`${p.name} ${n++}`); } const clean = portableFramePreset(p, true); map[slug] = clean; });
       saveFrameLibrary(this._hass, scope, map).then(() => this._render()).catch(err => window.alert(`Could not import: ${formatWsError(err)}`));
-    };
+    });
     // Card Frame: apply / reorder / remove which frames layer onto the card.
     const cfMutate = (fn) => {
       const cf = JSON.parse(JSON.stringify((this._config && this._config.card_frame) || { presets: [] }));
@@ -9902,7 +11587,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // Export one set as JSON.
     this.querySelectorAll('.cpce-hdr-export').forEach(btn => btn.onclick = () => {
       const src = headerSetById(btn.dataset.hdrId); if (!src) return;
-      window.prompt('Copy this Header Rule Set JSON (paste into another card via Import):', serializeHeaderRuleSets([src]));
+      this._exportJson(serializeHeaderRuleSets([src]), 'Header Rule Set JSON — paste into another card via Import.');
     });
     // Delete a System set (warn if the card uses it — refs go missing gracefully).
     this.querySelectorAll('.cpce-hdr-delete').forEach(btn => btn.onclick = () => {
@@ -9918,16 +11603,14 @@ class ColorLightManagerCardEditor extends HTMLElement {
     });
     // Import a Header Rule Set from JSON.
     const hdrImport = this.querySelector('#cpce-hdr-import');
-    if (hdrImport) hdrImport.onclick = () => {
-      const txt = window.prompt('Paste exported Header Rule Set JSON to add to the shared library:');
-      if (!txt) return;
+    if (hdrImport) hdrImport.onclick = () => this._importJson('Paste exported Header Rule Set JSON to add to the shared library:', (txt) => {
       const res = parseHeaderRuleSetBlob(txt);
       if (!res.ok) { window.alert('Import failed: ' + res.error); return; }
       const scope = hdrScope(); const map = { ...headerLibraryMap(scope) };
       res.sets.forEach(set => { const nm = set.name || 'Rule Set'; let slug = headerLibSlug(nm), n = 2; while (map[slug]) { slug = headerLibSlug(`${nm} ${n++}`); } const clean = normalizeHeaderRuleSet(set); delete clean.id; map[slug] = clean; });
       SEED_HEADER_LIBRARY[scope === 'system' ? 'system' : 'user'].map = map;
       saveHeaderLibrary(this._hass, scope, map).then(() => this._render()).catch(err => window.alert(`Could not import: ${formatWsError(err)}`));
-    };
+    });
     // ---- Header Rule Set builder (edit a System set in a DRAFT) ----
     this.querySelectorAll('.cpce-hdr-edit').forEach(btn => btn.onclick = () => {
       const slug = btn.dataset.hdrSlug;
@@ -10071,29 +11754,16 @@ class ColorLightManagerCardEditor extends HTMLElement {
       hdrRefMutate(el, refs => { if (refs[i]) refs[i].entity = el.value ? el.value : ''; });
     }));
 
-    // Style Builder: "Save Changes to Layer #" captures the Builder settings back into the layer
-    // currently loaded for editing (full look for Layer 1, delta vs the base beneath it otherwise).
-    const layerSave = this.querySelector('#cpce-layer-savechanges');
-    if (layerSave) layerSave.onclick = () => {
-      const el = this._editingLayer; if (!el) return;
-      this._mutateStackDraft(el.slug, layers => {
-        const full = extractButtonAppearance(this._config);
-        if (!layers[el.idx]) return;
-        layers[el.idx].groups = (el.idx === 0) ? full : buttonStyleDelta(full, buttonStackBaseBelow(layers, el.idx));
-      });
-    };
-    const layerCancel = this.querySelector('#cpce-layer-editcancel');
-    if (layerCancel) layerCancel.onclick = () => { this._editingLayer = null; this._render(); };
-
     // ---- Conditional-layer stack editor ----
     this.querySelectorAll('.cpce-btnstyle-layers').forEach(btn => btn.onclick = () => this._openStackEditor(btn.dataset.slug));
     this.querySelectorAll('.cpce-layer-add').forEach(btn => btn.onclick = () =>
       this._mutateStackDraft(btn.dataset.slug, layers => layers.push({ groups: {}, when: { type: 'light_on' } })));
     this.querySelectorAll('.cpce-layer-import').forEach(btn => btn.onclick = () => {
-      const txt = window.prompt('Paste Button Appearance JSON to append as new layer(s):');
-      if (!txt) return;
-      let parsed; try { parsed = JSON.parse(txt); } catch (e) { window.alert('That isn\'t valid JSON.'); return; }
-      this._importButtonStyleAsLayer(btn.dataset.slug, parsed);
+      const slug = btn.dataset.slug;   // capture before the async clipboard read
+      this._importJson('Paste Button Appearance JSON to append as new layer(s):', (txt) => {
+        let parsed; try { parsed = JSON.parse(txt); } catch (e) { window.alert('That isn\'t valid JSON.'); return; }
+        this._importButtonStyleAsLayer(slug, parsed);
+      });
     });
     this.querySelectorAll('.cpce-layer-discard').forEach(btn => btn.onclick = () => { this._stackDraft = null; this._openButtonStack = null; this._editingLayer = null; this._openStackEditor(btn.dataset.slug); });
     this.querySelectorAll('.cpce-layer-save').forEach(btn => btn.onclick = () => this._saveStackDraft(btn.dataset.slug));
@@ -10115,11 +11785,20 @@ class ColorLightManagerCardEditor extends HTMLElement {
       // Reorder/remove change layer indices, which would leave _editingLayer pointing at the wrong
       // layer — stop editing before mutating so the Builder isn't silently bound to a moved layer.
       const up = row.querySelector('.cpce-layer-up');
-      if (up) up.onclick = () => { this._editingLayer = null; this._mutateStackDraft(slug, layers => { if (idx > 0) { const t = layers[idx - 1]; layers[idx - 1] = layers[idx]; layers[idx] = t; } }); };
+      if (up) up.onclick = () => { this._editingLayer = null; this._layerEditCfg = null; this._layerOwned = null; this._mutateStackDraft(slug, layers => { if (idx > 0) { const prevFlat = flattenButtonStack({ layers }, () => true); const t = layers[idx - 1]; layers[idx - 1] = layers[idx]; layers[idx] = t; this._ensureBaseFullLook(layers, prevFlat); } }); };
       const dn = row.querySelector('.cpce-layer-down');
-      if (dn) dn.onclick = () => { this._editingLayer = null; this._mutateStackDraft(slug, layers => { if (idx < layers.length - 1) { const t = layers[idx + 1]; layers[idx + 1] = layers[idx]; layers[idx] = t; } }); };
+      if (dn) dn.onclick = () => { this._editingLayer = null; this._layerEditCfg = null; this._layerOwned = null; this._mutateStackDraft(slug, layers => { if (idx < layers.length - 1) { const prevFlat = flattenButtonStack({ layers }, () => true); const t = layers[idx + 1]; layers[idx + 1] = layers[idx]; layers[idx] = t; this._ensureBaseFullLook(layers, prevFlat); } }); };
       const rm = row.querySelector('.cpce-layer-remove');
-      if (rm) rm.onclick = () => { if (!this._confirmDelete('Remove this layer? This cannot be undone (until you Discard changes).')) return; this._editingLayer = null; this._mutateStackDraft(slug, layers => { if (layers.length > 1) layers.splice(idx, 1); }); };
+      if (rm) rm.onclick = () => { if (!this._confirmDelete('Remove this layer? This cannot be undone (until you Discard changes).')) return; this._editingLayer = null; this._layerEditCfg = null; this._layerOwned = null; this._mutateStackDraft(slug, layers => { if (layers.length > 1) { const prevFlat = flattenButtonStack({ layers }, () => true); layers.splice(idx, 1); this._ensureBaseFullLook(layers, prevFlat); } }); };
+      // Duplicate this layer — insert a deep copy directly after the source. Stop editing first
+      // (indices shift). A duplicated base (idx 0) becomes an overlay that happens to own every
+      // group (valid); its label gets a "(copy)" suffix so the two are distinguishable.
+      const dup = row.querySelector('.cpce-layer-duplicate');
+      if (dup) dup.onclick = () => { this._editingLayer = null; this._layerEditCfg = null; this._layerOwned = null; this._mutateStackDraft(slug, layers => {
+        const copy = JSON.parse(JSON.stringify(layers[idx]));
+        if (copy.label) copy.label = `${copy.label} (copy)`;
+        layers.splice(idx + 1, 0, copy);
+      }); };
       // Hide/show this layer (draft-level; previews the stack without it).
       const hide = row.querySelector('.cpce-layer-hide');
       if (hide) hide.onclick = () => this._mutateStackDraft(slug, layers => { layers[idx].hidden = !layers[idx].hidden; });
@@ -10127,28 +11806,23 @@ class ColorLightManagerCardEditor extends HTMLElement {
       // EFFECTIVE look (base beneath it + this layer's delta) into the Builder; clicking the pencil
       // of the already-open layer closes the editor.
       const edit = row.querySelector('.cpce-layer-edit');
-      if (edit) edit.onclick = () => {
-        if (this._editingLayer && this._editingLayer.slug === slug && this._editingLayer.idx === idx) { this._editingLayer = null; this._render(); return; }
-        const d = this._stackDraftFor(slug); if (!d) return;
-        const effective = { ...buttonStackBaseBelow(d.layers, idx), ...(d.layers[idx].groups || {}) };
-        this._editingLayer = { slug, idx };
-        this._updateConfig(extractButtonAppearance({ ...this._config, ...effective }));
-        this._render();
-      };
+      if (edit) edit.onclick = () => this._editLayer(slug, idx);
     });
 
-    bind('#cpce-button-glow-color', 'button_glow_color');
-    bind('#cpce-button-glow-intensity', 'button_glow_intensity', v => clamp(parseFloat(v)||1.0, 0.2, 3));
-    bind('#cpce-button-glow-condition', 'button_glow_condition');
+    bindBtn('#cpce-button-glow-color', 'button_glow_color');
+    bindBtn('#cpce-button-glow-blur', 'button_glow_blur', v => clamp(parseInt(v,10)||0, 0, 40));
+    bindBtn('#cpce-button-glow-spread', 'button_glow_spread', v => clamp(parseInt(v,10)||0, -10, 20));
+    bindBtn('#cpce-button-glow-opacity', 'button_glow_opacity', v => clamp(parseInt(v,10)||50, 0, 100) / 100);
+    bindBtn('#cpce-button-glow-condition', 'button_glow_condition');
     // Button drop-shadow controls (enable toggles the sub-options → re-render).
     const btnShadowEnable = this.querySelector('#cpce-button-shadow-enabled');
-    if (btnShadowEnable) btnShadowEnable.addEventListener('change', () => { this._updateConfig({ button_shadow_enabled: btnShadowEnable.checked }); this._render(); });
-    bind('#cpce-button-shadow-color', 'button_shadow_color');
-    bind('#cpce-button-shadow-x', 'button_shadow_x', v => clamp(parseInt(v,10)||0, -20, 20));
-    bind('#cpce-button-shadow-y', 'button_shadow_y', v => clamp(parseInt(v,10)||0, -20, 20));
-    bind('#cpce-button-shadow-blur', 'button_shadow_blur', v => clamp(parseInt(v,10)||0, 0, 40));
-    bind('#cpce-button-shadow-spread', 'button_shadow_spread', v => clamp(parseInt(v,10)||0, -20, 20));
-    bind('#cpce-button-shadow-opacity', 'button_shadow_opacity', v => clamp(parseInt(v,10)||35, 0, 100) / 100);
+    if (btnShadowEnable) btnShadowEnable.addEventListener('change', () => { this._builderPatch({ button_shadow_enabled: btnShadowEnable.checked }); this._render(); });
+    bindBtn('#cpce-button-shadow-color', 'button_shadow_color');
+    bindBtn('#cpce-button-shadow-x', 'button_shadow_x', v => clamp(parseInt(v,10)||0, -20, 20));
+    bindBtn('#cpce-button-shadow-y', 'button_shadow_y', v => clamp(parseInt(v,10)||0, -20, 20));
+    bindBtn('#cpce-button-shadow-blur', 'button_shadow_blur', v => clamp(parseInt(v,10)||0, 0, 40));
+    bindBtn('#cpce-button-shadow-spread', 'button_shadow_spread', v => clamp(parseInt(v,10)||0, -20, 20));
+    bindBtn('#cpce-button-shadow-opacity', 'button_shadow_opacity', v => clamp(parseInt(v,10)||35, 0, 100) / 100);
     ['brightness', 'temperature', 'rgb'].forEach(type => {
       bind(`#cpce-${type}-label-position`, `${type}_label_position`);
       bind(`#cpce-${type}-value-position`, `${type}_value_position`);
@@ -10156,11 +11830,15 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // Switching fixed-vs-current mode changes which field is shown, so it needs a full re-render.
     const endModeEl = this.querySelector('#cpce-brightness-end-mode');
     if (endModeEl) endModeEl.addEventListener('change', () => { this._updateConfig({ brightness_end_color_mode: endModeEl.value }); this._render(); });
-    // Switching between fixed and match border color shows/hides the fixed-color picker.
-    const btnBorderModeEl = this.querySelector('#cpce-button-border-color-mode');
-    if (btnBorderModeEl) btnBorderModeEl.addEventListener('change', () => { this._updateConfig({ button_border_color_mode: btnBorderModeEl.value }); this._render(); });
-    const btnGlowModeEl = this.querySelector('#cpce-button-glow-color-mode');
-    if (btnGlowModeEl) btnGlowModeEl.addEventListener('change', () => { this._updateConfig({ button_glow_color_mode: btnGlowModeEl.value }); this._render(); });
+    // Button color-mode selects (match/fixed/none) — write to the layer buffer, re-render to
+    // reveal/hide the fixed-color picker.
+    bindBtnMode('#cpce-button-border-color-mode', 'button_border_color_mode');
+    bindBtnMode('#cpce-button-glow-color-mode', 'button_glow_color_mode');
+    bindBtnMode('#cpce-button-gradient-color-mode', 'button_border_gradient_color_mode');
+    bindBtn('#cpce-button-icon', 'button_icon', v => normalizeIcon(v));
+    bindBtn('#cpce-button-icon-size', 'button_icon_size', v => clamp(parseInt(v,10)||0, 0, 48));
+    bindBtn('#cpce-button-icon-color', 'button_icon_color');
+    bindBtnMode('#cpce-button-icon-color-mode', 'button_icon_color_mode');
     // Enabling/disabling a slider's label/value text also enables/disables its position dropdown.
     ['brightness', 'temperature', 'rgb'].forEach(type => {
       const labelCb = this.querySelector(`#cpce-${type}-show-label`);
@@ -10177,7 +11855,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         '#cpce-button-border-enabled': 'button_border_enabled',
         '#cpce-button-glow-enabled': 'button_glow_enabled',
       };
-      if (el) el.addEventListener('change', () => { this._updateConfig({ [keyMap[sel]]: el.checked }); this._render(); });
+      if (el) el.addEventListener('change', () => { this._builderPatch({ [keyMap[sel]]: el.checked }); this._render(); });
     });
     const cardBgColorEl = this.querySelector('#cpce-card-bg-color');
     if (cardBgColorEl) cardBgColorEl.addEventListener('input', () => this._updateConfig({ card_bg_color: cardBgColorEl.value }));
@@ -10192,7 +11870,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
     wireRangeReadout('#cpce-brightness-strength', null, '%');
     wireRangeReadout('#cpce-handle-opacity', '#cpce-handle-opacity-val', '%');
     wireRangeReadout('#cpce-scale', '#cpce-scale-val', 'x');
-    wireRangeReadout('#cpce-button-glow-intensity', '#cpce-button-glow-intensity-val', 'x');
+    wireRangeReadout('#cpce-button-glow-blur', '#cpce-button-glow-blur-val', 'px');
+    wireRangeReadout('#cpce-button-glow-spread', '#cpce-button-glow-spread-val', 'px');
+    wireRangeReadout('#cpce-button-glow-opacity', '#cpce-button-glow-opacity-val', '%');
     wireRangeReadout('#cpce-button-border-width', '#cpce-button-border-width-val', 'px');
     wireRangeReadout('#cpce-button-shadow-x', '#cpce-button-shadow-x-val', 'px');
     wireRangeReadout('#cpce-button-shadow-y', '#cpce-button-shadow-y-val', 'px');
@@ -10206,6 +11886,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     wireRangeReadout('#cpce-columns', '#cpce-columns-val', '');
     wireRangeReadout('#cpce-gap', '#cpce-gap-val', 'px');
     wireRangeReadout('#cpce-button-icon-gap', '#cpce-button-icon-gap-val', 'px');
+    wireRangeReadout('#cpce-button-icon-size', '#cpce-button-icon-size-val', 'px');
     wireRangeReadout('#cpce-slider-width-horizontal', '#cpce-slider-width-horizontal-val', 'px');
     wireRangeReadout('#cpce-slider-length-horizontal', '#cpce-slider-length-horizontal-val', '%');
     wireRangeReadout('#cpce-slider-width-vertical', '#cpce-slider-width-vertical-val', 'px');
@@ -10516,6 +12197,93 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const sceneListToggle = this.querySelector('#cpce-scene-list-toggle');
     if (sceneListToggle) sceneListToggle.onclick = () => { this._sceneListCollapsed = !this._sceneListCollapsed; this._render(); };
 
+    // ---- Scene Groups (input_select helper management) ----
+    // Scene Group filter (card-level). Debounce the text input so typing doesn't re-render per keystroke.
+    const sgFilterStr = this.querySelector('#cpce-sg-filter-str');
+    if (sgFilterStr) {
+      let t;
+      sgFilterStr.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { this._updateConfig({ scene_group_filter_str: sgFilterStr.value }); this._render(); }, 400); });
+    }
+    const sgFilterLabel = this.querySelector('#cpce-sg-filter-label');
+    if (sgFilterLabel) sgFilterLabel.addEventListener('change', () => { this._updateConfig({ scene_group_filter_label: sgFilterLabel.value || undefined }); this._render(); });
+    const shCreateToggle = this.querySelector('#cpce-sh-create-toggle');
+    if (shCreateToggle) shCreateToggle.onclick = () => { this._sceneHelperCreateOpen = !this._sceneHelperCreateOpen; this._render(); };
+    // Persist the create-form fields into a draft so a re-render (e.g. from a hass tick) doesn't wipe
+    // in-progress typing.
+    const shDraftSet = (patch) => { this._sceneHelperDraft = { ...(this._sceneHelperDraft || {}), ...patch }; };
+    const shName = this.querySelector('#cpce-sh-name');
+    if (shName) shName.addEventListener('input', () => shDraftSet({ name: shName.value }));
+    const shOpts = this.querySelector('#cpce-sh-new-options');
+    if (shOpts) shOpts.addEventListener('input', () => shDraftSet({ options: shOpts.value }));
+    const shInit = this.querySelector('#cpce-sh-initial');
+    if (shInit) shInit.addEventListener('input', () => shDraftSet({ initial: shInit.value }));
+    const shIcon = this.querySelector('#cpce-sh-icon');
+    if (shIcon) shIcon.addEventListener('input', () => shDraftSet({ icon: shIcon.value }));
+    const shCreate = this.querySelector('#cpce-sh-create');
+    if (shCreate) shCreate.onclick = () => {
+      const d = this._sceneHelperDraft || {};
+      const name = (d.name || '').trim();
+      const options = (d.options || '').split('\n').map(o => o.trim()).filter(Boolean);
+      if (!name) { window.alert('Enter a name for the helper.'); return; }
+      if (!options.length) { window.alert('Enter at least one option (one per line).'); return; }
+      const initial = (d.initial || '').trim();
+      if (initial && !options.includes(initial)) { window.alert('The initial option must be one of the listed options.'); return; }
+      wsInputSelectCreate(this._hass, { name, options, initial: initial || undefined, icon: (d.icon || '').trim() || undefined })
+        .then(() => { this._sceneHelperDraft = null; this._sceneHelperCreateOpen = false; this._sceneHelpers = null; this._ensureSceneHelpers(); this._render(); })
+        .catch(e => window.alert(`Could not create helper: ${formatWsError(e)}`));
+    };
+    // Edit-options toggle (opens the textarea panel for a helper).
+    this.querySelectorAll('.cpce-sh-edit').forEach(btn => btn.onclick = () => {
+      const ent = btn.dataset.entity;
+      this._sceneHelperEditing = this._sceneHelperEditing === ent ? null : ent;
+      this._render();
+    });
+    // Save edited options.
+    this.querySelectorAll('.cpce-sh-options-save').forEach(btn => btn.onclick = () => {
+      const ent = btn.dataset.entity;
+      const ta = this.querySelector(`.cpce-sh-options[data-entity="${ent}"]`);
+      const options = ta ? ta.value.split('\n').map(o => o.trim()).filter(Boolean) : [];
+      if (!options.length) { window.alert('A helper needs at least one option.'); return; }
+      const id = this._helperCollectionId(ent);
+      if (!id) { window.alert('Could not resolve this helper for editing (it may be YAML-defined).'); return; }
+      // HA's input_select/update is a FULL-object update: `name` is required. Send the current name
+      // (+ icon) alongside the new options, else it rejects with "required key not provided @ name".
+      const st = this._hass.states[ent];
+      const name = friendlyName(this._hass, ent);
+      const icon = st && st.attributes && st.attributes.icon;
+      wsInputSelectUpdate(this._hass, id, { name, options, icon })
+        .then(() => { this._sceneHelperEditing = null; this._sceneHelpers = null; this._ensureSceneHelpers(); this._render(); })
+        .catch(e => window.alert(`Could not save options: ${formatWsError(e)}`));
+    });
+    // Rename helper.
+    this.querySelectorAll('.cpce-sh-rename').forEach(btn => btn.onclick = () => {
+      const ent = btn.dataset.entity;
+      const cur = friendlyName(this._hass, ent);
+      const name = (window.prompt('New name for this helper:', cur) || '').trim();
+      if (!name || name === cur) return;
+      const id = this._helperCollectionId(ent);
+      if (!id) { window.alert('Could not resolve this helper for editing.'); return; }
+      // Full-object update: carry the existing options + icon so a rename doesn't wipe them.
+      const st = this._hass.states[ent];
+      const options = (st && st.attributes && Array.isArray(st.attributes.options)) ? st.attributes.options : [];
+      const icon = st && st.attributes && st.attributes.icon;
+      wsInputSelectUpdate(this._hass, id, { name, options, icon })
+        .then(() => { this._sceneHelpers = null; this._ensureSceneHelpers(); this._render(); })
+        .catch(e => window.alert(`Could not rename: ${formatWsError(e)}`));
+    });
+    // Delete helper — warn about references and offer to clean them up.
+    this.querySelectorAll('.cpce-sh-delete').forEach(btn => btn.onclick = () => {
+      const ent = btn.dataset.entity;
+      const id = this._helperCollectionId(ent);
+      if (!id) { window.alert('Could not resolve this helper for deletion (it may be YAML-defined).'); return; }
+      const refs = this._sceneHelperReferences(ent);
+      const refMsg = refs.total ? `\n\n${refs.total} reference${refs.total===1?'':'s'} (${refs.buttons} button${refs.buttons===1?'':'s'}, ${refs.areas} tracker area${refs.areas===1?'':'s'}) point at it and will be removed.` : '';
+      if (!this._confirmDelete(`Delete the helper "${friendlyName(this._hass, ent)}"?${refMsg} This deletes the Home Assistant helper itself.`)) return;
+      wsInputSelectDelete(this._hass, id)
+        .then(() => { if (refs.total) this._cleanupHelperReferences(ent); this._sceneHelpers = null; this._ensureSceneHelpers(); this._render(); })
+        .catch(e => window.alert(`Could not delete: ${formatWsError(e)}`));
+    });
+
     // Scene Builder — capture-set picker (which entities the next capture snapshots).
     const capAdd = this.querySelector('.cpce-scene-cap-add');
     if (capAdd) capAdd.onclick = () => {
@@ -10726,4 +12494,4 @@ if (!customElements.get('color-light-manager-card-editor')) customElements.defin
 window.customCards = window.customCards || [];
 window.customCards.push({ type: 'color-light-manager-card', name: 'Color Light & Scene Manager', description: 'Control colored lights (color temp / RGB / RGBWW) and author Home Assistant scenes — with preset buttons, Fixture Profiles, and Color Entity management.', preview: true });
 
-debugLog('Loaded', BUILD_NUMBER);
+console.log(`${LOG_PREFIX} Loaded ${BUILD_NUMBER}`);
