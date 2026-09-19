@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.09.08.239
+// Version: v2026.09.19.254
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.09.08.239';
+const BUILD_NUMBER = 'v2026.09.19.254';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -242,6 +242,19 @@ const ColorUtils = {
 };
 
 // ============ SHARED HELPERS ============
+// Apply an alpha to ANY CSS color, theme-tolerant (CARD_DESIGN_SYSTEM.md §3). A #rrggbb goes
+// through hexToRgba (numeric, exact); anything non-hex — a var(--…) theme color, a named color,
+// rgba(…) — can't be picked apart into channels (hexToRgb → null → black), so it's blended with
+// color-mix instead. At full alpha the color is returned as-is.
+function cssColorWithAlpha(color, alpha) {
+  const c = color == null ? '' : String(color);
+  const a = Number.isFinite(Number(alpha)) ? clamp(Number(alpha), 0, 1) : 1;
+  if (/^#[0-9a-fA-F]{6}$/.test(c)) return a < 1 ? ColorUtils.hexToRgba(c, a) : c;
+  if (!c) return c;
+  if (a >= 1) return c;                                  // opaque → the color verbatim
+  return `color-mix(in srgb, ${c} ${Math.round(a * 100)}%, transparent)`;
+}
+
 function getLightEntities(hass) {
   if (!hass || !hass.states) return [];
   return Object.keys(hass.states).filter(id => id.startsWith('light.')).sort();
@@ -2375,13 +2388,15 @@ function presetBorderAndGlowCssFor(preset, state, cfg, tempOutFmt, btnColor, act
         const blur = Number.isFinite(Number(cfg.button_glow_blur)) ? Number(cfg.button_glow_blur) : 12 * intensity;
         const spread = Number.isFinite(Number(cfg.button_glow_spread)) ? Number(cfg.button_glow_spread) : -2 * intensity;
         const op = Number.isFinite(Number(cfg.button_glow_opacity)) ? clamp(Number(cfg.button_glow_opacity), 0, 1) : 1;
-        shadows.push(`0 0 ${blur}px ${spread}px ${op < 1 ? ColorUtils.hexToRgba(color, op) : color}`);
+        // Theme-tolerant: the glow color may be a var(--…)/CSS color now (four-mode control).
+        shadows.push(`0 0 ${blur}px ${spread}px ${cssColorWithAlpha(color, op)}`);
       }
     }
   }
   if (cfg.button_shadow_enabled) {
     const op = clamp(Number(cfg.button_shadow_opacity), 0, 1);
-    shadows.push(`${Number(cfg.button_shadow_x)||0}px ${Number(cfg.button_shadow_y)||0}px ${Number(cfg.button_shadow_blur)||0}px ${Number(cfg.button_shadow_spread)||0}px ${ColorUtils.hexToRgba(cfg.button_shadow_color || '#000000', Number.isFinite(op) ? op : 0.35)}`);
+    // Theme-tolerant: shadow color may be a var(--…)/CSS color now (four-mode control).
+    shadows.push(`${Number(cfg.button_shadow_x)||0}px ${Number(cfg.button_shadow_y)||0}px ${Number(cfg.button_shadow_blur)||0}px ${Number(cfg.button_shadow_spread)||0}px ${cssColorWithAlpha(cfg.button_shadow_color || '#000000', Number.isFinite(op) ? op : 0.35)}`);
   }
   if (shadows.length) parts.boxShadow = shadows.join(', ');
   return parts;
@@ -2435,7 +2450,8 @@ function renderPresetButtonHtml(look, preset, cfg, state, tempOutFmt, activeId, 
       fillImage = 'linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02))';
       iconColor = 'var(--secondary-text-color)';
     } else {
-      fillImage = `linear-gradient(135deg, ${ColorUtils.hexToRgba(bg, 0.35)}, ${ColorUtils.hexToRgba(bg, 0.06)})`;
+      // Theme-tolerant: bg may be a var(--…)/CSS color (four-mode button/glow color).
+      fillImage = `linear-gradient(135deg, ${cssColorWithAlpha(bg, 0.35)}, ${cssColorWithAlpha(bg, 0.06)})`;
       iconColor = bg;
     }
     if (iconOverride !== undefined) iconColor = iconOverride || iconColor;   // explicit mode wins; 'none' keeps default
@@ -2729,7 +2745,31 @@ class ColorLightManagerCard extends HTMLElement {
     this._collapseInitialized = false;
     this._lastPressedPresetId = null; // for glow/header "active" color mode
     this._renderScheduled = false;    // coalesces rapid setConfig() calls into one render
+    this._onLightsOnly = {};          // per-slider-section live "on lights only" toggle state
+    this._edit = false;               // HA dashboard edit-mode flag (set via editMode accessor)
+    this._prev = false;               // HA preview flag (config dialog / card picker)
+    this._editMode = false;           // combined: edit OR preview
   }
+
+  // HA sets `editMode` on the card element while the DASHBOARD is being edited (the hui-card
+  // wrapper does `if ('editMode' in el) el.editMode = …`), and `preview` on the card in the
+  // config dialog / card picker. We track both so the collapsible card stays EXPANDED in either
+  // context — a collapsed preview/edit view hides everything the user is changing, and each
+  // keystroke re-render would otherwise re-collapse it. Mirrors the Easy Entity Styler card.
+  set editMode(v) {
+    this._edit = !!v;
+    this._editMode = this._edit || this._prev;
+    if (this._editMode) this._cardCollapsed = false;
+    if (this._rendered) this._scheduleRender();
+  }
+  get editMode() { return this._edit === true; }
+  set preview(v) {
+    this._prev = !!v;
+    this._editMode = this._edit || this._prev;
+    if (this._editMode) this._cardCollapsed = false;
+    if (this._rendered) this._scheduleRender();
+  }
+  get preview() { return this._prev === true; }
 
   // Coalesce full re-renders onto the next animation frame. In the editor's live preview,
   // HA calls setConfig() on EVERY keystroke/slider tick — rendering synchronously each time
@@ -2752,15 +2792,8 @@ class ColorLightManagerCard extends HTMLElement {
     // Heal any duplicate preset ids from older builds (they broke per-button glow lookups).
     this._config.presets = dedupePresetIds(this._config.presets);
     DEBUG = this._config.debug || false;
-    // Collapsible cards start collapsed. Resolve the initial state only once so a later
-    // config round-trip (or hass update) doesn't re-collapse a card the user has expanded.
-    // EXCEPTION: in the editor's live preview (this.preview === true) always start
-    // EXPANDED so edits are visible — a collapsed preview hides everything the user
-    // is changing, and each keystroke re-render would otherwise re-collapse it.
-    if (!this._collapseInitialized) {
-      this._cardCollapsed = this.preview ? false : (this._config.card_collapsible === true);
-      this._collapseInitialized = true;
-    }
+    // NOTE: the collapsed state is seeded/maintained in renderCard (it checks `this.preview` on
+    // every render), NOT here — HA can assign `preview` before or after setConfig.
     // Rendering is owned by `set hass` for the FIRST paint — it must run with hass available so
     // linked-Color-Entity buttons can resolve their live colors (rendering here first, before
     // hass, painted them colorless and suppressed that first hass render). So: if we've already
@@ -3019,6 +3052,19 @@ class ColorLightManagerCard extends HTMLElement {
   // Target ids for a slider/values section (same model as buttons; any light allowed).
   _sectionTargetIds(section) { return this._specTargetIds(presetTargetSpec(section)); }
 
+  // Whether a slider section should act on ONLY its currently-on lights. Two inputs:
+  //   • section.on_lights_only — the static setting (visual editor), the baseline.
+  //   • when section.on_lights_only_toggle is on, a live per-section checkbox on the card can flip
+  //     it at runtime; its value lives in this._onLightsOnly[section.id] (browser-local, seeded from
+  //     the static setting), so it doesn't touch config.
+  _sliderOnLightsOnly(section) {
+    if (!section) return false;
+    if (section.on_lights_only_toggle && this._onLightsOnly && Object.prototype.hasOwnProperty.call(this._onLightsOnly, section.id)) {
+      return !!this._onLightsOnly[section.id];
+    }
+    return !!section.on_lights_only;
+  }
+
   // Resolve a slider section's effective style (module helper — shared with the
   // editor class). See resolveSliderStyle().
   _sliderStyle(sectionId) { return resolveSliderStyle(this._config, sectionId); }
@@ -3241,6 +3287,25 @@ class ColorLightManagerCard extends HTMLElement {
     if (DEBUG) debugLog(`RESET "${preset.name}": FIRING → set ${group} = "${option}" (was "${st.state}")`);
     this._hass.callService('input_select', 'select_option', { entity_id: group, option })
       .catch(e => console.warn(`${LOG_PREFIX} default scene reset failed`, e));
+  }
+
+  // Section default scene reset for a SLIDER interaction. A slider move is unambiguously a room
+  // divergence (no scene intent), so this skips the preset-specific guards of the button path
+  // (no_scene_reset / scene-mode / self-binding). Idempotent: skips the service call when the group
+  // is already at the target option, so a drag that fires many commits only writes once.
+  _applyDefaultSceneResetForSection(section) {
+    if (!section || !this._hass) return;
+    const group = section.default_scene_group;
+    if (!group) return;                                    // not configured → disabled (today's behavior)
+    const st = this._hass.states[group];
+    if (!st) { console.warn(`${LOG_PREFIX} slider scene reset: ${group} not found`); return; }
+    const option = section.default_scene_option || '-none-';
+    if (String(st.state) === String(option)) return;       // already off-scene → nothing to do
+    const opts = (st.attributes && Array.isArray(st.attributes.options)) ? st.attributes.options : null;
+    if (opts && !opts.includes(option)) { console.warn(`${LOG_PREFIX} slider scene reset: "${option}" not an option of ${group}`); return; }
+    if (DEBUG) debugLog(`RESET (slider): FIRING → set ${group} = "${option}" (was "${st.state}")`);
+    this._hass.callService('input_select', 'select_option', { entity_id: group, option })
+      .catch(e => console.warn(`${LOG_PREFIX} slider scene reset failed`, e));
   }
 
   // The buttons section a preset belongs to (mirrors _presetsForSection's fallback: a missing/stale
@@ -3481,8 +3546,8 @@ class ColorLightManagerCard extends HTMLElement {
     }
     if (acc.background) {
       const mode = acc.background.mode || 'custom';
-      out.background = mode === 'theme' ? 'theme'
-        : mode === 'transparent' ? 'transparent'
+      out.background = mode === 'transparent' ? 'transparent'
+        : mode === 'theme' ? (acc.background.color || 'theme')
         : (acc.background.color || 'transparent');
     }
     const edgeMatch = (acc.border && !acc.border.follow_icon && acc.border.color) ? acc.border.color : iconCol;
@@ -3498,7 +3563,10 @@ class ColorLightManagerCard extends HTMLElement {
     const cfg = this._config;
     const mode = cfg.card_bg_mode || 'theme';
     if (mode === 'transparent') return 'transparent';
-    if (mode === 'custom') return cfg.card_bg_color || '#1c1c1c';
+    // custom (hex), theme (var(--…) stored in card_bg_color), css (free text) all render the stored
+    // color directly. Legacy 'theme' with no stored color → the HA card-background var.
+    if (mode === 'custom' || mode === 'css') return cfg.card_bg_color || '#1c1c1c';
+    if (mode === 'theme') return cfg.card_bg_color || 'var(--ha-card-background, var(--card-background-color, #1c1c1c))';
     return 'var(--ha-card-background, var(--card-background-color, #1c1c1c))';
   }
 
@@ -3812,7 +3880,9 @@ class ColorLightManagerCard extends HTMLElement {
     const titleFontWeight = cfg.title_font_weight || '500';
     const titleColor = cfg.title_color || 'var(--primary-text-color)';
     const handleOpacity = clamp(Number(cfg.slider_handle_opacity), 0, 100) / 100;
-    const handleColor = ColorUtils.hexToRgba(cfg.slider_handle_color || '#ffffff', Number.isFinite(handleOpacity) ? handleOpacity : 1);
+    // Theme-tolerant: slider_handle_color may now be a var(--…)/CSS color (four-mode control), so
+    // don't feed it through hex-only rgba (that renders black on a var()). See cssColorWithAlpha.
+    const handleColor = cssColorWithAlpha(cfg.slider_handle_color || '#ffffff', Number.isFinite(handleOpacity) ? handleOpacity : 1);
     const handleShape = cfg.slider_handle_shape || 'round';
     // Only meaningful for vertical orientation, where sliders sit side-by-side
     // and can be pushed to one edge, centered, or spread evenly across the card.
@@ -3827,6 +3897,21 @@ class ColorLightManagerCard extends HTMLElement {
     // Header composition. Title text and icon are independently show/hide-able.
     const showTitleText = cfg.show_title !== false && !!cfg.title;
     const showTitleIcon = cfg.show_title_icon !== false && !!cfg.icon;
+    // Collapsed-state seeding. `_editMode` is true when HA is editing the dashboard OR previewing
+    // in the config dialog (set via the editMode/preview accessors, which can arrive before OR
+    // after the first render).
+    //   • In edit/preview, always keep the card EXPANDED — a collapsed view hides the edits, and
+    //     each keystroke re-render would otherwise re-collapse it. Forced on EVERY render (not once)
+    //     so a late editMode/preview assignment still corrects it.
+    //   • On the real dashboard (never in edit/preview), seed ONCE from card_collapsible; thereafter
+    //     the state is user-owned (header click) and preserved across re-renders.
+    if (this._editMode) {
+      this._cardCollapsed = false;
+      this._collapseInitialized = true;
+    } else if (!this._collapseInitialized) {
+      this._cardCollapsed = cfg.card_collapsible === true;
+      this._collapseInitialized = true;
+    }
     // Collapsible works even with no title/icon: the header becomes a minimal bar with just
     // a chevron so the card can still be expanded.
     const collapsible = cfg.card_collapsible === true;
@@ -3924,6 +4009,13 @@ class ColorLightManagerCard extends HTMLElement {
         .cpc-preset-btn .cpc-btn-sublabel { font-size:calc(11px * ${scale}); color:var(--secondary-text-color); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
         .cpc-sliders { display:flex; width:100%; box-sizing:border-box; ${vertical ? `flex-direction:row; align-items:flex-start; gap:calc(16px * ${scale}); ${verticalAlignmentCss}` : `flex-direction:column; gap:calc(10px * ${scale});`} }
         .cpc-slider-row { display:flex; flex-direction:column; gap:4px; ${vertical ? `width:calc(${sliderWidth}px * ${scale});` : `width:${sliderLength}%;`} }
+        /* Live "Only Control Lights Currently On" checkbox — full-width line (both orientations).
+           Placement (top/bottom via order), alignment (justify-content), and font size/weight/color
+           are set inline per section by _renderSliderOnlyOnToggle. */
+        .cpc-slider-onlyon { flex:0 0 100%; width:100%; display:flex; align-items:center; gap:6px; color:var(--secondary-text-color); cursor:pointer; }
+        .cpc-slider-onlyon-top { order:-1; }
+        .cpc-slider-onlyon-bottom { order:99; }
+        .cpc-slider-onlyon input { cursor:pointer; flex:0 0 auto; }
         .cpc-bar-slider {
           position:relative; border-radius:${sliderRadiusPx}px;
           cursor:pointer; user-select:none; overflow:visible;
@@ -4217,6 +4309,20 @@ class ColorLightManagerCard extends HTMLElement {
     return `${k}K`;
   }
 
+  // The live "Only Control Lights Currently On" checkbox for a slider section. Alignment + text
+  // style (size/weight/color) come from per-section settings; placement (top/bottom) is handled by
+  // the caller. `order` keeps it above/below the slider rows within the flex container.
+  _renderSliderOnlyOnToggle(section) {
+    const align = ['left', 'center', 'right'].includes(section.on_lights_only_label_align) ? section.on_lights_only_label_align : 'left';
+    const justify = align === 'center' ? 'center' : (align === 'right' ? 'flex-end' : 'flex-start');
+    const pos = section.on_lights_only_label_position === 'bottom' ? 'bottom' : 'top';
+    const size = Number(section.on_lights_only_font_size) || 12;
+    const weight = section.on_lights_only_font_weight || '400';
+    const color = section.on_lights_only_font_color || '';
+    const styleBits = `justify-content:${justify};font-size:${size}px;font-weight:${weight};${color ? `color:${color};` : ''}`;
+    return `<label class="cpc-slider-onlyon cpc-slider-onlyon-${pos}" style="${styleBits}"><input type="checkbox" class="cpc-slider-onlyon-cb" data-section-id="${section.id}" ${this._sliderOnLightsOnly(section) ? 'checked' : ''}> Only Control Lights Currently On</label>`;
+  }
+
   _renderSlider(type, pct, extra, gradientCss, sectionId) {
     const cfg = this._config;
     // Per-section unique DOM id so multiple slider sections don't collide.
@@ -4358,32 +4464,45 @@ class ColorLightManagerCard extends HTMLElement {
 
     // Wire every slider in every slider section, each acting on its OWN section target.
     this._orderedSections().filter(s => s.type === 'sliders').forEach(section => {
-      const ids = () => this._sectionTargetIds(section);
+      // "On lights only": when effective (static section setting, or the live per-section checkbox),
+      // a slider drives only the section's lights that are currently ON — leaving off lights off.
+      // Resolved at each commit (getter) so it tracks live state + the live toggle.
+      const ids = () => {
+        const all = this._sectionTargetIds(section);
+        if (!this._sliderOnLightsOnly(section)) return all;
+        const on = all.filter(id => { const st = this._hass && this._hass.states[id]; return st && st.state === 'on'; });
+        return on;
+      };
       const sid = `#cpc-slider-${section.id}`;
       // Per-section orientation drives drag math + handle positioning.
       const vertical = this._sliderStyle(section.id).slider_orientation === 'vertical';
 
+      // Any slider move diverges the room from its active scene → de-highlight it (idempotent, so
+      // repeated drag commits only write the group once). No-op when the section has no
+      // default_scene_group configured. Fires on all three sliders (brightness included).
+      const resetScene = () => this._applyDefaultSceneResetForSection(section);
+
       // onCommit receives the raw pct (rAF-decoupled from onVisual); each converts pct→value.
-      const commitBrightness = throttle((pct) => this._setBrightness(pct, ids()), debounceMs);
+      const commitBrightness = throttle((pct) => { this._setBrightness(pct, ids()); resetScene(); }, debounceMs);
       this._wireSlider(`${sid}-brightness`, {
         onVisual: (pct) => this._updateSliderVisual(`${sid}-brightness`, pct, `${Math.round(pct)}%`, false, vertical),
         onCommit: commitBrightness,
-        onFinal: (pct) => { commitBrightness.cancel(); this._setBrightness(pct, ids()); },
+        onFinal: (pct) => { commitBrightness.cancel(); this._setBrightness(pct, ids()); resetScene(); },
         vertical,
       });
 
-      const commitTemp = throttle((pct) => this._setColorTemp(this._pctToKelvin(pct, this._config), ids()), debounceMs);
+      const commitTemp = throttle((pct) => { this._setColorTemp(this._pctToKelvin(pct, this._config), ids()); resetScene(); }, debounceMs);
       this._wireSlider(`${sid}-temperature`, {
         onVisual: (pct) => {
           const kelvin = this._pctToKelvin(pct, this._config);
           this._updateSliderVisual(`${sid}-temperature`, pct, this._tempReadout(kelvin), true, vertical);
         },
         onCommit: commitTemp,
-        onFinal: (pct) => { commitTemp.cancel(); this._setColorTemp(this._pctToKelvin(pct, this._config), ids()); },
+        onFinal: (pct) => { commitTemp.cancel(); this._setColorTemp(this._pctToKelvin(pct, this._config), ids()); resetScene(); },
         vertical,
       });
 
-      const commitRgb = throttle((pct) => { const hue = Math.round((pct / 100) * 360); this._setRgb(ColorUtils.hsToRgb(hue, 100), ids()); }, debounceMs);
+      const commitRgb = throttle((pct) => { const hue = Math.round((pct / 100) * 360); this._setRgb(ColorUtils.hsToRgb(hue, 100), ids()); resetScene(); }, debounceMs);
       this._wireSlider(`${sid}-rgb`, {
         onVisual: (pct) => {
           const hue = Math.round((pct / 100) * 360); const rgb = ColorUtils.hsToRgb(hue, 100);
@@ -4394,9 +4513,17 @@ class ColorLightManagerCard extends HTMLElement {
           commitRgb.cancel();
           const hue = Math.round((pct / 100) * 360);
           this._setRgb(ColorUtils.hsToRgb(hue, 100), ids());
+          resetScene();
         },
         vertical,
       });
+    });
+
+    // Live "on lights only" checkbox per slider section: stores the runtime override (browser-local,
+    // not config) so subsequent slider moves target only on-lights. No re-render needed — the ids()
+    // getter reads this live on the next commit.
+    this.querySelectorAll('.cpc-slider-onlyon-cb').forEach(cb => {
+      cb.addEventListener('change', () => { this._onLightsOnly[cb.dataset.sectionId] = cb.checked; });
     });
   }
 
@@ -4766,10 +4893,18 @@ class ColorLightManagerCard extends HTMLElement {
       // Buttons, the section only controls WHICH sliders show + its target lights. No
       // per-section style override; the global renderCard style block drives shape/
       // orientation/handle for all slider sections.
+      // Optional live "Only Control Lights Currently On" checkbox (shown only when the section
+      // enables the toggle). Its checked state comes from the runtime override (seeded from the
+      // static setting). Placement (top/bottom), alignment (left/center/right), and text style
+      // (size/weight/color) are per-section settings.
+      const onOnlyToggle = section.on_lights_only_toggle ? this._renderSliderOnlyOnToggle(section) : '';
+      const onOnlyPos = section.on_lights_only_label_position === 'bottom' ? 'bottom' : 'top';
       const body = this._wrapSectionBody(section, `<div class="cpc-sliders">
+        ${onOnlyPos === 'top' ? onOnlyToggle : ''}
         ${sel.brightness ? this._renderSlider('brightness', briPct, null, this._brightnessGradientCss(rgb, section.id), section.id) : ''}
         ${sel.temperature ? this._renderSlider('temperature', this._kelvinToPct(kelvin, cfg), kelvin, null, section.id) : ''}
         ${sel.rgb ? this._renderSlider('rgb', this._rgbToPct(rgb), rgb, null, section.id) : ''}
+        ${onOnlyPos === 'bottom' ? onOnlyToggle : ''}
       </div>`);
       return `<div class="cpc-section${div}" data-section-id="${section.id}">${heading}${body}</div>`;
     }
@@ -4844,6 +4979,10 @@ class ColorLightManagerCard extends HTMLElement {
     }
     if (!color && optColor) color = optColor;
     const isOff = !option || /^(-?off-?|none|off)$/i.test(option);
+    // A "-none-" (or none) sentinel means NO scene is selected. It still renders as a normal styled
+    // tile (not the Off look), but it must never count as active — otherwise the tile glows the moment
+    // the room lights diverge from baseline even though no scene is set.
+    const isNoScene = isOff || /^-?none-?$/i.test(option);
     // Icon: matching button's own icon → per-option map → area icon → generic.
     const btnIcon = srcBtn ? resolvePresetIcon(srcBtn, buttonMode(srcBtn)) : null;
     const iconMap = (area && area.icon_map && typeof area.icon_map === 'object') ? area.icon_map : null;
@@ -4853,8 +4992,8 @@ class ColorLightManagerCard extends HTMLElement {
       if (lightSt.state === 'on') { const bri = lightSt.attributes && lightSt.attributes.brightness; sub = bri != null ? `${Math.round((bri / 255) * 100)}%` : 'On'; }
       else if (lightSt.state === 'off') sub = 'Off';
     }
-    // "Active" for tracker glow = the area is on a real (non-off, available) scene.
-    const isActive = !unavailable && !isOff;
+    // "Active" for tracker glow = the area is on a real (non-off, non-none, available) scene.
+    const isActive = !unavailable && !isNoScene;
     return { option, unavailable, color, icon, sub, isOff, isActive, lightSt };
   }
   // Default chip tile (no Button Style bound).
@@ -6516,6 +6655,278 @@ class ColorLightManagerCardEditor extends HTMLElement {
     if (colorEl) colorEl.addEventListener('input', () => onChange({ color: colorEl.value }));
   }
 
+  // ── Four-mode color control (CARD_DESIGN_SYSTEM.md §3) ────────────────────────
+  // Every color option is one control: a mode dropdown + the value field that mode
+  // needs. Ported from EES v216 (_atColorControl/_edColorField). CLM writes straight
+  // to config, so this uses the ed-* (config-bound) idiom only. Gradient/blend stops
+  // stay hex-only swatches (the one documented exception) — not routed through here.
+  _AT_THEME_COLORS = [
+    ['var(--primary-color)', 'Primary'],
+    ['var(--accent-color)', 'Accent'],
+    ['var(--primary-text-color)', 'Primary text'],
+    ['var(--secondary-text-color)', 'Secondary text'],
+    ['var(--disabled-text-color)', 'Disabled text'],
+    ['var(--state-active-color)', 'State active'],
+    ['var(--error-color)', 'Error'],
+    ['var(--warning-color)', 'Warning'],
+    ['var(--success-color)', 'Success'],
+    ['var(--info-color)', 'Info'],
+  ];
+  _COLOR_MODES = [['default', 'Default'], ['theme', 'Theme color'], ['custom', 'Custom color'], ['css', 'Custom CSS…']];
+  // Small [value,label] → <option> helper (EES's helpers assume one; CLM lacked it).
+  _atOpts(pairs, sel) {
+    return (pairs || []).map(([v, l]) => `<option value="${escapeHtml(v)}" ${String(sel) === String(v) ? 'selected' : ''}>${escapeHtml(l)}</option>`).join('');
+  }
+  // Which of the four modes a stored value represents. A var(--…) is 'theme' only
+  // when it's one we actually offer — an unlisted one falls to 'css' so the dropdown
+  // never rewrites it.
+  _colorMode(cur) {
+    cur = cur == null ? '' : String(cur);
+    if (cur === '') return 'default';
+    if (/^#[0-9a-fA-F]{3,8}$/.test(cur)) return 'custom';
+    if (/^var\(/.test(cur) && this._AT_THEME_COLORS.some(([v]) => v === cur)) return 'theme';
+    return 'css';
+  }
+  // The config-bound color control. `key` is the config key; `swatchHtml` is the
+  // EXISTING bare-swatch markup verbatim, so that key's original live handler keeps
+  // driving Custom mode and only the mode/theme/css controls are new (all routed by
+  // one generic handler set below). `default` deletes the key (byte-stable).
+  //   opts.defaultLabel — what "Default" inherits here (e.g. "Card default").
+  //   opts.seedHex — the hex Custom starts from when the current value isn't hex.
+  _edColorField(key, label, cur, swatchHtml, opts) {
+    opts = opts || {};
+    cur = cur == null ? '' : String(cur);
+    const mode = this._colorMode(cur);
+    const hex = /^#[0-9a-fA-F]{6}$/.test(cur) ? cur : (opts.seedHex || '#2196F3');
+    const themeVal = mode === 'theme' ? cur : 'var(--primary-color)';
+    const cssVal = (mode === 'css' && cur) ? cur : 'currentColor';
+    // opts.noDefault drops the "default" mode — for a value that's ALREADY the chosen color (e.g.
+    // inside a background's Custom option, where a domain select above owns inherit/transparent).
+    let baseModes = opts.noDefault ? this._COLOR_MODES.filter(([v]) => v !== 'default') : this._COLOR_MODES;
+    const modes = opts.defaultLabel
+      ? baseModes.map(([v, l]) => [v, v === 'default' ? opts.defaultLabel : l])
+      : baseModes;
+    // scope routes the write: 'config' (default) → this._config; 'builder' → the button-style layer
+    // edit buffer via _builderPatch (button-appearance colors, which never touch the live card).
+    const scope = opts.scope || 'config';
+    const d = `data-ed-key="${escapeHtml(key)}" data-ed-scope="${scope}"`;
+    let valField = '';
+    if (mode === 'custom') valField = swatchHtml;
+    else if (mode === 'theme') valField = `<select class="cpce-ed-color-theme" ${d} title="Follows the HA theme">${this._atOpts(this._AT_THEME_COLORS, themeVal)}</select>`;
+    else if (mode === 'css') valField = `<input type="text" class="cpce-ed-color-css" ${d} value="${escapeHtml(cur)}" placeholder="e.g. tomato" title="Any CSS color" />`;
+    return `<div class="cpce-row cpce-ed-color-field">
+      ${label ? `<label class="lbl">${label}</label>` : ''}
+      <select class="cpce-ed-color-mode" ${d} data-ed-hex="${hex}" data-ed-theme="${escapeHtml(themeVal)}" data-ed-css="${escapeHtml(cssVal)}">${this._atOpts(modes, mode)}</select>
+      ${valField}
+    </div>`;
+  }
+  // One generic handler set for every _edColorField — mode swaps the value control
+  // (re-render), theme/css write live. The Custom swatch keeps its own per-key handler.
+  _wireEdColorFields(root) {
+    // Write a color value to the right place based on the field's scope.
+    const writeColor = (scope, key, value, isDelete) => {
+      if (scope === 'builder') {
+        // Layer edit buffer — deleting isn't meaningful (a layer either owns a group or not), so a
+        // 'default' on a builder-scoped field just stores '' (the group's inherit sentinel).
+        this._builderPatch({ [key]: value });
+        return;
+      }
+      if (isDelete) { const c = { ...this._config }; delete c[key]; this._config = c; this._fire(c); }
+      else this._updateConfig({ [key]: value });
+    };
+    (root || this).querySelectorAll('.cpce-ed-color-mode').forEach(el => {
+      el.addEventListener('change', () => {
+        const key = el.dataset.edKey, scope = el.dataset.edScope || 'config', mode = el.value;
+        const value = mode === 'default' ? ''
+          : mode === 'theme' ? (el.dataset.edTheme || 'var(--primary-color)')
+          : mode === 'css' ? (el.dataset.edCss || 'currentColor')
+          : (el.dataset.edHex || '#2196F3');
+        writeColor(scope, key, value, mode === 'default');
+        this._render();
+      });
+    });
+    (root || this).querySelectorAll('.cpce-ed-color-theme').forEach(el =>
+      el.addEventListener('change', () => writeColor(el.dataset.edScope || 'config', el.dataset.edKey, el.value, false)));
+    (root || this).querySelectorAll('.cpce-ed-color-css').forEach(el =>
+      el.addEventListener('input', () => writeColor(el.dataset.edScope || 'config', el.dataset.edKey, el.value, false)));
+  }
+
+  // Frame-scoped four-mode color control. Frame colors live on a frame-preset object and are written
+  // via patchFrame(id, fx => fbSet(fx, path, val)); the existing .fb-input handler already drives the
+  // Custom swatch (it carries data-fb-id/data-fb-path). This adds the mode dropdown + theme/css value
+  // fields, all carrying data-fb-id/data-fb-path so _wireFbColorFields routes them the same way.
+  // `swatchHtml` is the ORIGINAL fb-input swatch verbatim.
+  _fbColorField(id, path, label, cur, swatchHtml, opts) {
+    opts = opts || {};
+    cur = cur == null ? '' : String(cur);
+    const mode = this._colorMode(cur);
+    const hex = /^#[0-9a-fA-F]{6}$/.test(cur) ? cur : (opts.seedHex || '#2196F3');
+    const themeVal = mode === 'theme' ? cur : 'var(--primary-color)';
+    const cssVal = (mode === 'css' && cur) ? cur : 'currentColor';
+    const baseModes = this._COLOR_MODES.filter(([v]) => v !== 'default');   // frame color is always a chosen color
+    const d = `data-fb-id="${escapeHtml(id)}" data-fb-path="${escapeHtml(path)}"`;
+    let valField = '';
+    if (mode === 'custom') valField = swatchHtml;
+    else if (mode === 'theme') valField = `<select class="fb-color-theme" ${d} title="Follows the HA theme">${this._atOpts(this._AT_THEME_COLORS, themeVal)}</select>`;
+    else if (mode === 'css') valField = `<input type="text" class="fb-color-css" ${d} value="${escapeHtml(cur)}" placeholder="e.g. tomato" title="Any CSS color" />`;
+    return `<span class="cpce-fb-color-field">
+      <select class="fb-color-mode" ${d} data-fb-hex="${hex}" data-fb-theme="${escapeHtml(themeVal)}" data-fb-css="${escapeHtml(cssVal)}">${this._atOpts(baseModes, mode)}</select>
+      ${valField}
+    </span>`;
+  }
+  // Handlers for _fbColorField — route through the same patchFrame/fbSet path the .fb-input uses.
+  // `patchFrame` + `fbSet` are locals in the frame wiring, so this takes them as callbacks.
+  _wireFbColorFields(root, patchFrame, fbSet) {
+    (root || this).querySelectorAll('.fb-color-mode').forEach(el => {
+      el.addEventListener('change', () => {
+        const id = el.dataset.fbId, path = el.dataset.fbPath, mode = el.value;
+        const value = mode === 'theme' ? (el.dataset.fbTheme || 'var(--primary-color)')
+          : mode === 'css' ? (el.dataset.fbCss || 'currentColor')
+          : (el.dataset.fbHex || '#2196F3');
+        patchFrame(id, fx => fbSet(fx, path, value), false);   // structural: re-render to swap value field
+      });
+    });
+    (root || this).querySelectorAll('.fb-color-theme').forEach(el =>
+      el.addEventListener('change', () => patchFrame(el.dataset.fbId, fx => fbSet(fx, el.dataset.fbPath, el.value), true)));
+    (root || this).querySelectorAll('.fb-color-css').forEach(el =>
+      el.addEventListener('input', () => patchFrame(el.dataset.fbId, fx => fbSet(fx, el.dataset.fbPath, el.value), true)));
+  }
+
+  // BACKGROUND four-mode control — one flat selector (no redundant nesting). A background has one
+  // extra option over the plain four-mode control: **Transparent**. So the single dropdown is
+  // Transparent / Theme color / Custom color / Custom CSS, and each non-Transparent choice reveals
+  // its own second field (theme-variable <select>, swatch, or free text). Storage:
+  //   modeKey  → 'transparent' | 'theme' | 'custom' | 'css'
+  //   colorKey → the value for the current mode (var(--…) for theme, #hex for custom, text for css;
+  //              unused for transparent/legacy 'theme' with no stored color)
+  // Back-compat: the legacy card model used mode 'theme'|'transparent'|'custom' with a separate hex
+  // in colorKey; that maps 1:1 (legacy 'theme' had no color → theme-default, still rendered the same).
+  // `scope` routes writes: 'config' (default) or 'frame' (needs patchFrame/fbSet via _wireBgColorControl).
+  _bgColorControl(modeKey, colorKey, label, curMode, curColor, opts) {
+    opts = opts || {};
+    curMode = curMode || 'theme';
+    const color = curColor == null ? '' : String(curColor);
+    const seedHex = /^#[0-9a-fA-F]{6}$/.test(color) ? color : (opts.seedHex || '#1c1c1c');
+    const themeVal = /^var\(/.test(color) ? color : 'var(--primary-color)';
+    const cssVal = (curMode === 'css' && color) ? color : 'currentColor';
+    const themeLabel = opts.themeLabel || 'Theme default';
+    const modes = [['transparent', 'Transparent'], ['theme', themeLabel], ['custom', 'Custom color'], ['css', 'Custom CSS…']];
+    const d = `data-bg-modekey="${escapeHtml(modeKey)}" data-bg-colorkey="${escapeHtml(colorKey)}" data-bg-scope="${opts.scope || 'config'}"${opts.fbId ? ` data-fb-id="${escapeHtml(opts.fbId)}"` : ''}`;
+    let valField = '';
+    if (curMode === 'custom') valField = `<input type="color" class="cpce-bg-swatch" ${d} value="${seedHex}">`;
+    else if (curMode === 'theme') valField = `<select class="cpce-bg-theme" ${d} title="Follows the HA theme">${this._atOpts(this._AT_THEME_COLORS, themeVal)}</select>`;
+    else if (curMode === 'css') valField = `<input type="text" class="cpce-bg-css" ${d} value="${escapeHtml(color)}" placeholder="e.g. tomato / rgba(…)" title="Any CSS color" />`;
+    // curMode === 'transparent' → no second field.
+    return `<div class="cpce-row"><label class="lbl">${label}</label>
+        <select class="cpce-bg-mode" ${d} data-bg-hex="${seedHex}" data-bg-theme="${escapeHtml(themeVal)}" data-bg-css="${escapeHtml(cssVal)}">${this._atOpts(modes, curMode)}</select>
+      </div>
+      ${valField ? `<div class="cpce-row"><label class="lbl">${curMode === 'theme' ? 'Theme color' : curMode === 'custom' ? 'Custom color' : 'CSS color'}</label>${valField}</div>` : ''}`;
+  }
+  // Handlers for _bgColorControl. `frameHelpers` (optional) = { patchFrame, fbSet } for scope 'frame'.
+  _wireBgColorControls(root, frameHelpers) {
+    const write = (el, modeVal, colorVal) => {
+      const scope = el.dataset.bgScope || 'config';
+      const modeKey = el.dataset.bgModekey, colorKey = el.dataset.bgColorkey;
+      if (scope === 'frame' && frameHelpers) {
+        frameHelpers.patchFrame(el.dataset.fbId, fx => {
+          if (modeVal !== undefined) frameHelpers.fbSet(fx, modeKey, modeVal);
+          if (colorVal !== undefined) frameHelpers.fbSet(fx, colorKey, colorVal);
+        }, colorVal !== undefined && modeVal === undefined);   // live only when just editing the color
+        return;
+      }
+      const patch = {};
+      if (modeVal !== undefined) patch[modeKey] = modeVal;
+      if (colorVal !== undefined) patch[colorKey] = colorVal;
+      this._updateConfig(patch);
+    };
+    (root || this).querySelectorAll('.cpce-bg-mode').forEach(el => el.addEventListener('change', () => {
+      const mode = el.value;
+      // Seed the color for the newly-selected mode so switching never blanks it.
+      const colorVal = mode === 'transparent' ? undefined
+        : mode === 'theme' ? (el.dataset.bgTheme || 'var(--primary-color)')
+        : mode === 'css' ? (el.dataset.bgCss || 'currentColor')
+        : (el.dataset.bgHex || '#1c1c1c');
+      write(el, mode, colorVal);
+      this._render();   // structural: swap the second field
+    }));
+    (root || this).querySelectorAll('.cpce-bg-swatch').forEach(el => el.addEventListener('input', () => write(el, undefined, el.value)));
+    (root || this).querySelectorAll('.cpce-bg-theme').forEach(el => el.addEventListener('change', () => write(el, undefined, el.value)));
+    (root || this).querySelectorAll('.cpce-bg-css').forEach(el => el.addEventListener('input', () => write(el, undefined, el.value)));
+  }
+
+  // Divider-scoped four-mode color control. Dividers write to a divider section via
+  // patchSection(id, {key: value}); the existing per-key .cpce-div-*-color handler drives the Custom
+  // swatch. This sits inside the divider's own domain mode select (line/text/theme/fixed) — it only
+  // renders in the 'fixed' branch — so it offers no 'default' mode (the domain select owns that).
+  // `swatchHtml` is the original .cpce-div-*-color swatch verbatim.
+  _divColorField(did, key, cur, swatchHtml, seedHex) {
+    cur = cur == null ? '' : String(cur);
+    const mode = this._colorMode(cur);
+    const hex = /^#[0-9a-fA-F]{6}$/.test(cur) ? cur : (seedHex || '#888888');
+    const themeVal = mode === 'theme' ? cur : 'var(--primary-text-color)';
+    const cssVal = (mode === 'css' && cur) ? cur : 'currentColor';
+    const baseModes = this._COLOR_MODES.filter(([v]) => v !== 'default');
+    const d = `data-id="${escapeHtml(did)}" data-div-key="${escapeHtml(key)}"`;
+    let valField = '';
+    if (mode === 'custom') valField = swatchHtml;
+    else if (mode === 'theme') valField = `<select class="cpce-div-color-theme" ${d} title="Follows the HA theme">${this._atOpts(this._AT_THEME_COLORS, themeVal)}</select>`;
+    else if (mode === 'css') valField = `<input type="text" class="cpce-div-color-css" ${d} value="${escapeHtml(cur)}" placeholder="e.g. tomato" style="width:110px;" title="Any CSS color" />`;
+    return `<span class="cpce-fb-color-field"><select class="cpce-div-color-4mode" ${d} data-div-hex="${hex}" data-div-theme="${escapeHtml(themeVal)}" data-div-css="${escapeHtml(cssVal)}">${this._atOpts(baseModes, mode)}</select>${valField}</span>`;
+  }
+  // Handlers for _divColorField — write through patchSection (passed in from the divider wiring).
+  _wireDivColorFields(panel, patchSection) {
+    panel.querySelectorAll('.cpce-div-color-4mode').forEach(el => {
+      el.addEventListener('change', () => {
+        const id = el.dataset.id, key = el.dataset.divKey, mode = el.value;
+        const value = mode === 'theme' ? (el.dataset.divTheme || 'var(--primary-text-color)')
+          : mode === 'css' ? (el.dataset.divCss || 'currentColor')
+          : (el.dataset.divHex || '#888888');
+        patchSection(id, { [key]: value });
+        this._render();   // structural: swap the value field
+      });
+    });
+    panel.querySelectorAll('.cpce-div-color-theme').forEach(el =>
+      el.addEventListener('change', () => { patchSection(el.dataset.id, { [el.dataset.divKey]: el.value }); this._render(); }));
+    panel.querySelectorAll('.cpce-div-color-css').forEach(el =>
+      el.addEventListener('input', () => patchSection(el.dataset.id, { [el.dataset.divKey]: el.value })));
+  }
+
+  // Preset-scoped four-mode color control (per-button Fixed Button/Glow color). Writes to
+  // config.presets[index][key]. The Custom swatch keeps its own per-key handler. noDefault: these
+  // only render when their "Fixed …" checkbox is on, so the value is always a chosen color.
+  _presetColorField(index, key, cur, swatchHtml, seedHex) {
+    cur = cur == null ? '' : String(cur);
+    const mode = this._colorMode(cur);
+    const hex = /^#[0-9a-fA-F]{6}$/.test(cur) ? cur : (seedHex || '#2196F3');
+    const themeVal = mode === 'theme' ? cur : 'var(--primary-color)';
+    const cssVal = (mode === 'css' && cur) ? cur : 'currentColor';
+    const baseModes = this._COLOR_MODES.filter(([v]) => v !== 'default');
+    const d = `data-pc-index="${index}" data-pc-key="${escapeHtml(key)}"`;
+    let valField = '';
+    if (mode === 'custom') valField = swatchHtml;
+    else if (mode === 'theme') valField = `<select class="cpce-pc-theme" ${d} title="Follows the HA theme">${this._atOpts(this._AT_THEME_COLORS, themeVal)}</select>`;
+    else if (mode === 'css') valField = `<input type="text" class="cpce-pc-css" ${d} value="${escapeHtml(cur)}" placeholder="e.g. tomato" style="width:110px;" title="Any CSS color" />`;
+    return `<div class="cpce-row cpce-ed-color-field"><select class="cpce-pc-mode" ${d} data-pc-hex="${hex}" data-pc-theme="${escapeHtml(themeVal)}" data-pc-css="${escapeHtml(cssVal)}">${this._atOpts(baseModes, mode)}</select>${valField}</div>`;
+  }
+  _wirePresetColorFields(container) {
+    const writePc = (el) => {
+      const index = Number(el.dataset.pcIndex), key = el.dataset.pcKey;
+      let value;
+      if (el.classList.contains('cpce-pc-mode')) {
+        const mode = el.value;
+        value = mode === 'theme' ? (el.dataset.pcTheme || 'var(--primary-color)')
+          : mode === 'css' ? (el.dataset.pcCss || 'currentColor')
+          : (el.dataset.pcHex || '#2196F3');
+      } else value = el.value;
+      const presets = [...(this._config.presets || [])];
+      presets[index] = { ...presets[index], [key]: value };
+      this._updateConfig({ presets });
+    };
+    container.querySelectorAll('.cpce-pc-mode').forEach(el => el.addEventListener('change', () => { writePc(el); this._render(); }));
+    container.querySelectorAll('.cpce-pc-theme').forEach(el => el.addEventListener('change', () => writePc(el)));
+    container.querySelectorAll('.cpce-pc-css').forEach(el => el.addEventListener('input', () => writePc(el)));
+  }
+
   // A row of removable chips for a set of selected ids. `kind` = on|off|scene (chip color).
   // `removeCls` names the ✕ button class the wiring listens on.
   _renderChips(ids, kind, removeCls) {
@@ -6784,8 +7195,13 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const opts = curGroup ? curGroup.options : [];
     const curOpt = s.default_scene_option || '';
     const optionList = (curOpt && !opts.includes(curOpt)) ? [curOpt, ...opts] : opts;
+    // Copy differs by section type: buttons reset on press (with per-button exceptions); sliders reset
+    // whenever any slider here is moved (a drag is always a room divergence).
+    const hint = s.type === 'sliders'
+      ? 'When any slider here is <strong>moved</strong>, set this Scene Group to the option below — so the active scene de-highlights once the room diverges. Leave as “(none)” to disable.'
+      : 'When a color/profile/Off button here is <strong>pressed</strong>, set this Scene Group to the option below — so the active scene de-highlights once the room diverges. Scene buttons (and any button that sets this group itself) are unaffected. Leave as “(none)” to disable.';
     return `<div class="cpce-sub-title">Default scene reset</div>
-      <div class="cpce-hint">When a color/profile/Off button here is <strong>pressed</strong>, set this Scene Group to the option below — so the active scene de-highlights once the room diverges. Scene buttons (and any button that sets this group itself) are unaffected. Leave as “(none)” to disable.</div>
+      <div class="cpce-hint">${hint}</div>
       <div class="cpce-row"><label class="lbl">Scene Group</label>
         <select class="cpce-sn-default-group" data-id="${escapeHtml(s.id)}">
           <option value="">(none — no reset)</option>
@@ -6917,7 +7333,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
         <div class="cpce-sub-title">Glow</div>
         <div class="cpce-check"><input type="checkbox" class="fb-toggle" data-fb-id="${escapeHtml(id)}" data-fb-key="glow" ${chk(!!g)}><label>Enable glow</label></div>
         ${g ? `<div class="cpce-row"><label class="lbl">Color</label>
-            <input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="glow.color" value="${/^#/.test(g.color||'')?g.color:'#2196F3'}" ${g.follow_icon?'disabled':''}>
+            ${g.follow_icon
+              ? `<input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="glow.color" value="${/^#[0-9a-f]{6}$/i.test(g.color||'')?g.color:'#2196F3'}" disabled>`
+              : this._fbColorField(id, 'glow.color', 'Color', g.color, `<input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="glow.color" value="${/^#[0-9a-f]{6}$/i.test(g.color||'')?g.color:'#2196F3'}">`, { seedHex: '#2196F3' })}
             <label class="cpce-check-inline"><input type="checkbox" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="glow.follow_icon" ${chk(g.follow_icon)}> Follow icon color</label></div>
           <div class="cpce-check"><input type="checkbox" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="glow.borders_only" ${chk(g.borders_only)}><label>Borders only</label></div>
           ${this._fbSlider(id, 'glow.intensity', 'Intensity', g.intensity ?? 1.0, 0.25, 3, 0.05)}` : ''}
@@ -6925,7 +7343,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
         <div class="cpce-sub-title">Drop Shadow</div>
         <div class="cpce-check"><input type="checkbox" class="fb-toggle" data-fb-id="${escapeHtml(id)}" data-fb-key="shadow" ${chk(!!sh)}><label>Enable drop-shadow</label></div>
         ${sh ? `<div class="cpce-row"><label class="lbl">Color</label>
-            <input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="shadow.color" value="${/^#/.test(sh.color||'')?sh.color:'#000000'}" ${sh.follow_icon?'disabled':''}>
+            ${sh.follow_icon
+              ? `<input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="shadow.color" value="${/^#[0-9a-f]{6}$/i.test(sh.color||'')?sh.color:'#000000'}" disabled>`
+              : this._fbColorField(id, 'shadow.color', 'Color', sh.color, `<input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="shadow.color" value="${/^#[0-9a-f]{6}$/i.test(sh.color||'')?sh.color:'#000000'}">`, { seedHex: '#000000' })}
             <label class="cpce-check-inline"><input type="checkbox" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="shadow.follow_icon" ${chk(sh.follow_icon)}> Follow icon color</label></div>
           ${this._fbSlider(id, 'shadow.x', 'X offset (px)', sh.x ?? 0, -40, 40, 1)}
           ${this._fbSlider(id, 'shadow.y', 'Y offset (px)', sh.y ?? 4, -40, 40, 1)}
@@ -6936,7 +7356,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
         <div class="cpce-sub-title">Border</div>
         <div class="cpce-check"><input type="checkbox" class="fb-toggle" data-fb-id="${escapeHtml(id)}" data-fb-key="border" ${chk(!!bd)}><label>Enable border</label></div>
         ${bd ? `<div class="cpce-row"><label class="lbl">Color</label>
-            <input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="border.color" value="${/^#/.test(bd.color||'')?bd.color:'#2196F3'}" ${bd.follow_icon?'disabled':''}>
+            ${bd.follow_icon
+              ? `<input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="border.color" value="${/^#[0-9a-f]{6}$/i.test(bd.color||'')?bd.color:'#2196F3'}" disabled>`
+              : this._fbColorField(id, 'border.color', 'Color', bd.color, `<input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="border.color" value="${/^#[0-9a-f]{6}$/i.test(bd.color||'')?bd.color:'#2196F3'}">`, { seedHex: '#2196F3' })}
             <label class="cpce-check-inline"><input type="checkbox" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="border.follow_icon" ${chk(bd.follow_icon)}> Follow icon color</label></div>
           ${this._fbSlider(id, 'border.width', 'Width (px)', bd.width ?? 1, 1, 8, 1)}
           ${this._fbSlider(id, 'border.radius', 'Radius (px)', bd.radius ?? 12, 0, 24, 1)}
@@ -6949,13 +7371,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
         <div class="cpce-sub-title">Background</div>
         <div class="cpce-check"><input type="checkbox" class="fb-toggle" data-fb-id="${escapeHtml(id)}" data-fb-key="background" ${chk(!!bg)}><label>Set background</label></div>
-        ${bg ? `<div class="cpce-row"><label class="lbl">Mode</label>
-            <select class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="background.mode">
-              <option value="custom" ${bgMode==='custom'?'selected':''}>Custom color</option>
-              <option value="transparent" ${bgMode==='transparent'?'selected':''}>Transparent</option>
-              <option value="theme" ${bgMode==='theme'?'selected':''}>Theme (inherit)</option>
-            </select>
-            ${bgMode==='custom'?`<input type="color" class="fb-input" data-fb-id="${escapeHtml(id)}" data-fb-path="background.color" value="${/^#/.test((bg&&bg.color)||'')?bg.color:'#1c1c1c'}">`:''}</div>` : ''}
+        ${bg ? this._bgColorControl('background.mode', 'background.color', 'Background', bgMode, (bg&&bg.color)||'', { scope: 'frame', fbId: id, seedHex: '#1c1c1c', themeLabel: 'Theme (inherit)' }) : ''}
 
         <div class="cpce-sub-title">Edges (Border / Gradient)</div>
         <div class="cpce-hint">Each edge is a <b>Solid line</b> or a <b>Gradient</b> (multi-stop; a stop color of <code>match</code> follows the border/icon color). Set thickness, pick a pattern, or edit stops by hand.</div>
@@ -7156,11 +7572,23 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // Enable-checkbox + color picker for a "Not set"-capable color output. Unchecked
   // = the key is omitted (Not set). data-hr-path names the output key.
   _hdrColorField(slug, idx, pathKey, label, val) {
+    // Four-mode control (§3): 'default' (Not set → key omitted) / Theme / Custom / CSS. The header
+    // rule's "Not set" state IS the four-mode 'default', so no separate enable checkbox is needed.
+    const cur = val == null ? '' : String(val);
+    const mode = this._colorMode(cur);
+    const hex = /^#[0-9a-fA-F]{6}$/.test(cur) ? cur : '#2196F3';
+    const themeVal = mode === 'theme' ? cur : 'var(--primary-color)';
+    const cssVal = (mode === 'css' && cur) ? cur : 'currentColor';
+    const modes = this._COLOR_MODES.map(([v, l]) => [v, v === 'default' ? 'Not set' : l]);
     const ds = `data-hdr-slug="${escapeHtml(slug)}" data-hr-idx="${idx}" data-hr-path="${pathKey}"`;
-    const on = !!(val && String(val).length);
+    let valField = '';
+    if (mode === 'custom') valField = `<input type="color" class="hr-color" ${ds} value="${hex}">`;
+    else if (mode === 'theme') valField = `<select class="hr-color-theme" ${ds} title="Follows the HA theme">${this._atOpts(this._AT_THEME_COLORS, themeVal)}</select>`;
+    else if (mode === 'css') valField = `<input type="text" class="hr-color-css" ${ds} value="${escapeHtml(cur)}" placeholder="e.g. tomato" style="width:110px;" title="Any CSS color" />`;
     return `<div class="cpce-row" style="gap:8px;">
-      <label class="cpce-inline-check"><input type="checkbox" class="hr-color-enable" ${ds} ${on ? 'checked' : ''}> ${label}</label>
-      ${on ? `<input type="color" class="hr-color" ${ds} value="${/^#[0-9a-f]{6}$/i.test(val || '') ? val : '#2196F3'}">` : '<span class="cpce-hint">Not set</span>'}
+      <label class="lbl">${label}</label>
+      <select class="hr-color-mode" ${ds} data-hr-hex="${hex}" data-hr-theme="${escapeHtml(themeVal)}" data-hr-css="${escapeHtml(cssVal)}">${this._atOpts(modes, mode)}</select>
+      ${valField}
     </div>`;
   }
 
@@ -7603,7 +8031,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         : `<div class="cpce-divcfg-row"><label>Line Color<select class="cpce-div-color-mode" data-id="${did}">
               <option value="theme" ${!hasColor?'selected':''}>Theme default</option>
               <option value="fixed" ${hasColor?'selected':''}>Custom color</option>
-            </select>${hasColor ? `<input type="color" class="cpce-div-color" data-id="${did}" value="${s.color}">` : ''}</label>
+            </select>${hasColor ? this._divColorField(did, 'color', s.color, `<input type="color" class="cpce-div-color" data-id="${did}" value="${/^#[0-9a-f]{6}$/i.test(s.color||'')?s.color:'#888888'}">`, '#888888') : ''}</label>
           </div>`}
       <div class="cpce-divcfg-slider"><label><span>Thickness (px):</span></label><input type="range" class="cpce-div-thickness" data-id="${did}" min="1" max="20" value="${thickness}"><span class="cpce-strength-val">${thickness}px</span></div>
       <div class="cpce-divcfg-slider"><label><span>Length (%):</span></label><input type="range" class="cpce-div-length" data-id="${did}" min="5" max="100" value="${length}"><span class="cpce-strength-val">${length}%</span></div>`;
@@ -7636,7 +8064,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <option value="line" ${tm==='line'?'selected':''}>Line color</option>
           <option value="theme" ${tm==='theme'?'selected':''}>Theme</option>
           <option value="fixed" ${tm==='fixed'?'selected':''}>Custom color</option>
-        </select>${tm==='fixed' ? `<input type="color" class="cpce-div-text-color" data-id="${did}" value="${/^#[0-9a-f]{6}$/i.test(s.text_color||'')?s.text_color:'#ffffff'}">` : ''}</label>
+        </select>${tm==='fixed' ? this._divColorField(did, 'text_color', s.text_color, `<input type="color" class="cpce-div-text-color" data-id="${did}" value="${/^#[0-9a-f]{6}$/i.test(s.text_color||'')?s.text_color:'#ffffff'}">`, '#ffffff') : ''}</label>
       </div>
       ${tm==='line' && s.gradient ? `<div class="cpce-hint">A gradient line has no single color — "Line color" uses the first solid gradient stop. For an exact color, choose <strong>Custom color</strong>.</div>` : ''}`;
 
@@ -7650,7 +8078,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <option value="text" ${im==='text'?'selected':''}>Match text color</option>
           <option value="theme" ${im==='theme'?'selected':''}>Theme</option>
           <option value="fixed" ${im==='fixed'?'selected':''}>Custom color</option>
-        </select>${im==='fixed' ? `<input type="color" class="cpce-div-icon-color" data-id="${did}" value="${/^#[0-9a-f]{6}$/i.test(s.icon_color||'')?s.icon_color:'#ffffff'}">` : ''}</label>
+        </select>${im==='fixed' ? this._divColorField(did, 'icon_color', s.icon_color, `<input type="color" class="cpce-div-icon-color" data-id="${did}" value="${/^#[0-9a-f]{6}$/i.test(s.icon_color||'')?s.icon_color:'#ffffff'}">`, '#ffffff') : ''}</label>
       </div>`;
 
     return `
@@ -8030,12 +8458,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
     return `
       <div class="cpce-check"><input type="checkbox" class="cpce-btnstyle-enable" data-index="${index}" ${bodyOn?'checked':''}><label>Fixed button color</label></div>
       ${bodyOn ? `
-        <div class="cpce-row"><label class="lbl">Button Color</label><input type="color" class="cpce-btnstyle-color" data-index="${index}" value="${preset.button_style_color}"></div>
+        <div class="cpce-row"><label class="lbl">Button Color</label>${this._presetColorField(index, 'button_style_color', preset.button_style_color, `<input type="color" class="cpce-btnstyle-color" data-index="${index}" value="${/^#[0-9a-f]{6}$/i.test(preset.button_style_color||'')?preset.button_style_color:'#2196F3'}">`, '#2196F3')}</div>
         <div class="cpce-hint">The button body stays this exact color — independent of the glow.</div>
       ` : ''}
       <div class="cpce-check"><input type="checkbox" class="cpce-btnglow-enable" data-index="${index}" ${glowOn?'checked':''}><label>Fixed glow color</label></div>
       ${glowOn ? `
-        <div class="cpce-row"><label class="lbl">Glow Color</label><input type="color" class="cpce-btnglow-color" data-index="${index}" value="${preset.button_glow_style_color}"></div>
+        <div class="cpce-row"><label class="lbl">Glow Color</label>${this._presetColorField(index, 'button_glow_style_color', preset.button_glow_style_color, `<input type="color" class="cpce-btnglow-color" data-index="${index}" value="${/^#[0-9a-f]{6}$/i.test(preset.button_glow_style_color||'')?preset.button_glow_style_color:'#2196F3'}">`, '#2196F3')}</div>
         <div class="cpce-hint">The glow stays this exact color — independent of the button body.</div>
       ` : ''}
       ${!bodyOn && !glowOn ? `<div class="cpce-hint">Off: the button body follows the live color when active; the glow follows the live color.</div>` : ''}
@@ -9176,6 +9604,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
         presets[index] = { ...presets[index], button_glow_style_color: glowColor.value };
         this._updateConfig({ presets });
       });
+      // Four-mode (theme/css) controls for the per-button Fixed Button/Glow colors.
+      this._wirePresetColorFields(container);
 
       // Fixture Profile selector (Mode = Fixture Profile): "" clears the ref (button applies
       // nothing until one is chosen), lib:<slug> references a shared profile.
@@ -9594,10 +10024,61 @@ class ColorLightManagerCardEditor extends HTMLElement {
         const cb = el.querySelector(sel);
         if (cb) cb.addEventListener('change', () => { updateOne(id, { sliders: readSliders() }); this._render(); });
       });
+      // "Only control lights that are on" (static) + "show live checkbox on card" (toggle).
+      // Byte-stable: emit these keys only when true (delete when off) so legacy configs are unchanged.
+      const setFlag = (key, on, rerender) => {
+        const sections = getSections().map(s => {
+          if (s.id !== id) return s;
+          const next = { ...s }; if (on) next[key] = true; else delete next[key]; return next;
+        });
+        this._updateSections(sections);
+        if (rerender) this._render();
+      };
+      const onlyOnCb = el.querySelector('.cpce-ss-onlyon');
+      if (onlyOnCb) onlyOnCb.addEventListener('change', () => setFlag('on_lights_only', onlyOnCb.checked, false));
+      const onlyOnToggleCb = el.querySelector('.cpce-ss-onlyon-toggle');
+      if (onlyOnToggleCb) onlyOnToggleCb.addEventListener('change', () => setFlag('on_lights_only_toggle', onlyOnToggleCb.checked, true));
+      // Live-checkbox placement / alignment / text style (only present when the toggle is on).
+      // Byte-stable: store non-default values only (delete a key when it returns to its default).
+      const setOpt = (key, val, def) => {
+        const sections = getSections().map(s => {
+          if (s.id !== id) return s;
+          const next = { ...s };
+          if (val === undefined || val === null || val === '' || val === def) delete next[key]; else next[key] = val;
+          return next;
+        });
+        this._updateSections(sections);
+      };
+      const posEl = el.querySelector('.cpce-ss-onlyon-pos');
+      if (posEl) posEl.addEventListener('change', () => setOpt('on_lights_only_label_position', posEl.value, 'top'));
+      const alignEl = el.querySelector('.cpce-ss-onlyon-align');
+      if (alignEl) alignEl.addEventListener('change', () => setOpt('on_lights_only_label_align', alignEl.value, 'left'));
+      this._wireTextStyleControls(el, `cpce-ss-onlyon-${id}`, (patch) => {
+        if ('size' in patch) setOpt('on_lights_only_font_size', patch.size, 12);
+        if ('weight' in patch) setOpt('on_lights_only_font_weight', patch.weight, '400');
+        if ('color' in patch) setOpt('on_lights_only_font_color', patch.color, '');
+      }, '#ffffff');
       // Target picker (scoped to this section's container) — two-checkbox any-light model.
       this._wireTargetPicker(el,
         () => getSections().find(s => s.id === id) || {},
         (patch) => { updateOne(id, patch); this._render(); });
+      // Default scene reset (group + option): a slider move here sets the group to the option below,
+      // de-highlighting the active scene. Same mechanism as buttons; wired here because slider
+      // sections have their own editor container.
+      const defGroupSel = el.querySelector('.cpce-sn-default-group');
+      if (defGroupSel) defGroupSel.addEventListener('change', () => {
+        const g = defGroupSel.value || undefined;
+        let opt;
+        if (g) {
+          const grp = this._allInputSelectEntities().find(x => x.entity === g);
+          const o = (grp && grp.options) || [];
+          opt = o.includes('-none-') ? '-none-' : (o[0] || '-none-');
+        }
+        updateOne(id, { default_scene_group: g, default_scene_option: g ? opt : undefined });
+        this._render();
+      });
+      const defOptSel = el.querySelector('.cpce-sn-default-option');
+      if (defOptSel) defOptSel.addEventListener('change', () => { updateOne(id, { default_scene_option: defOptSel.value || undefined }); this._render(); });
       // Per-section style: mode toggle (card default | custom) — seed slider_style
       // from the current resolved look on first switch to custom so it's a no-op change.
       const removeBtn = el.querySelector('.cpce-ss-remove');
@@ -9728,6 +10209,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
           flex:1; padding:var(--ltek-ctrl-pad); background:var(--secondary-background-color,#2a2a2a);
           border:1px solid var(--divider-color,#333); border-radius:var(--ltek-r-ctrl); color:var(--primary-text-color); font-size:var(--ltek-fs-body);
         }
+        /* Four-mode color control (§3): mode dropdown stays compact; the value field (theme select
+           / CSS text / swatch) takes the rest of the row. Swatch keeps its fixed size. */
+        .cpce-ed-color-field .cpce-ed-color-mode { flex:0 0 auto; min-width:120px; }
+        .cpce-ed-color-field input[type="color"] { flex:0 0 auto; }
         .cpce-row input[type="range"] { flex:1; min-width:100px; accent-color:var(--ltek-c-accent); cursor:pointer; }
         .cpce-check { display:flex; align-items:center; gap:var(--ltek-sp-2); padding:var(--ltek-sp-1) 0; color:var(--ltek-c-label); font-size:var(--ltek-fs-body); }
         .cpce-inline-check { display:inline-flex; align-items:center; gap:var(--ltek-sp-1); color:var(--primary-text-color); font-size:var(--ltek-fs-body); margin-right:8px; }
@@ -10086,14 +10571,14 @@ class ColorLightManagerCardEditor extends HTMLElement {
                 <option value="active" ${cfg.icon_color_mode==='active'?'selected':''}>Last-pressed button's color</option>
               </select>
             </div>
-            ${cfg.icon_color_mode !== 'light' ? `<div class="cpce-row"><label class="lbl">${cfg.icon_color_mode==='active'?'Fallback Color':'Fixed Icon Color'}</label><input type="color" id="cpce-icon-color" value="${cfg.icon_color || '#2196F3'}"></div>${cfg.icon_color_mode==='active'?`<div class="cpce-hint">Used until a button is pressed.</div>`:''}` : `
+            ${cfg.icon_color_mode !== 'light' ? `${this._edColorField('icon_color', cfg.icon_color_mode==='active'?'Fallback Color':'Fixed Icon Color', cfg.icon_color, `<input type="color" id="cpce-icon-color" value="${/^#[0-9a-f]{6}$/i.test(cfg.icon_color||'')?cfg.icon_color:'#2196F3'}">`, { noDefault: true, seedHex: '#2196F3' })}${cfg.icon_color_mode==='active'?`<div class="cpce-hint">Used until a button is pressed.</div>`:''}` : `
               <div class="cpce-row"><label class="lbl">When Light Off</label>
                 <select id="cpce-icon-off-mode">
                   <option value="theme" ${cfg.icon_off_color_mode!=='fixed'?'selected':''}>Theme default</option>
                   <option value="fixed" ${cfg.icon_off_color_mode==='fixed'?'selected':''}>Specific color</option>
                 </select>
               </div>
-              ${cfg.icon_off_color_mode === 'fixed' ? `<div class="cpce-row"><label class="lbl">Off Color</label><input type="color" id="cpce-icon-off-color" value="${cfg.icon_off_color || '#666666'}"></div>` : ''}
+              ${cfg.icon_off_color_mode === 'fixed' ? this._edColorField('icon_off_color', 'Off Color', cfg.icon_off_color, `<input type="color" id="cpce-icon-off-color" value="${/^#[0-9a-f]{6}$/i.test(cfg.icon_off_color||'')?cfg.icon_off_color:'#666666'}">`, { noDefault: true, seedHex: '#666666' }) : ''}
             `}
           ` : `<div class="cpce-hint">Off uses the theme's default icon color.</div>`}
 
@@ -10101,16 +10586,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
           ${this._renderCardHeaderApply()}`)}
 
           ${this._subpanel('card-bg', 'Background', `
-          <div class="cpce-row">
-            <label class="lbl">Card Background</label>
-            <select id="cpce-card-bg-mode">
-              <option value="theme" ${(cfg.card_bg_mode||'theme')==='theme'?'selected':''}>Theme Default</option>
-              <option value="transparent" ${cfg.card_bg_mode==='transparent'?'selected':''}>Transparent</option>
-              <option value="custom" ${cfg.card_bg_mode==='custom'?'selected':''}>Custom Color</option>
-            </select>
-          </div>
-          ${cfg.card_bg_mode === 'custom' ? `<div class="cpce-row"><label class="lbl">Custom Color</label><input type="color" id="cpce-card-bg-color" value="${cfg.card_bg_color || '#1c1c1c'}"></div>` : ''}
-          <div class="cpce-hint">Transparent forces the background to be invisible; Theme Default uses whatever color your Home Assistant theme applies to cards.</div>`)}
+          ${this._bgColorControl('card_bg_mode', 'card_bg_color', 'Card Background', cfg.card_bg_mode || 'theme', cfg.card_bg_color, { seedHex: '#1c1c1c', themeLabel: 'Theme default' })}
+          <div class="cpce-hint">Transparent forces the background to be invisible; Theme default uses whatever color your Home Assistant theme applies to cards. Custom color / Custom CSS set a specific background.</div>`)}
 
           ${this._subpanel('card-frame', 'Card Frame', this._renderCardFrameApply())}
 
@@ -10266,6 +10743,27 @@ class ColorLightManagerCardEditor extends HTMLElement {
                   <label class="cpce-inline-check"><input type="checkbox" class="cpce-ss-rgb" ${sel.rgb?'checked':''}> RGB</label>
                 </div>
                 ${this._renderTargetPicker(s, `data-ss-target="${s.id}"`)}
+                <div class="cpce-check" style="margin-top:8px;"><input type="checkbox" class="cpce-ss-onlyon" ${s.on_lights_only?'checked':''}><label>Only Control Lights Currently On</label></div>
+                <div class="cpce-hint">When on, this section's sliders adjust only the target lights that are already on — they won't turn off lights on.</div>
+                <div class="cpce-check"><input type="checkbox" class="cpce-ss-onlyon-toggle" ${s.on_lights_only_toggle?'checked':''}><label>Show an "Only Control Lights Currently On" checkbox on the card</label></div>
+                <div class="cpce-hint">Lets viewers flip the above on/off live in this section. Its starting state follows the setting above.</div>
+                ${s.on_lights_only_toggle ? `
+                <div class="cpce-row"><label class="lbl">Checkbox Position</label>
+                  <select class="cpce-ss-onlyon-pos">
+                    <option value="top" ${(s.on_lights_only_label_position||'top')==='top'?'selected':''}>Top</option>
+                    <option value="bottom" ${s.on_lights_only_label_position==='bottom'?'selected':''}>Bottom</option>
+                  </select>
+                </div>
+                <div class="cpce-row"><label class="lbl">Alignment</label>
+                  <select class="cpce-ss-onlyon-align">
+                    <option value="left" ${(s.on_lights_only_label_align||'left')==='left'?'selected':''}>Left</option>
+                    <option value="center" ${s.on_lights_only_label_align==='center'?'selected':''}>Center</option>
+                    <option value="right" ${s.on_lights_only_label_align==='right'?'selected':''}>Right</option>
+                  </select>
+                </div>
+                ${this._textStyleControls(`cpce-ss-onlyon-${s.id}`, { size: s.on_lights_only_font_size, weight: s.on_lights_only_font_weight || '400', color: s.on_lights_only_font_color }, 12)}
+                ` : ''}
+                ${this._renderSectionDefaultScene(s)}
                 <div class="cpce-hint">Slider appearance (orientation, size, handle, gradient, text) is set once for all slider sections in the <strong>Sliders</strong> panel below.</div>
               </div>
             </div>`;
@@ -10314,7 +10812,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           `)}
 
           ${this._subpanel('sl-handle', 'Slider Handle', `
-          <div class="cpce-row"><label class="lbl">Handle Color</label><input type="color" id="cpce-handle-color" value="${cfg.slider_handle_color || '#ffffff'}"></div>
+          ${this._edColorField('slider_handle_color', 'Handle Color', cfg.slider_handle_color, `<input type="color" id="cpce-handle-color" value="${/^#[0-9a-f]{6}$/i.test(cfg.slider_handle_color||'')?cfg.slider_handle_color:'#ffffff'}">`, { defaultLabel: 'Default (white)', seedHex: '#ffffff' })}
           <div class="cpce-row"><label class="lbl">Handle Opacity</label><input type="range" id="cpce-handle-opacity" min="10" max="100" value="${Number(cfg.slider_handle_opacity)||100}"><span class="cpce-strength-val" id="cpce-handle-opacity-val">${Number(cfg.slider_handle_opacity)||100}%</span></div>
           <div class="cpce-row"><label class="lbl">Handle Shape</label>
             <select id="cpce-handle-shape">
@@ -10335,13 +10833,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
             <div class="cpce-row"><label class="lbl">Slider Length</label><input type="range" id="cpce-slider-length-horizontal" min="20" max="100" value="${Number(cfg.slider_length_horizontal)||100}"><span class="cpce-strength-val" id="cpce-slider-length-horizontal-val">${Number(cfg.slider_length_horizontal)||100}%</span></div>
           `}
           <div class="cpce-row"><label class="lbl">Slider Text Size</label><input type="range" id="cpce-slider-font-size" min="8" max="28" value="${Number(cfg.slider_font_size)||13}"><span class="cpce-strength-val" id="cpce-slider-font-size-val">${Number(cfg.slider_font_size)||13}px</span></div>
-          <div class="cpce-row"><label class="lbl">Slider Text Color</label>
-            <select id="cpce-slider-text-color-mode">
-              <option value="theme" ${!cfg.slider_text_color?'selected':''}>Theme default</option>
-              <option value="fixed" ${cfg.slider_text_color?'selected':''}>Custom color</option>
-            </select>
-          </div>
-          ${cfg.slider_text_color ? `<div class="cpce-row"><label class="lbl">Custom Text Color</label><input type="color" id="cpce-slider-text-color" value="${cfg.slider_text_color}"></div>` : ''}
+          ${this._edColorField('slider_text_color', 'Slider Text Color', cfg.slider_text_color, `<input type="color" id="cpce-slider-text-color" value="${/^#[0-9a-f]{6}$/i.test(cfg.slider_text_color||'')?cfg.slider_text_color:'#ffffff'}">`, { defaultLabel: 'Theme default', seedHex: '#ffffff' })}
           <div class="cpce-row"><label class="lbl">Corner Radius</label><input type="range" id="cpce-slider-border-radius" min="0" max="30" value="${Number(cfg.slider_border_radius)??10}"><span class="cpce-strength-val" id="cpce-slider-border-radius-val">${Number(cfg.slider_border_radius)??10}px</span></div>
           `)}
 
@@ -10507,7 +10999,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
                 <option value="none" ${cfg.button_border_color_mode==='none'?'selected':''}>None (disable)</option>
               </select>
             </div>
-            ${(cfg.button_border_color_mode||'fixed')==='fixed' ? `<div class="cpce-row"><label class="lbl">Border Color</label><input type="color" id="cpce-button-border-color" value="${cfg.button_border_color || '#2196F3'}"></div>` : ''}
+            ${(cfg.button_border_color_mode||'fixed')==='fixed' ? this._edColorField('button_border_color', 'Border Color', cfg.button_border_color, `<input type="color" id="cpce-button-border-color" value="${/^#[0-9a-f]{6}$/i.test(cfg.button_border_color||'')?cfg.button_border_color:'#2196F3'}">`, { scope: 'builder', noDefault: true, seedHex: '#2196F3' }) : ''}
             <div class="cpce-row"><label class="lbl">Border Weight</label><input type="range" id="cpce-button-border-width" min="1" max="10" value="${Number(cfg.button_border_width)||1}"><span class="cpce-strength-val" id="cpce-button-border-width-val">${Number(cfg.button_border_width)||1}px</span></div>
             <div class="cpce-row"><label class="lbl">Sides</label><span class="cpce-side-toggles">
               ${(() => { const on = buttonBorderSides(cfg); return [['top','Top'],['bottom','Bottom'],['left','Left'],['right','Right']].map(([s,l])=>`<label><input type="checkbox" class="cpce-button-border-side" data-side="${s}" ${on.includes(s)?'checked':''}> ${l}</label>`).join(''); })()}
@@ -10535,7 +11027,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
                 <option value="none" ${cfg.button_glow_color_mode==='none'?'selected':''}>None (disable)</option>
               </select>
             </div>
-            ${(cfg.button_glow_color_mode||'fixed')==='fixed' ? `<div class="cpce-row"><label class="lbl">Glow Color</label><input type="color" id="cpce-button-glow-color" value="${cfg.button_glow_color || '#2196F3'}"></div>` : ''}
+            ${(cfg.button_glow_color_mode||'fixed')==='fixed' ? this._edColorField('button_glow_color', 'Glow Color', cfg.button_glow_color, `<input type="color" id="cpce-button-glow-color" value="${/^#[0-9a-f]{6}$/i.test(cfg.button_glow_color||'')?cfg.button_glow_color:'#2196F3'}">`, { scope: 'builder', noDefault: true, seedHex: '#2196F3' }) : ''}
             <div class="cpce-row"><label class="lbl">Glow Blur</label><input type="range" id="cpce-button-glow-blur" min="0" max="40" value="${Number.isFinite(Number(cfg.button_glow_blur))?Number(cfg.button_glow_blur):12}"><span class="cpce-strength-val" id="cpce-button-glow-blur-val">${Number.isFinite(Number(cfg.button_glow_blur))?Number(cfg.button_glow_blur):12}px</span></div>
             <div class="cpce-row"><label class="lbl">Glow Spread</label><input type="range" id="cpce-button-glow-spread" min="-10" max="20" value="${Number.isFinite(Number(cfg.button_glow_spread))?Number(cfg.button_glow_spread):2}"><span class="cpce-strength-val" id="cpce-button-glow-spread-val">${Number.isFinite(Number(cfg.button_glow_spread))?Number(cfg.button_glow_spread):2}px</span></div>
             <div class="cpce-row"><label class="lbl">Glow Opacity</label><input type="range" id="cpce-button-glow-opacity" min="0" max="100" value="${Math.round((Number.isFinite(Number(cfg.button_glow_opacity))?Number(cfg.button_glow_opacity):0.5)*100)}"><span class="cpce-strength-val" id="cpce-button-glow-opacity-val">${Math.round((Number.isFinite(Number(cfg.button_glow_opacity))?Number(cfg.button_glow_opacity):0.5)*100)}%</span></div>
@@ -10549,7 +11041,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
           ${this._btnGroupSubpanel('btn-shadow', 'shadow', 'Drop Shadow', `
           <div class="cpce-hint">A plain elevation shadow on each button, separate from the colored glow above.</div>
-          <div class="cpce-row"><label class="lbl">Shadow Color</label><input type="color" id="cpce-button-shadow-color" value="${cfg.button_shadow_color || '#000000'}"><label class="cpce-inline-check"><input type="checkbox" id="cpce-button-shadow-enabled" ${cfg.button_shadow_enabled?'checked':''}> Enable</label></div>
+          <div class="cpce-row"><label class="lbl">Drop Shadow</label><label class="cpce-inline-check"><input type="checkbox" id="cpce-button-shadow-enabled" ${cfg.button_shadow_enabled?'checked':''}> Enable</label></div>
+          ${this._edColorField('button_shadow_color', 'Shadow Color', cfg.button_shadow_color, `<input type="color" id="cpce-button-shadow-color" value="${/^#[0-9a-f]{6}$/i.test(cfg.button_shadow_color||'')?cfg.button_shadow_color:'#000000'}">`, { scope: 'builder', noDefault: true, seedHex: '#000000' })}
           ${cfg.button_shadow_enabled ? `
             <div class="cpce-row"><label class="lbl">X Offset</label><input type="range" id="cpce-button-shadow-x" min="-20" max="20" value="${Number(cfg.button_shadow_x)||0}"><span class="cpce-strength-val" id="cpce-button-shadow-x-val">${Number(cfg.button_shadow_x)||0}px</span></div>
             <div class="cpce-row"><label class="lbl">Y Offset</label><input type="range" id="cpce-button-shadow-y" min="-20" max="20" value="${Number(cfg.button_shadow_y)||4}"><span class="cpce-strength-val" id="cpce-button-shadow-y-val">${Number(cfg.button_shadow_y)||4}px</span></div>
@@ -10572,7 +11065,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
               <option value="fixed" ${cfg.button_name_color_mode==='fixed'?'selected':''}>Specific color</option>
             </select>
           </div>
-          ${cfg.button_name_color_mode==='fixed' ? `<div class="cpce-row"><label class="lbl">Name Color</label><input type="color" id="cpce-button-name-color" value="${cfg.button_name_color || '#2196F3'}"></div>` : ''}
+          ${cfg.button_name_color_mode==='fixed' ? this._edColorField('button_name_color', 'Name Color', cfg.button_name_color, `<input type="color" id="cpce-button-name-color" value="${/^#[0-9a-f]{6}$/i.test(cfg.button_name_color||'')?cfg.button_name_color:'#2196F3'}">`, { scope: 'builder', noDefault: true, seedHex: '#2196F3' }) : ''}
           <div class="cpce-check"><input type="checkbox" id="cpce-button-name-wrap" ${cfg.button_name_wrap?'checked':''}><label for="cpce-button-name-wrap">Word-wrap button names (multi-word names break to lines instead of widening)</label></div>
           <div class="cpce-row"><label class="lbl">Icon–Label Spacing</label><input type="range" id="cpce-button-icon-gap" min="0" max="24" value="${Number(cfg.button_icon_gap)??8}"><span class="cpce-strength-val" id="cpce-button-icon-gap-val">${Number(cfg.button_icon_gap)??8}px</span></div>`)}
 
@@ -10588,7 +11081,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
               <option value="none" ${cfg.button_icon_color_mode==='none'?'selected':''}>None (leave default)</option>
             </select>
           </div>
-          ${cfg.button_icon_color_mode==='fixed' ? `<div class="cpce-row"><label class="lbl">Icon Color</label><input type="color" id="cpce-button-icon-color" value="${cfg.button_icon_color || '#2196F3'}"></div>` : ''}`)}
+          ${cfg.button_icon_color_mode==='fixed' ? this._edColorField('button_icon_color', 'Icon Color', cfg.button_icon_color, `<input type="color" id="cpce-button-icon-color" value="${/^#[0-9a-f]{6}$/i.test(cfg.button_icon_color||'')?cfg.button_icon_color:'#2196F3'}">`, { scope: 'builder', noDefault: true, seedHex: '#2196F3' }) : ''}`)}
 
           ${this._btnGroupSubpanel('btn-sizing', 'sizing', 'Button Shape', `
           <div class="cpce-row"><label class="lbl">Corner Radius</label><input type="range" id="cpce-button-border-radius" min="0" max="40" value="${Number(cfg.button_border_radius)||10}"><span class="cpce-strength-val" id="cpce-button-border-radius-val">${Number(cfg.button_border_radius)||10}px</span></div>
@@ -10637,7 +11130,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       }
       if (fx.shadow) {
         const s = fx.shadow;
-        parts.push(`${s.x || 0}px ${s.y ?? 4}px ${s.blur ?? 12}px ${s.spread || 0}px ${ColorUtils.hexToRgba(s.follow_icon ? iconColor : (s.color || '#000000'), s.opacity ?? 0.35)}`);
+        parts.push(`${s.x || 0}px ${s.y ?? 4}px ${s.blur ?? 12}px ${s.spread || 0}px ${cssColorWithAlpha(s.follow_icon ? iconColor : (s.color || '#000000'), s.opacity ?? 0.35)}`);
       }
       el.style.boxShadow = parts.filter(p => p && p !== 'none').join(', ') || 'none';
       if (fx.border) {
@@ -10653,8 +11146,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
       } else { el.style.border = 'none'; el.style.borderRadius = '8px'; }
       if (fx.background) {
         const bm = fx.background.mode || 'custom';
+        // theme now stores the picked var(--…) in background.color (single-selector bg control);
+        // fall back to the theme surface var for legacy 'theme' with no stored color. custom/css use
+        // the stored color directly (CSS-tolerant).
         el.style.backgroundColor = bm === 'transparent' ? 'transparent'
-          : bm === 'theme' ? 'var(--secondary-background-color, #1c1c1c)'
+          : bm === 'theme' ? (fx.background.color || 'var(--secondary-background-color, #1c1c1c)')
           : (fx.background.color || '#1a1a1a');
       } else { el.style.backgroundColor = '#1a1a1a'; }
       const edgeMatch = (fx.border && !fx.border.follow_icon && fx.border.color) ? fx.border.color : iconColor;
@@ -10747,6 +11243,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
       if ('color' in patch) map.title_color = patch.color;
       this._updateConfig(map);
     }, '#ffffff');
+    // Generic four-mode color control handlers (mode/theme/css) for every _edColorField in the editor.
+    this._wireEdColorFields(this);
     bind('#cpce-icon', 'icon', v => normalizeIcon(v));
     bind('#cpce-icon-size', 'icon_size', v => clamp(parseInt(v,10)||22, 12, 48));
     bind('#cpce-icon-color', 'icon_color');
@@ -11005,6 +11503,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
       if (divIconColorMode) divIconColorMode.addEventListener('change', () => { const v = divIconColorMode.value; patchSection(id, { icon_color_mode: v, icon_color: v === 'fixed' ? ((this._orderedSectionsRaw().find(s => s.id === id) || {}).icon_color || '#ffffff') : '' }); this._render(); });
       const divIconColor = panel.querySelector('.cpce-div-icon-color');
       if (divIconColor) divIconColor.addEventListener('input', () => { patchSection(id, { icon_color_mode: 'fixed', icon_color: divIconColor.value }); refreshDivPreview(); });
+      // Four-mode color controls (theme/css) for the divider's Custom line/text/icon colors.
+      this._wireDivColorFields(panel, patchSection);
       // Show toggles (inverse of the stored hide_* flags). Line toggle re-renders (it shows/hides
       // the Text "Position vs Line" + mirror controls); text/icon just repaint the preview.
       const divShowLine = panel.querySelector('.cpce-div-show-line');
@@ -11143,11 +11643,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
     bind('#cpce-slider-text-placement-horizontal', 'slider_text_placement_horizontal');
     bind('#cpce-slider-text-placement-vertical', 'slider_text_placement_vertical');
     bind('#cpce-slider-font-size', 'slider_font_size', v => clamp(parseInt(v,10)||13, 8, 28));
-    const sliderTextColorModeEl = this.querySelector('#cpce-slider-text-color-mode');
-    if (sliderTextColorModeEl) sliderTextColorModeEl.addEventListener('change', () => {
-      this._updateConfig({ slider_text_color: sliderTextColorModeEl.value === 'fixed' ? (this._config.slider_text_color || '#ffffff') : '' });
-      this._render();
-    });
+    // Slider Text Color is now the four-mode control (_edColorField); its old theme/fixed select is
+    // gone. The Custom-mode swatch keeps this per-key handler; mode/theme/css go through
+    // _wireEdColorFields (called once at the end of listener setup).
     bind('#cpce-slider-text-color', 'slider_text_color');
     bind('#cpce-slider-debounce', 'slider_debounce_ms', v => clamp(parseInt(v,10)||100, 0, 1000));
     bind('#cpce-brightness-show-label', 'brightness_show_label');
@@ -11412,6 +11910,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
       for (let i = 0; i < ks.length - 1; i++) { const k = ks[i]; if (o[k] == null) o[k] = /^\d+$/.test(ks[i + 1]) ? [] : {}; o = o[k]; }
       o[ks[ks.length - 1]] = val;
     };
+    // Four-mode color controls for frame colors (glow/shadow/border/background) — same patchFrame path.
+    this._wireFbColorFields(this, patchFrame, fbSet);
+    // Single-selector Background control (frame scope) — routes through the same patchFrame/fbSet.
+    this._wireBgColorControls(this, { patchFrame, fbSet });
     // Group enable/disable toggles (glow/shadow/border/background).
     this.querySelectorAll('.fb-toggle').forEach(el => el.addEventListener('change', () => {
       const id = el.dataset.fbId, key = el.dataset.fbKey;
@@ -11675,13 +12177,25 @@ class ColorLightManagerCardEditor extends HTMLElement {
       const slug = el.dataset.hdrSlug, i = Number(el.dataset.hrIdx), path = el.dataset.hrPath;
       patchHeaderSet(slug, set => { const r = set.rules[i]; if (!r) return; fbSet(r, path, el.value); }, true);
     }));
-    // Color enable checkbox (structural: reveals/hides the picker; sets a default color / clears).
-    this.querySelectorAll('.hr-color-enable').forEach(el => el.addEventListener('change', () => {
-      const slug = el.dataset.hdrSlug, i = Number(el.dataset.hrIdx), key = el.dataset.hrPath;
-      patchHeaderSet(slug, set => { const r = set.rules[i]; if (!r) return; if (el.checked) r[key] = r[key] || '#2196F3'; else delete r[key]; }, false);
+    // Four-mode color: mode select (structural — swaps the value field; 'default' deletes the key =
+    // Not set), plus the theme/css value fields. The Custom swatch keeps its own live .hr-color below.
+    this.querySelectorAll('.hr-color-mode').forEach(el => el.addEventListener('change', () => {
+      const slug = el.dataset.hdrSlug, i = Number(el.dataset.hrIdx), key = el.dataset.hrPath, mode = el.value;
+      const value = mode === 'theme' ? (el.dataset.hrTheme || 'var(--primary-color)')
+        : mode === 'css' ? (el.dataset.hrCss || 'currentColor')
+        : (el.dataset.hrHex || '#2196F3');
+      patchHeaderSet(slug, set => { const r = set.rules[i]; if (!r) return; if (mode === 'default') delete r[key]; else r[key] = value; }, false);
     }));
-    // Color picker (live).
+    // Custom swatch (live).
     this.querySelectorAll('.hr-color').forEach(el => el.addEventListener('input', () => {
+      const slug = el.dataset.hdrSlug, i = Number(el.dataset.hrIdx), key = el.dataset.hrPath;
+      patchHeaderSet(slug, set => { const r = set.rules[i]; if (r) r[key] = el.value; }, true);
+    }));
+    this.querySelectorAll('.hr-color-theme').forEach(el => el.addEventListener('change', () => {
+      const slug = el.dataset.hdrSlug, i = Number(el.dataset.hrIdx), key = el.dataset.hrPath;
+      patchHeaderSet(slug, set => { const r = set.rules[i]; if (r) r[key] = el.value; }, true);
+    }));
+    this.querySelectorAll('.hr-color-css').forEach(el => el.addEventListener('input', () => {
       const slug = el.dataset.hdrSlug, i = Number(el.dataset.hrIdx), key = el.dataset.hrPath;
       patchHeaderSet(slug, set => { const r = set.rules[i]; if (r) r[key] = el.value; }, true);
     }));
@@ -11857,10 +12371,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
       };
       if (el) el.addEventListener('change', () => { this._builderPatch({ [keyMap[sel]]: el.checked }); this._render(); });
     });
-    const cardBgColorEl = this.querySelector('#cpce-card-bg-color');
-    if (cardBgColorEl) cardBgColorEl.addEventListener('input', () => this._updateConfig({ card_bg_color: cardBgColorEl.value }));
-    const cardBgModeEl = this.querySelector('#cpce-card-bg-mode');
-    if (cardBgModeEl) cardBgModeEl.addEventListener('change', () => { this._updateConfig({ card_bg_mode: cardBgModeEl.value }); this._render(); });
+    // Card Background now uses the single-selector _bgColorControl (Transparent / Theme / Custom /
+    // CSS with one nested value field). Its generic handlers are wired via _wireBgColorControls.
+    this._wireBgColorControls(this);
     // Live-update the numeric readout next to each range slider as it's dragged.
     const wireRangeReadout = (sliderId, valueId, suffix) => {
       const slider = this.querySelector(sliderId);
