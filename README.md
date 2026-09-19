@@ -2,8 +2,6 @@
 
 A Home Assistant Dashboard **custom card** for controlling colored lights (color / temperature / RGB / RGBWW) in real time, **authoring Home Assistant scenes**, and **tracking scene state across rooms** — with mode-driven preset buttons, reusable styles and fixture profiles, live-linked color entities, per-light send-method tuning, and a full visual editor.
 
-Current build: **v2026.09.08.239**
-
 ---
 
 ## Key features at a glance
