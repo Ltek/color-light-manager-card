@@ -4,10 +4,9 @@ A Home Assistant Dashboard **custom card** for controlling colored lights (color
 
 > The Dashboard resource, card `type:` (`custom:color-light-manager-card`), and JS filename keep their original `color-light-manager-card` names for backward compatibility — only the display name changed.
 
-Current build: **v2026.09.27.255**
+Current build: **v2026.09.27.255** · full history in [CHANGELOG.md](CHANGELOG.md)
 
 ---
-
 
 ## Key features at a glance
 
@@ -23,17 +22,6 @@ Current build: **v2026.09.27.255**
 - **Full visual editor** — every option is point-and-click; no YAML required.
 
 ---
-
-## What's new (2026-09-27)
-
-- **Fixed: library changes now reach every consumer.** Each style library subscribed once and kept
-  only the *first* caller's callback, so whichever of the card or the editor registered second was
-  never told an entry had changed — the visible symptom was editing a style not refreshing the card
-  beside it. Affected all four libraries (Fixture Profiles, Button Styles, Frame, Header).
-- **Section exports now carry their dependencies.** Exporting a section bundles the Fixture Profiles,
-  Button Styles, Frame and Header entries its buttons reference, so it works on another install
-  instead of silently falling back to defaults. Import adds anything missing and never overwrites an
-  existing entry of the same name, then reports what it added.
 
 ## Requirements
 
@@ -165,7 +153,6 @@ A scene button that **Follows Lights for Color** shows the live room color only 
 2. Open the repository in HACS and click **Download**.
 3. Hard-refresh the browser (Ctrl/Cmd+Shift+R). HACS adds the Dashboard resource automatically.
 4. Add the card to a dashboard: **Add Card → Custom: Color Light & Scene Manager** (or `type: custom:color-light-manager-card`).
-
 
 ---
 
