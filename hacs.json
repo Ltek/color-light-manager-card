@@ -1,0 +1,8 @@
+{
+    "name": "Color Light & Scene Manager Card",
+    "filename": "color-light-manager-card.js",
+    "render_readme": true,
+    "homeassistant": "2024.10.0",
+    "content_in_root": true,
+    "zip_release": false
+}

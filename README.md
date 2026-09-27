@@ -2,7 +2,12 @@
 
 A Home Assistant Dashboard **custom card** for controlling colored lights (color / temperature / RGB / RGBWW) in real time, **authoring Home Assistant scenes**, and **tracking scene state across rooms** — with mode-driven preset buttons, reusable styles and fixture profiles, live-linked color entities, per-light send-method tuning, and a full visual editor.
 
+> The Dashboard resource, card `type:` (`custom:color-light-manager-card`), and JS filename keep their original `color-light-manager-card` names for backward compatibility — only the display name changed.
+
+Current build: **v2026.09.27.255**
+
 ---
+
 
 ## Key features at a glance
 
@@ -19,26 +24,23 @@ A Home Assistant Dashboard **custom card** for controlling colored lights (color
 
 ---
 
-## What's new
+## What's new (2026-09-27)
 
-- **Follow Lights for Color** — a scene button now colors its whole appearance (body, glow, accents) from the **live color of the lights it turns on**, so its look tracks the room. HA-native scenes resolve their member lights automatically; for Zigbee2MQTT / script scenes (whose `scene.*` entity lists no members) you pick the lights to follow. It only takes the live color while the button is **active** — no flicker when a followed light changes in the background.
-- **Independent fixed Button & Glow colors** — Custom button styling now has **two** separate, independently-toggled colors: a fixed **button color** and a fixed **glow color**. Set one, the other, both, or neither (each falls back to the live color). An unconfigured scene button shows a neutral grey — a clear "set a color or follow-lights" signal.
-- **Section Import / Export** — export any section (its buttons bundled) as portable JSON and import it fully-configured on another card, through an over-the-editor modal with **Copy** / **Paste** buttons.
-- **Richer button list** — each button's row shows its **section name**, link-icon chips for the bound **Color Entity** / **Fixture Profile** / **scene count**, and tighter action icons.
-- **Scene Groups & Scene Selects** — bind buttons to `input_select` helpers for deterministic, multi-room "active" highlighting; create and manage those helpers in the card.
-- **Scene Tracker section** — a status board of area tiles that mirror your scene buttons' colors/icons, with an optional Button Style.
-- **Button Styles library** — two built-in looks (**Basic Theme**, **Neon Lux**) plus your own layered, conditional styles; create a new style from any **starter**.
-- **Save as Fixture Profile** — promote a button's inline look into the shared library in one click.
-- **Clearer button list** — buttons group under **Local** vs **Library**, with compact chips showing bound Color Entity / profile / scene count. A button can also be left **unassigned** (hidden on the card, used only to style a Scene Tracker tile).
-
----
+- **Fixed: library changes now reach every consumer.** Each style library subscribed once and kept
+  only the *first* caller's callback, so whichever of the card or the editor registered second was
+  never told an entry had changed — the visible symptom was editing a style not refreshing the card
+  beside it. Affected all four libraries (Fixture Profiles, Button Styles, Frame, Header).
+- **Section exports now carry their dependencies.** Exporting a section bundles the Fixture Profiles,
+  Button Styles, Frame and Header entries its buttons reference, so it works on another install
+  instead of silently falling back to defaults. Import adds anything missing and never overwrites an
+  existing entry of the same name, then reports what it added.
 
 ## Requirements
 
 The card works on its own for buttons, sliders, scenes, scene groups, and the scene tracker. Two features build on the **Color helper integration** (the `color` domain) by [@kkilchrist](https://github.com/kkilchrist/ha-color-ext): **Color Entities** (a button following a shared, live color) and **exact color round-trip**.
 
 - Repo: **https://github.com/kkilchrist/ha-color-ext**
-- Install via **HACS → Integrations → Custom repositories** → add that repo as an *Integration* → install → restart Home Assistant.
+- Install via **HACS → ⋮ → Custom repositories** → add that repo with category **Dashboard** → install → hard-refresh the browser.
 - **v0.3.0+ recommended** — it adds the `color_params` / `source` / `source_type` attributes the card reads for exact color (no lossy xy→rgb drift). Older versions and legacy `input_color.*` helpers still work via a fallback path.
 
 Not using Color Entities? The integration is optional — buttons with an inline Custom Color/Temperature need nothing extra.
@@ -184,9 +186,7 @@ A scene button that **Follows Lights for Color** shows the live room color only 
     <td align="center" valign="top">
       <img src="screenshots/example-live.JPG" width="100%" alt="example live">
     </td>
-    <td align="center" valign="top">
-      <img src="screenshots/example2.JPG" width="100%" alt="example2">
-    </td>
+    <td></td>
     <td></td>
   </tr>
 </table>

@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.09.19.254
+// Version: v2026.09.27.255
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.09.19.254';
+const BUILD_NUMBER = 'v2026.09.27.255';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -864,9 +864,20 @@ function _fixtureLibParseValue(value) {
 }
 // Fetch (once) + subscribe to a library scope. onChange fires on initial load and every live
 // update. Safe to call repeatedly.
+// v2026.09.27: notify EVERY registered listener. Libraries used to capture only the first caller's
+// callback (the `subscribed` guard returns early afterwards), so whichever consumer — card or editor —
+// registered second was never told the library changed. Symptom: editing a style did not refresh the
+// card beside it. Tolerates a missing set so any call site is safe.
+function _notifyLibListeners(st) {
+  const ls = st && st.listeners;
+  if (!ls) return;
+  ls.forEach((fn) => { try { fn(); } catch (e) {} });
+}
 function ensureFixtureLibrary(hass, scope, onChange) {
   scope = scope === 'system' ? 'system' : 'user';
   const st = FIXTURE_LIBRARY[scope];
+  st.listeners = st.listeners || new Set();
+  if (typeof onChange === 'function') st.listeners.add(onChange);
   if (!hass || !hass.connection) return;
   const conn = hass.connection;
   if (st.subscribed) return;
@@ -877,7 +888,7 @@ function ensureFixtureLibrary(hass, scope, onChange) {
         (ev) => {
           st.map = _fixtureLibParseValue(ev && ev.value);
           st.loaded = true; st.loading = false;
-          if (typeof onChange === 'function') { try { onChange(); } catch (e) {} }
+          _notifyLibListeners(st);
         },
         { type: _fixtureLibWs(scope, 'subscribe'), key: FIXTURE_LIB_KEY }
       );
@@ -891,7 +902,7 @@ function ensureFixtureLibrary(hass, scope, onChange) {
     .then(res => {
       st.map = _fixtureLibParseValue(res && res.value);
       st.loaded = true; st.loading = false;
-      if (typeof onChange === 'function') { try { onChange(); } catch (e) {} }
+      _notifyLibListeners(st);
     })
     .catch(() => { st.loading = false; st.loaded = true; st.map = {}; });
 }
@@ -1072,12 +1083,14 @@ function _btnStyleParseValue(value) {
 }
 function ensureButtonStyleLibrary(hass, onChange) {
   const st = BTN_STYLE_LIBRARY.system;
+  st.listeners = st.listeners || new Set();
+  if (typeof onChange === 'function') st.listeners.add(onChange);
   if (!hass || !hass.connection || st.subscribed) return;
   const conn = hass.connection;
   if (typeof conn.subscribeMessage === 'function') {
     st.subscribed = true;
     try {
-      conn.subscribeMessage((ev) => { st.map = _btnStyleParseValue(ev && ev.value); st.loaded = true; if (typeof onChange === 'function') { try { onChange(); } catch (e) {} } },
+      conn.subscribeMessage((ev) => { st.map = _btnStyleParseValue(ev && ev.value); st.loaded = true; _notifyLibListeners(st); },
         { type: 'frontend/subscribe_system_data', key: BTN_STYLE_LIB_KEY });
     } catch (e) { st.subscribed = false; }
     return;
@@ -1085,7 +1098,7 @@ function ensureButtonStyleLibrary(hass, onChange) {
   if (st.loaded || st.loading || typeof conn.sendMessagePromise !== 'function') return;
   st.loading = true;
   conn.sendMessagePromise({ type: 'frontend/get_system_data', key: BTN_STYLE_LIB_KEY })
-    .then(res => { st.map = _btnStyleParseValue(res && res.value); st.loaded = true; st.loading = false; if (typeof onChange === 'function') { try { onChange(); } catch (e) {} } })
+    .then(res => { st.map = _btnStyleParseValue(res && res.value); st.loaded = true; st.loading = false; _notifyLibListeners(st); })
     .catch(() => { st.loading = false; st.loaded = true; st.map = {}; });
 }
 function buttonStyleLibraryMap() { return BTN_STYLE_LIBRARY.system.map || {}; }
@@ -1684,12 +1697,49 @@ const SECTION_EXPORT_VERSION = 1;
 
 // Serialize a section + its buttons into the versioned text envelope. `presets`
 // is the list of button objects belonging to this section (caller resolves them).
+// v2026.09.27: an exported section bundles its buttons, but those buttons can point at library
+// entries (`profile_ref: 'lib:<slug>'`, button styles). Those refs used to travel alone and silently
+// fall back to defaults on an install without them — so collect and bundle the entries too.
+// Walks the object rather than naming fields, so a ref added under a new key is still caught.
+function collectLibRefs(node, out) {
+  if (!node) return out;
+  if (typeof node === 'string') { if (node.startsWith('lib:')) out.add(node.slice(4)); return out; }
+  if (Array.isArray(node)) { node.forEach((v) => collectLibRefs(v, out)); return out; }
+  if (typeof node === 'object') { Object.keys(node).forEach((k) => collectLibRefs(node[k], out)); }
+  return out;
+}
+// Built-ins are deliberately NOT bundled: they ship in the card.
+function collectSectionLibraryDeps(section, presets) {
+  const slugs = collectLibRefs({ section, presets }, new Set());
+  if (!slugs.size) return {};
+  const out = {};
+  const grab = (getMap, key, scopes) => {
+    scopes.forEach((sc) => {
+      let map = null;
+      try { map = sc === null ? getMap() : getMap(sc); } catch (e) { map = null; }
+      if (!map) return;
+      slugs.forEach((sl) => {
+        if (!map[sl]) return;
+        out[key] = out[key] || {};
+        if (!out[key][sl]) out[key][sl] = JSON.parse(JSON.stringify(map[sl]));   // first scope wins
+      });
+    });
+  };
+  grab(fixtureLibraryMap, 'fixture_profiles', ['user', 'system']);
+  grab(buttonStyleLibraryMap, 'button_styles', [null]);
+  grab(frameLibraryMap, 'frame_styles', ['user', 'system']);
+  grab(headerLibraryMap, 'header_styles', ['user', 'system']);
+  return out;
+}
+
 function serializeSection(section, presets, exportedIso) {
   const env = {
     seed_section: SECTION_EXPORT_VERSION,
     section: JSON.parse(JSON.stringify(section)),
     presets: (Array.isArray(presets) ? presets : []).map(p => JSON.parse(JSON.stringify(p))),
   };
+  const requires = collectSectionLibraryDeps(section, presets);
+  if (Object.keys(requires).length) env.requires = requires;
   if (exportedIso) env.exported = String(exportedIso);
   return JSON.stringify(env, null, 2);
 }
@@ -1712,7 +1762,10 @@ function parseSectionBlob(text) {
     return { ok: false, error: 'Envelope has no valid section.' };
   }
   const presets = Array.isArray(raw.presets) ? raw.presets.filter(p => p && typeof p === 'object') : [];
-  return { ok: true, section: JSON.parse(JSON.stringify(section)), presets: presets.map(p => JSON.parse(JSON.stringify(p))) };
+  return { ok: true,
+    // v2026.09.27: library entries bundled with the export; installed on import so the section
+    // keeps the look it left with. Absent in envelopes written before this.
+    requires: (raw && raw.requires && typeof raw.requires === "object") ? raw.requires : {}, section: JSON.parse(JSON.stringify(section)), presets: presets.map(p => JSON.parse(JSON.stringify(p))) };
 }
 
 // A url/id-safe slug from a preset name, used as its library key.
@@ -1786,7 +1839,7 @@ function _migrateLegacyFrameLibrary(hass, scope, st, onChange) {
       if (!legacy || !Object.keys(legacy).length) return;   // nothing to migrate
       if (st.map && Object.keys(st.map).length) return;      // don't clobber newer data
       st.map = legacy;
-      if (typeof onChange === 'function') { try { onChange(); } catch (e) {} }
+      _notifyLibListeners(st);
       saveFrameLibrary(hass, scope, legacy).catch(() => {});
     })
     .catch(() => {});
@@ -1797,6 +1850,8 @@ function _migrateLegacyFrameLibrary(hass, scope, st, onChange) {
 function ensureFrameLibrary(hass, scope, onChange) {
   scope = scope === 'system' ? 'system' : 'user';
   const st = SEED_FRAME_LIBRARY[scope];
+  st.listeners = st.listeners || new Set();
+  if (typeof onChange === 'function') st.listeners.add(onChange);
   if (!hass || !hass.connection) return;
   const conn = hass.connection;
   if (st.subscribed) return;         // subscription drives all future updates
@@ -1807,7 +1862,7 @@ function ensureFrameLibrary(hass, scope, onChange) {
         (ev) => {
           st.map = _frameLibParseValue(ev && ev.value);
           st.loaded = true; st.loading = false;
-          if (typeof onChange === 'function') { try { onChange(); } catch (e) {} }
+          _notifyLibListeners(st);
           if (!Object.keys(st.map).length) _migrateLegacyFrameLibrary(hass, scope, st, onChange);
         },
         { type: _frameLibWs(scope, 'subscribe'), key: SEED_FRAME_LIB_KEY }
@@ -1823,7 +1878,7 @@ function ensureFrameLibrary(hass, scope, onChange) {
     .then(res => {
       st.map = _frameLibParseValue(res && res.value);
       st.loaded = true; st.loading = false;
-      if (typeof onChange === 'function') { try { onChange(); } catch (e) {} }
+      _notifyLibListeners(st);
       if (!Object.keys(st.map).length) _migrateLegacyFrameLibrary(hass, scope, st, onChange);
     })
     .catch(() => { st.loading = false; st.loaded = true; st.map = {}; });
@@ -2212,6 +2267,8 @@ function _headerLibParseValue(value) {
 function ensureHeaderLibrary(hass, scope, onChange) {
   scope = scope === 'system' ? 'system' : 'user';
   const st = SEED_HEADER_LIBRARY[scope];
+  st.listeners = st.listeners || new Set();
+  if (typeof onChange === 'function') st.listeners.add(onChange);
   if (!hass || !hass.connection) return;
   const conn = hass.connection;
   if (st.subscribed) return;
@@ -2219,7 +2276,7 @@ function ensureHeaderLibrary(hass, scope, onChange) {
     st.subscribed = true; st.loading = true;
     try {
       conn.subscribeMessage(
-        (ev) => { st.map = _headerLibParseValue(ev && ev.value); st.loaded = true; st.loading = false; if (typeof onChange === 'function') { try { onChange(); } catch (e) {} } },
+        (ev) => { st.map = _headerLibParseValue(ev && ev.value); st.loaded = true; st.loading = false; _notifyLibListeners(st); },
         { type: _headerLibWs(scope, 'subscribe'), key: SEED_HEADER_LIB_KEY }
       );
     } catch (e) { st.subscribed = false; st.loading = false; }
@@ -2229,7 +2286,7 @@ function ensureHeaderLibrary(hass, scope, onChange) {
   if (typeof conn.sendMessagePromise !== 'function') return;
   st.loading = true;
   conn.sendMessagePromise({ type: _headerLibWs(scope, 'get'), key: SEED_HEADER_LIB_KEY })
-    .then(res => { st.map = _headerLibParseValue(res && res.value); st.loaded = true; st.loading = false; if (typeof onChange === 'function') { try { onChange(); } catch (e) {} } })
+    .then(res => { st.map = _headerLibParseValue(res && res.value); st.loaded = true; st.loading = false; _notifyLibListeners(st); })
     .catch(() => { st.loading = false; st.loaded = true; st.map = {}; });
 }
 function headerLibraryMap(scope) {
@@ -5416,7 +5473,29 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // the buttons to cfg.presets. Buttons arrive fully configured and already assigned — no manual
   // re-assignment. Library refs (style_preset/profile_ref/frame/header) and entity ids ride along
   // as-is: they resolve on this instance and degrade gracefully if absent.
-  _importSection(section, presets) {
+  // Install bundled library entries. Never overwrites an existing entry of the same slug: a local
+  // style of that name wins, so importing can only ADD.
+  _installSectionLibraryDeps(requires) {
+    const added = [];
+    const put = (getMap, saver, incoming, label, scoped) => {
+      if (!incoming || typeof incoming !== 'object' || !Object.keys(incoming).length) return;
+      let map = {};
+      try { map = { ...((scoped ? getMap('user') : getMap()) || {}) }; } catch (e) { map = {}; }
+      let n = 0;
+      Object.keys(incoming).forEach((k) => { if (!map[k]) { map[k] = incoming[k]; n++; } });
+      if (!n) return;
+      try { scoped ? saver(this.hass, 'user', map) : saver(this.hass, map); added.push(`${n} ${label}`); }
+      catch (e) {}
+    };
+    put(fixtureLibraryMap, saveFixtureLibrary, requires.fixture_profiles, 'fixture profile(s)', true);
+    put(buttonStyleLibraryMap, saveButtonStyleLibrary, requires.button_styles, 'button style(s)', false);
+    put(frameLibraryMap, saveFrameLibrary, requires.frame_styles, 'frame style(s)', true);
+    put(headerLibraryMap, saveHeaderLibrary, requires.header_styles, 'header style(s)', true);
+    return added;
+  }
+  _importSection(section, presets, requires) {
+    const deps = this._installSectionLibraryDeps(requires || {});
+    if (deps.length) console.info(`[ColorLightManagerCard] imported library entries: ${deps.join(', ')}`);
     const ordered = this._orderedSections();
     const copy = JSON.parse(JSON.stringify(section));
     copy.id = newSectionId(copy.type || 'section');
@@ -11583,7 +11662,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     if (importSection) importSection.onclick = () => this._importJson('Paste exported Section JSON:', (txt) => {
       const res = parseSectionBlob(txt);
       if (!res.ok) { window.alert(`Could not import: ${res.error}`); return; }
-      this._importSection(res.section, res.presets);
+      this._importSection(res.section, res.presets, res.requires);
     });
     bind('#cpce-card-show-chevron', 'card_show_chevron');
     // Toggling collapsible shows/hides its sub-options, so it needs a full re-render.
