@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.09.27.255
+// Version: v2026.10.01.282
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.09.27.255';
+const BUILD_NUMBER = 'v2026.10.01.282';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -566,12 +566,14 @@ function presetMode(preset) {
 //   scene   = scene / orchestration only, applies no color of its own (look_none)
 //   temp    = Custom Temperature (inline color_kelvin)
 //   color   = Custom Color (inline color, any format) — default
+//   tracker = Scene Tracker: a READ-ONLY status tile showing an input_select's current option
+//             (tracker_entity) and, optionally, a representative light (tracker_light). Never pressable.
 // A persisted `preset.mode` (set when the user picks a mode) is authoritative; older presets
 // with no `mode` are inferred from their data so nothing breaks. NOTE: this drives EDITOR
 // visibility only — the runtime look is classified by presetMode() on the effective look.
 function buttonMode(preset) {
   if (!preset) return 'color';
-  if (['off', 'profile', 'scene', 'temp', 'color'].includes(preset.mode)) return preset.mode;
+  if (['off', 'profile', 'scene', 'temp', 'color', 'tracker'].includes(preset.mode)) return preset.mode;
   if (fixtureRefSlug(preset.profile_ref)) return 'profile';
   if (preset.action === 'turn_off') return 'off';
   if (preset.look_none === true) return 'scene';
@@ -587,6 +589,7 @@ const MODE_DEFAULT_ICON = {
   scene: 'mdi:ticket',
   temp: 'mdi:thermometer',
   color: 'mdi:palette-outline',
+  tracker: 'mdi:view-grid-outline',
 };
 function modeDefaultIcon(mode) { return MODE_DEFAULT_ICON[mode] || 'mdi:lightbulb'; }
 // Normalize a user-typed icon: a bare name with no namespace assumes the `mdi:` set (the HA
@@ -868,6 +871,29 @@ function _fixtureLibParseValue(value) {
 // callback (the `subscribed` guard returns early afterwards), so whichever consumer — card or editor —
 // registered second was never told the library changed. Symptom: editing a style did not refresh the
 // card beside it. Tolerates a missing set so any call site is safe.
+// Remove one card/editor's change listener from every shared library (on disconnect), so a destroyed
+// card is no longer re-rendered — and no longer kept alive — by library updates.
+// Window-level drag tracking for an element: move/up listeners exist ONLY while a drag is in progress
+// and are removed when it ends. (The editor's colour wheels used to add four window listeners on every
+// editor render and never remove them, so they piled up — each holding a detached old editor tree —
+// and every mouse/touch move anywhere on the page ran all of them.)
+function trackWindowDrag(onMove, onEnd) {
+  const move = (e) => { const t = e.touches ? e.touches[0] : e; if (t) onMove(t.clientX, t.clientY); };
+  const end = () => {
+    window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', end);
+    window.removeEventListener('touchmove', move); window.removeEventListener('touchend', end);
+    if (onEnd) onEnd();
+  };
+  window.addEventListener('mousemove', move); window.addEventListener('mouseup', end);
+  window.addEventListener('touchmove', move, { passive: true }); window.addEventListener('touchend', end);
+}
+function _offLibListeners(fn) {
+  if (typeof fn !== 'function') return;
+  [FIXTURE_LIBRARY, BTN_STYLE_LIBRARY, SEED_FRAME_LIBRARY, SEED_HEADER_LIBRARY].forEach(lib => {
+    if (!lib) return;
+    Object.values(lib).forEach(st => { if (st && st.listeners) st.listeners.delete(fn); });
+  });
+}
 function _notifyLibListeners(st) {
   const ls = st && st.listeners;
   if (!ls) return;
@@ -939,7 +965,7 @@ function fixtureRefSlug(ref) {
 // The exact config keys a Button Appearance preset captures/applies. A preset fully reproduces
 // the button look (layout included) — nothing else on the card is touched.
 const BUTTON_APPEARANCE_KEYS = [
-  'layout', 'columns', 'gap', 'wrap',
+  'layout', 'columns', 'gap', 'wrap', 'align',
   'button_style',
   'button_border_enabled', 'button_border_width', 'button_border_color', 'button_border_color_mode', 'button_border_radius', 'button_border_sides',
   'button_border_gradient', 'button_border_gradient_color_mode',
@@ -954,7 +980,7 @@ const BUTTON_APPEARANCE_KEYS = [
 // REPLACES the whole group, and groups it doesn't own fall through — no per-key deltas. The
 // Builder subpanels map 1:1 to these groups, each with an include toggle on overlay layers.
 const BUTTON_STYLE_GROUPS = {
-  layout:   ['layout', 'columns', 'gap', 'wrap'],
+  layout:   ['layout', 'columns', 'gap', 'wrap', 'align'],
   background: ['button_style'],
   border:   ['button_border_enabled', 'button_border_width', 'button_border_color', 'button_border_color_mode', 'button_border_sides'],
   gradient: ['button_border_gradient', 'button_border_gradient_color_mode'],
@@ -978,6 +1004,51 @@ function extractButtonAppearance(cfg) {
   const out = {};
   BUTTON_APPEARANCE_KEYS.forEach(k => { if (cfg && cfg[k] !== undefined) out[k] = JSON.parse(JSON.stringify(cfg[k])); });
   return out;
+}
+// The five layout controls, shared by Button Styles AND the per-section override so both speak the
+// same vocabulary:
+//   layout  — 'stack' (vertical) | 'columns' (row) | 'scroll' (single-line row, no wrap) | 'grid'
+//   columns — grid track count (grid only)
+//   gap     — px between buttons
+//   wrap    — allow the columns row to wrap (ignored by scroll/grid/stack)
+//   align   — 'left' | 'center' | 'right' (maps per layout to justify-content / justify-items / align-items)
+const BUTTON_LAYOUTS = ['stack', 'columns', 'scroll', 'grid'];
+function normalizeButtonLayout(v) { return BUTTON_LAYOUTS.includes(v) ? v : 'columns'; }
+// The CSS class for a layout: 'scroll' shares the flex "columns" row (differing only by wrap/overflow,
+// set in buttonLayoutCss), so it renders under .layout-columns.
+function buttonLayoutClass(layout) { const l = normalizeButtonLayout(layout); return `layout-${l === 'scroll' ? 'columns' : l}`; }
+// Emit the layout CSS for a resolved appearance under `sel` (e.g. '' for the global card default, or
+// a section selector). `scale` scales the max-width stretch rule. This is the ONE place layout →
+// CSS lives, so the card default, per-preset scoped style, and section override stay identical.
+function buttonLayoutCss(appr, sel, scale) {
+  const layout = normalizeButtonLayout(appr.layout);
+  const gap = clamp(Number(appr.gap), 0, 64); const gapPx = Number.isFinite(gap) ? gap : 8;
+  const cols = clamp(Number(appr.columns) || 3, 1, 12);
+  const wrap = layout === 'scroll' ? false : (layout === 'grid' ? true : !!appr.wrap);
+  const p = sel ? `${sel} ` : '';
+  // Explicit alignment (left/center/right) or none. Rows (columns/scroll) historically CENTER at the
+  // card default, so treat unset-at-global as center there; grid/stack have no default alignment
+  // (grid fills with 1fr, stack stretches) so unset leaves them untouched — no regression.
+  const explicitAlign = (appr.align === 'left' || appr.align === 'center' || appr.align === 'right') ? appr.align : '';
+  const flex = explicitAlign === 'left' ? 'flex-start' : (explicitAlign === 'right' ? 'flex-end' : 'center');
+  const gridJC = explicitAlign === 'left' ? 'start' : (explicitAlign === 'right' ? 'end' : 'center');
+  const rules = [`${p}.cpc-presets { gap:${gapPx}px; }`];
+  if (layout === 'grid') {
+    // With an explicit alignment, size columns to their content and position the whole grid block with
+    // justify-content (1fr columns fill the row, leaving nothing to justify). Unset → classic 1fr fill.
+    const colSpec = explicitAlign ? 'minmax(0,max-content)' : 'minmax(0,1fr)';
+    rules.push(`${p}.cpc-presets.layout-grid { display:grid; grid-template-columns:repeat(${cols},${colSpec}); gap:${gapPx}px;${explicitAlign ? ` justify-content:${gridJC};` : ''} }`);
+    rules.push(`${p}.cpc-presets.layout-grid .cpc-preset-btn { min-width:0; }`);
+  } else if (layout === 'stack') {
+    rules.push(`${p}.cpc-presets.layout-stack { flex-direction:column;${explicitAlign ? ` align-items:${flex};` : ''} }`);
+  } else {
+    // columns + scroll both use the flex row; scroll = single line + horizontal scroll. Rows center by
+    // default at the global level (matches the card's original look); a section/style can override.
+    const rowAlign = explicitAlign || (sel ? '' : 'center');
+    const rowJustify = rowAlign === 'left' ? 'flex-start' : (rowAlign === 'right' ? 'flex-end' : (rowAlign === 'center' ? 'center' : ''));
+    rules.push(`${p}.cpc-presets.layout-columns { flex-direction:row; flex-wrap:${wrap ? 'wrap' : 'nowrap'};${layout === 'scroll' ? ' overflow-x:auto;' : ''}${rowJustify ? ` justify-content:${rowJustify};` : ''} }`);
+  }
+  return rules.join('\n        ');
 }
 // The button-border sides selected in config (defaults to all four when unset —
 // backward compatible with pre-per-side configs that only carried a uniform border).
@@ -1210,6 +1281,7 @@ const BTN_STYLE_CONDITIONS = [
   { type: '', label: 'Always', kinds: ['button', 'frame'] },
   { type: 'button_active', label: 'Button Active', kinds: ['button'] },
   { type: 'button_off', label: 'Off button only', kinds: ['button'] },
+  { type: 'button_tracker', label: 'Scene Tracker button only', kinds: ['button'] },
   { type: 'light_on', label: 'Light On', kinds: ['button', 'frame'] },
   { type: 'light_off', label: 'Light Off', kinds: ['button', 'frame'] },
   { type: 'light_unavailable', label: 'Light unavailable/unknown', kinds: ['button', 'frame'] },
@@ -1280,7 +1352,7 @@ function resolvePresetLook(preset, scope) {
 function buildSections(cfg) {
   // Already migrated? Use as-is (filtered to known types — including standalone dividers).
   if (Array.isArray(cfg.sections) && cfg.sections.length) {
-    return cfg.sections.filter(s => s && ['buttons', 'sliders', 'values', 'divider', 'scene_tracker'].includes(s.type));
+    return cfg.sections.filter(s => s && ['buttons', 'sliders', 'values', 'divider'].includes(s.type));
   }
   // Legacy migration from flat config.
   const sliders = {
@@ -1688,7 +1760,7 @@ function mergeFramePresets(existing, incoming) {
 // — they live in cfg.presets) are bundled in the payload so an import lands a
 // complete, working section. Library-backed refs (Button Style style_preset,
 // Fixture Profile profile_ref, Frame/Header refs) and HA entity ids (selects,
-// targets, tracker areas, default_scene_group) are NOT copied — they resolve on
+// targets, tracker_entity/tracker_light, default_scene_group) are NOT copied — they resolve on
 // the same instance and degrade gracefully cross-instance (missing style → Basic
 // Theme, missing entity → binding just doesn't match), exactly like a Button
 // Style import that references a missing profile.
@@ -2486,6 +2558,9 @@ function renderPresetButtonHtml(look, preset, cfg, state, tempOutFmt, activeId, 
   // Icon: a style-level override (cfg.button_icon) replaces the per-button icon for every button;
   // else the button's own icon. Optional fixed icon size (px).
   const icon = escapeHtml((cfg.button_icon && String(cfg.button_icon).trim()) || resolvePresetIcon(preset, buttonMode(preset)));
+  // hide_icon (per button): text only — no icon element at all, so no icon gap is reserved either.
+  // It wins over a style-level icon override, since it's an explicit choice on this one button.
+  const noIcon = !!(preset && preset.hide_icon);
   const iconSize = Number(cfg.button_icon_size) || 0;
   const iconSizeCss = iconSize > 0 ? `--mdc-icon-size:${iconSize}px;` : '';
   const glowCls = boxShadow && boxShadow !== 'none' ? ' cpc-glowing' : '';
@@ -2520,7 +2595,7 @@ function renderPresetButtonHtml(look, preset, cfg, state, tempOutFmt, activeId, 
     const tLabel = tSub
       ? `<span class="cpc-btn-labelwrap"><span class="cpc-tile-name cpc-btn-label" style="${labelStyle}">${escapeHtml(preset.name)}</span>${tSub}</span>`
       : `<span class="cpc-tile-name cpc-btn-label" style="${labelStyle}">${escapeHtml(preset.name)}</span>`;
-    return `<button class="cpc-preset-btn cpc-tile${glowCls} ${isOff ? 'off-style' : ''}" data-preset-id="${escapeHtml(preset.id)}" ${styleAttr}><ha-icon icon="${icon}" style="${iconSizeCss}"></ha-icon>${tLabel}</button>`;
+    return `<button class="cpc-preset-btn cpc-tile${glowCls} ${isOff ? 'off-style' : ''}" data-preset-id="${escapeHtml(preset.id)}" ${styleAttr}>${noIcon ? '' : `<ha-icon icon="${icon}" style="${iconSizeCss}"></ha-icon>`}${tLabel}</button>`;
   }
   const radiusCss = Number.isFinite(radius) ? `border-radius:${radius}px;` : '';
   // Background fill by style: 'transparent' → none; 'theme' → the card/theme surface color;
@@ -2544,7 +2619,7 @@ function renderPresetButtonHtml(look, preset, cfg, state, tempOutFmt, activeId, 
   const labelBlock = subLabel
     ? `<span class="cpc-btn-labelwrap"><span class="cpc-btn-label" style="${labelStyle}">${escapeHtml(preset.name)}</span>${subLabel}</span>`
     : `<span class="cpc-btn-label" style="${labelStyle}">${escapeHtml(preset.name)}</span>`;
-  return `<button class="cpc-preset-btn${glowCls} ${isOff ? 'off-style' : ''}" data-preset-id="${escapeHtml(preset.id)}" ${styleAttr}><ha-icon icon="${icon}"${iconStyle}></ha-icon>${labelBlock}</button>`;
+  return `<button class="cpc-preset-btn${glowCls} ${isOff ? 'off-style' : ''}" data-preset-id="${escapeHtml(preset.id)}" ${styleAttr}>${noIcon ? '' : `<ha-icon icon="${icon}"${iconStyle}></ha-icon>`}${labelBlock}</button>`;
 }
 
 // ============ LIVE CARD ============
@@ -2864,21 +2939,23 @@ class ColorLightManagerCard extends HTMLElement {
     this._hass = hass;
     // Load + live-subscribe the shared Fixture Profile Library only if any preset references
     // one (lib:<slug>) — otherwise skip the WS traffic entirely. Re-render on library updates.
+    // ONE listener per card instance, reused on every hass update. set hass runs on every state change
+    // anywhere in HA; passing a fresh arrow function each time added a new listener per update (they
+    // were never removed), so after a while a single library update — including the re-subscribe that
+    // happens when the HA connection resumes, e.g. the mobile app returning to the foreground — fired
+    // thousands of full re-renders back to back and froze the page. It also coalesces to one rAF render.
+    if (!this._libChanged) this._libChanged = () => { if (this._rendered) this._scheduleRender(); };
     if (this._usesFixtureLibraryRef()) {
-      ensureFixtureLibrary(hass, this._config && this._config.fixture_library_scope, () => {
-        if (this._rendered) this.renderCard();
-      });
+      ensureFixtureLibrary(hass, this._config && this._config.fixture_library_scope, this._libChanged);
     }
     // Button-style presets (incl. the system-wide Default) live in the shared store and drive
     // every buttons section's look. Subscribe so the card re-renders when a preset is saved
     // elsewhere (e.g. the editor) — otherwise a saved preset wouldn't apply until a full reload.
-    ensureButtonStyleLibrary(hass, () => { if (this._rendered) this.renderCard(); });
+    ensureButtonStyleLibrary(hass, this._libChanged);
     // Frame Style library: load/subscribe only if a card/section frame ref uses
     // a lib:<slug> preset. Re-render on updates so a frame edited elsewhere applies.
     if (this._usesLibraryRef()) {
-      ensureFrameLibrary(hass, (this._config && this._config.frame_library_scope) || 'system', () => {
-        if (this._rendered) this.renderCard();
-      });
+      ensureFrameLibrary(hass, (this._config && this._config.frame_library_scope) || 'system', this._libChanged);
     }
     // Header Rule library: load/subscribe only when enabled AND a card/section
     // ref uses a lib:<slug> set. Re-render on updates so a set edited elsewhere
@@ -2886,9 +2963,7 @@ class ColorLightManagerCard extends HTMLElement {
     if (this._config
         && (_usesHeaderLibRef(this._config.card_header_rules)
           || (this._config.sections || []).some(s => _usesHeaderLibRef(s.header_rule_refs)))) {
-      ensureHeaderLibrary(hass, (this._config && this._config.header_library_scope) || 'system', () => {
-        if (this._rendered) this.renderCard();
-      });
+      ensureHeaderLibrary(hass, (this._config && this._config.header_library_scope) || 'system', this._libChanged);
     }
     // First real paint — only once config is present (renderCard bails without it). Runs with
     // hass available so linked-entity buttons resolve their colors on the very first render.
@@ -2909,18 +2984,19 @@ class ColorLightManagerCard extends HTMLElement {
     // A card_frame conditional preset (when_entity) can change the whole frame
     // when its entity changes — re-render so _applyCardFrame re-evaluates it.
     if (prev && this._frameConditionEntitiesChanged(prev, hass)) { this._scheduleRender(); return; }
-    // Scene Tracker tiles read input_select options (+ optional light color) — re-render when any
-    // watched tracker entity changes so the board stays live.
+    // Scene Tracker buttons read an input_select's option (+ optional light color) — re-render when
+    // any watched tracker entity changes so the tiles stay live (updateStates() skips them).
     if (prev && this._sceneTrackerEntitiesChanged(prev, hass)) { this._scheduleRender(); return; }
     this.updateStates();
   }
 
-  // Entity ids the Scene Tracker sections display (each Area's input_select + optional light).
+  // Entity ids the Scene Tracker buttons display (each tracker button's input_select + optional light).
   _sceneTrackerEntityIds() {
     const ids = new Set();
-    ((this._config && this._config.sections) || []).forEach(s => {
-      if (!s || s.type !== 'scene_tracker' || !Array.isArray(s.areas)) return;
-      s.areas.forEach(a => { if (a && a.entity) ids.add(a.entity); if (a && a.light) ids.add(a.light); });
+    ((this._config && this._config.presets) || []).forEach(p => {
+      if (!p || buttonMode(p) !== 'tracker') return;
+      if (p.tracker_entity) ids.add(p.tracker_entity);
+      if (p.tracker_light) ids.add(p.tracker_light);
     });
     return ids;
   }
@@ -3048,6 +3124,11 @@ class ColorLightManagerCard extends HTMLElement {
   disconnectedCallback() {
     if (this._favoritesUnsub) { this._favoritesUnsub(); this._favoritesUnsub = null; }
     if (this._btnStylesSavedHandler) { window.removeEventListener('clm-button-styles-saved', this._btnStylesSavedHandler); this._btnStylesSavedHandler = null; }
+    // Drop the wrapped-Off-row resize observer — HA creates/destroys cards freely (dashboard edits,
+    // view switches), so leaving it attached would leak an observer per rebuild.
+    if (this._offRowRO) { this._offRowRO.disconnect(); this._offRowRO = null; }
+    // Stop library updates re-rendering this (now detached) card. set hass re-adds it on reconnect.
+    _offLibListeners(this._libChanged);
   }
   getCardSize() { return 6; }
   static getConfigElement() { return document.createElement('color-light-manager-card-editor'); }
@@ -3276,7 +3357,14 @@ class ColorLightManagerCard extends HTMLElement {
     // Send methods (white-temp format + effect timing) are resolved PER TARGET ENTITY, since a
     // single button can drive fixtures with different controllers. We group the targets by their
     // resolved methods and emit one set of service calls per group.
-    const colorIds = this._presetColorIds(rawPreset);
+    let colorIds = this._presetColorIds(rawPreset);
+    // "Only Control Lights Currently On": when the button's section enables it (static setting or the
+    // live per-section checkbox), restrict this press to the target lights that are already on — so
+    // it never turns an off light on. Mirrors the slider sections' behavior; resolved live at press.
+    const onlyOnSection = this._sectionForPreset(rawPreset);
+    if (onlyOnSection && this._sliderOnLightsOnly(onlyOnSection)) {
+      colorIds = colorIds.filter(id => { const st = this._hass && this._hass.states[id]; return st && st.state === 'on'; });
+    }
     if (colorIds.length) {
       if (preset.action === 'turn_off') {
         this._callLightService('turn_off', hasTransition ? { transition } : {}, colorIds);
@@ -3570,6 +3658,14 @@ class ColorLightManagerCard extends HTMLElement {
   }
   _resolveFrame(frameRef, section) {
     const acc = this._flattenFrameToBundle(frameRef || {});
+    if (!acc) return null;
+    return this._frameBundleToFx(acc, section);
+  }
+  // Turn a flattened frame bundle (glow/shadow/border/background/edges) into the resolved fx object
+  // (boxShadow / borderVars / background / edge) the appliers use. Split out of _resolveFrame so the
+  // Frame Styles library preview can render a single preset's look without going through the
+  // id-keyed layer resolver.
+  _frameBundleToFx(acc, section) {
     if (!acc) return null;
     const out = { boxShadow: 'none', borderVars: null, edge: null, background: null };
     const iconCol = this._frameIconColor(section);
@@ -3907,7 +4003,7 @@ class ColorLightManagerCard extends HTMLElement {
     const brightnessPct = attrs.brightness ? Math.round((attrs.brightness / 255) * 100) : 0;
     const currentKelvin = attrsToKelvin(attrs) || Math.round(((Number(cfg.min_kelvin)||2000) + (Number(cfg.max_kelvin)||6500)) / 2);
     const currentRgb = attrs.rgb_color || [255, 255, 255];
-    const layoutClass = `layout-${cfg.layout || 'columns'}`;
+    const layoutClass = buttonLayoutClass(cfg.layout);
     const gap = Number(cfg.gap) || 8;
     // NOTE: buttons are rendered per-section (see _renderSection → _renderPresetButton(p, bstyle)),
     // which applies each section's Button Style. There is no card-level preset list in the DOM, so
@@ -3966,7 +4062,8 @@ class ColorLightManagerCard extends HTMLElement {
       this._cardCollapsed = false;
       this._collapseInitialized = true;
     } else if (!this._collapseInitialized) {
-      this._cardCollapsed = cfg.card_collapsible === true;
+      // card_start_expanded: a collapsible card that starts OPEN (the header still collapses it).
+      this._cardCollapsed = cfg.card_collapsible === true && cfg.card_start_expanded !== true;
       this._collapseInitialized = true;
     }
     // Collapsible works even with no title/icon: the header becomes a minimal bar with just
@@ -4019,12 +4116,18 @@ class ColorLightManagerCard extends HTMLElement {
         /* When collapsed, the header keeps no bottom margin so the card hugs the title. */
         .cpc-header.collapsed-state { margin-bottom:0; }
         .cpc-body.collapsed { display:none; }
-        .cpc-presets { display:flex; gap:${gap}px; }
-        .cpc-presets.layout-stack { flex-direction:column; }
-        .cpc-presets.layout-columns { flex-direction:row; flex-wrap:${cfg.wrap ? 'wrap' : 'nowrap'}; justify-content:center; }
-        .cpc-presets.layout-grid { display:grid; grid-template-columns:repeat(${Number(cfg.columns)||3},minmax(0,1fr)); gap:${gap}px; }
-        /* Let grid items shrink to their track instead of overflowing at min-content width. */
-        .cpc-presets.layout-grid .cpc-preset-btn { min-width:0; }
+        .cpc-presets { display:flex; }
+        /* When a buttons section shows the live "Only Control Lights Currently On" checkbox, wrap the
+           body in a flex column so the checkbox sits off the buttons with the SAME spacing the slider
+           sections use (.cpc-sliders gap). Sections without the toggle render .cpc-presets directly. */
+        .cpc-buttons-wrap { display:flex; flex-direction:column; gap:calc(10px * ${scale}); }
+        /* Detached Off-button placement: the wrapper separates the main group from the Off group; the
+           Off group is its own flex line/column. Both inherit the section's button gap. */
+        .cpc-off-wrap { gap:${gap}px; }
+        .cpc-off-group { display:flex; gap:${gap}px; }
+        /* Card-default button layout (stack/columns/scroll/grid + gap/wrap/align) — the ONE layout-CSS
+           builder shared with per-preset styles and the per-section override. */
+        ${buttonLayoutCss(cfg, '', scale)}
         .cpc-preset-btn {
           display:flex; align-items:center; justify-content:center; gap:calc(${buttonIconGap}px * ${scale});
           padding:calc(${buttonHeight}px * ${scale} / 3.15) calc(18px * ${scale}); border-radius:10px; border:none; cursor:pointer;
@@ -4042,8 +4145,8 @@ class ColorLightManagerCard extends HTMLElement {
           ? 'white-space:normal; overflow-wrap:anywhere; text-align:center;'
           : 'white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'} }
         ${buttonNameWrap ? `.cpc-preset-btn { min-height:calc(${buttonHeight}px * ${scale}); align-items:center; }` : ''}
-        /* In columns layout with a max width, stretch buttons to equal width for uniformity. */
-        ${(buttonMaxWidth && cfg.layout === 'columns') ? `.cpc-presets.layout-columns .cpc-preset-btn { flex:1 1 calc(${buttonMaxWidth}px * ${scale}); }` : ''}
+        /* In a columns/scroll row with a max width, stretch buttons to equal width for uniformity. */
+        ${(buttonMaxWidth && (cfg.layout === 'columns' || cfg.layout === 'scroll')) ? `.cpc-presets.layout-columns .cpc-preset-btn { flex:1 1 calc(${buttonMaxWidth}px * ${scale}); }` : ''}
         /* A glowing button floats above its neighbors so its halo shows on all sides. */
         .cpc-preset-btn.cpc-glowing { z-index:1; }
         .cpc-preset-btn:hover { transform:translateY(-1px); box-shadow:0 2px 8px rgba(0,0,0,0.25); }
@@ -4127,16 +4230,9 @@ class ColorLightManagerCard extends HTMLElement {
         /* Each body section is wrapped in .cpc-section; consistent spacing lives here. */
         .cpc-section { margin-bottom:calc(14px * ${scale}); }
         .cpc-section:last-child { margin-bottom:0; }
-        /* Scene Tracker: a responsive grid of read-only Area status tiles. */
-        .cpc-scene-tracker { display:grid; grid-template-columns:repeat(auto-fill, minmax(calc(140px * ${scale}), 1fr)); gap:calc(8px * ${scale}); }
-        .cpc-scene-tracker-empty { font-size:calc(12px * ${scale}); color:var(--secondary-text-color); padding:calc(8px * ${scale}) 0; }
-        .cpc-area-tile { display:flex; align-items:center; gap:calc(8px * ${scale}); padding:calc(8px * ${scale}) calc(10px * ${scale}); border-radius:calc(10px * ${scale}); background:var(--secondary-background-color, rgba(255,255,255,0.04)); min-width:0; }
-        .cpc-area-tile.cpc-area-unavailable { opacity:0.5; }
-        .cpc-area-dot { flex:0 0 auto; width:calc(8px * ${scale}); height:calc(8px * ${scale}); border-radius:50%; }
-        .cpc-area-icon { flex:0 0 auto; --mdc-icon-size:calc(20px * ${scale}); }
-        .cpc-area-text { display:flex; flex-direction:column; min-width:0; }
-        .cpc-area-name { font-size:calc(13px * ${scale}); color:var(--primary-text-color); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .cpc-area-option { font-size:calc(11px * ${scale}); color:var(--secondary-text-color); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        /* Scene Tracker buttons are read-only status tiles: no pointer, no press-lift on hover. */
+        .cpc-preset-btn.cpc-tracker-tile { cursor:default; }
+        .cpc-preset-btn.cpc-tracker-tile:hover { transform:none; box-shadow:none; }
         .cpc-current-values {
           display:grid; grid-template-columns:repeat(2, 1fr); gap:calc(6px * ${scale}) calc(14px * ${scale});
           font-size:calc(12px * ${scale}); color:var(--secondary-text-color);
@@ -4174,6 +4270,15 @@ class ColorLightManagerCard extends HTMLElement {
           background:transparent; color:var(--secondary-text-color); cursor:pointer; font-size:12px;
         }
         .cpc-fav-save-btn ha-icon { --mdc-icon-size:14px; }
+        /* "Save as Favorite" action under a Color Values section (reuses the Local Favorites bar button look). */
+        .cpc-cv-actions { display:flex; margin-top:calc(8px * ${scale}); }
+        .cpc-cv-save-fav {
+          display:inline-flex; align-items:center; gap:4px; padding:4px 10px;
+          border-radius:999px; border:1px dashed var(--divider-color);
+          background:transparent; color:var(--secondary-text-color); cursor:pointer; font-size:calc(12px * ${scale});
+        }
+        .cpc-cv-save-fav:hover { color:var(--primary-text-color); border-color:var(--primary-color); }
+        .cpc-cv-save-fav ha-icon { --mdc-icon-size:14px; }
       </style>
       <div class="cpc-card">
         ${headerHtml}
@@ -4188,6 +4293,76 @@ class ColorLightManagerCard extends HTMLElement {
     this._applyCardFrame();
     this._applySectionFrames();
     this._applyHeaderRulesLive();
+    // Must run AFTER the frames above, since section padding changes the width available to the row.
+    // Size the moved Off / tracker buttons first: their width changes the room left for the row.
+    this._matchDetachedSizes();
+    this._fitWrappedOffRows();
+    this._observeOffRowResize();
+  }
+
+  // Re-fit the wrapped Off rows when the available width changes (window resize, sidebar toggle, a
+  // masonry column reflow), since a different width wraps into different rows.
+  //
+  // Observe the `.cpc-off-wrap-col` cluster, NOT the card element and NOT `.cpc-off-main`:
+  //   - the card host is `display:inline`, and ResizeObserver skips non-replaced inline boxes, so
+  //     observing `this` never delivers a callback at all;
+  //   - `.cpc-off-main` is what _fitWrappedOffRows pins to an explicit width, so once fitted its own
+  //     box stops tracking the available space and it would never report a change either.
+  // The cluster wrap is a block-level flex box that spans the section, so its width follows the
+  // card's exactly. Re-target on every render, since renderCard() replaces the whole subtree.
+  _observeOffRowResize() {
+    if (typeof ResizeObserver !== 'function') return;
+    // Row placements have no column cluster, but their main buttons still resize with the card (and
+    // _matchDetachedSizes follows them), so observe every placement wrapper.
+    const targets = this.querySelectorAll('.cpc-off-wrap');
+    if (!this._offRowRO) {
+      this._offRowRO = new ResizeObserver(() => {
+        // Coalesce to one fit per frame — a resize drag fires this continuously.
+        if (this._offRowFitScheduled) return;
+        this._offRowFitScheduled = true;
+        requestAnimationFrame(() => { this._offRowFitScheduled = false; this._matchDetachedSizes(); this._fitWrappedOffRows(); });
+      });
+    }
+    this._offRowRO.disconnect();
+    targets.forEach(t => this._offRowRO.observe(t));
+  }
+
+  // Give buttons moved OUT of the main row (Off placement, Scene Tracker layout) the size they have
+  // when inline. Inline, a button is a flex item of the button row: it gets the row's width rule (the
+  // style's max-width stretch) and stretches to the row's height like its neighbours. In a detached
+  // group neither applies, so it shrank to its own content — the Off button looked "scaled down" in a
+  // column even at Button Size 100%. CSS can't express "as tall as the buttons in that other row", so
+  // after layout we measure the main buttons and set the detached ones' min-width / min-height to match.
+  // Width is matched only when the main buttons share one width, and never for a Vertical Stack (its
+  // buttons span the whole section; copying that into a side column would squeeze the stack).
+  // Reset first, so a resize re-measures from scratch. Button Size (transform) still scales on top.
+  _matchDetachedSizes() {
+    this.querySelectorAll('.cpc-off-wrap').forEach(wrap => {
+      if (wrap.parentElement && wrap.parentElement.closest('.cpc-off-wrap')) return;   // outermost only
+      const detached = [...wrap.querySelectorAll('.cpc-off-group .cpc-preset-btn')];
+      if (!detached.length) return;
+      const main = [...wrap.querySelectorAll('.cpc-presets .cpc-preset-btn')].filter(b => !b.closest('.cpc-off-group'));
+      [...detached, ...main].forEach(b => { b.style.minWidth = ''; b.style.minHeight = ''; });
+      if (!main.length) return;
+      // A group's Size is CSS zoom; measure detached buttons back at 100% so the zoom applies on top.
+      const zoomOf = (b) => { const g = b.closest('.cpc-off-group'); const z = g ? parseFloat(g.style.zoom) : NaN; return Number.isFinite(z) && z > 0 ? z : 1; };
+      const rects = main.map(b => b.getBoundingClientRect());
+      // Height: inline, every button in a row stretches to the tallest one. Match that between the main
+      // buttons and the Off buttons (an Off button's border can make it a few px taller). Tracker
+      // tiles are matched UP to the main height but don't push it, since a two-line tile is taller.
+      const offNatural = detached.filter(b => b.classList.contains('off-style')).map(b => b.getBoundingClientRect().height / zoomOf(b));
+      const h = Math.max(...rects.map(r => r.height), ...offNatural);
+      // Width only when the main buttons are uniform (a max-width stretch row, or a grid) — that's when
+      // an inline Off would share their width too. Content-sized buttons each keep their own width.
+      const ws = rects.map(r => r.width);
+      const uniform = Math.max(...ws) - Math.min(...ws) <= 2;
+      const w = (!uniform || wrap.querySelector('.cpc-presets.layout-stack')) ? 0 : Math.max(...ws);
+      if (h > 0) main.forEach(b => { if (b.getBoundingClientRect().height < h - 0.5) b.style.minHeight = `${Math.round(h)}px`; });
+      detached.forEach(b => {
+        if (h > 0) b.style.minHeight = `${Math.round(h)}px`;
+        if (w > 0) b.style.minWidth = `${Math.round(w)}px`;
+      });
+    });
   }
 
   // Apply all Header Rule styling (card title + each section heading) in place.
@@ -4201,6 +4376,42 @@ class ColorLightManagerCard extends HTMLElement {
       if (!Array.isArray(section.header_rule_refs) || !section.header_rule_refs.length) return;
       const sectionEl = this.querySelector(`.cpc-section[data-section-id="${section.id}"]`);
       if (sectionEl) this._applyHeaderStyleLive(sectionEl, section);
+    });
+  }
+
+  // Shrink a WRAPPING button row beside a column-placed Off button to the width it actually uses, so
+  // its own centring lines the wrapped rows up on each other (a short last row centres under the row
+  // above) AND the nearest button still sits exactly Off Button Gap from the Off button.
+  //
+  // Why JS: this can't be expressed in CSS. A flex-wrap container's intrinsic (`max-content`) width is
+  // its fully UNWRAPPED width, and `fit-content` resolves to the AVAILABLE width — so the box is always
+  // wider than the rows it wrapped into, and `justify-content:center` centres inside that slack, opening
+  // a phantom gap beside Off. Grid reports a true wrapped width but forces uniform columns (v268's bug:
+  // every layout became a grid). Packing the row toward Off fixes the gap but flush-lefts the rows
+  // (v269's bug). Measuring the widest used row and pinning the box to it satisfies both at once.
+  //
+  // Safe to re-run: we clear the previous fit before measuring, so a resize/re-render re-fits from
+  // scratch rather than compounding. Narrowing the box to its widest row cannot change the wrapping
+  // (no row was wider than that), which is verified in the browser harness.
+  _fitWrappedOffRows() {
+    this.querySelectorAll('.cpc-off-main[data-cpc-fit-rows="1"]').forEach(el => {
+      // Reset any prior fit so we measure the natural wrap at the CURRENT available width.
+      el.style.width = '';
+      el.style.flex = '0 1 auto';
+      const kids = [...el.children];
+      if (!kids.length) return;
+      const rects = kids.map(k => k.getBoundingClientRect());
+      // Group by row (shared top edge), then take the widest row's span.
+      const tops = [...new Set(rects.map(r => Math.round(r.top)))];
+      let widest = 0;
+      for (const t of tops) {
+        const row = rects.filter(r => Math.round(r.top) === t);
+        widest = Math.max(widest, Math.max(...row.map(r => r.right)) - Math.min(...row.map(r => r.left)));
+      }
+      if (widest > 0) {
+        el.style.width = `${Math.ceil(widest)}px`;
+        el.style.flex = '0 0 auto';
+      }
     });
   }
 
@@ -4504,6 +4715,7 @@ class ColorLightManagerCard extends HTMLElement {
     });
 
     this.querySelectorAll('.cpc-preset-btn').forEach(btn => {
+      if (btn.classList.contains('cpc-tracker-tile')) return;   // Scene Tracker tiles are read-only
       btn.onclick = () => {
         const preset = (this._config.presets || []).find(p => p.id === btn.dataset.presetId);
         // Remember the last-pressed preset id so glow/header "active" color mode can follow the
@@ -4582,6 +4794,27 @@ class ColorLightManagerCard extends HTMLElement {
     this.querySelectorAll('.cpc-slider-onlyon-cb').forEach(cb => {
       cb.addEventListener('change', () => { this._onLightsOnly[cb.dataset.sectionId] = cb.checked; });
     });
+    // "Save as Favorite" in a Color Values section: capture THAT section's own target color.
+    this.querySelectorAll('.cpc-cv-save-fav').forEach(btn => {
+      btn.onclick = () => this._saveValuesFavorite(btn.dataset.sectionId);
+    });
+  }
+
+  // Save the given Values section's current color into Local Favorites. Mirrors
+  // _promptSaveFavorite but reads the SECTION's own target (not the card's primary light), so a
+  // multi-section card saves the right color. The Favorite can later be converted to a real button
+  // in the visual editor (Local Favorites panel).
+  _saveValuesFavorite(sectionId) {
+    const section = this._orderedSections().find(s => s.id === sectionId && s.type === 'values');
+    const state = section ? this._sectionPrimaryState(section) : this._primaryState();
+    const attrs = (state && state.attributes) || {};
+    const name = window.prompt('Name this favorite color:', '');
+    if (!name || !name.trim()) return;
+    const value = {};
+    if (attrs.rgb_color) value.rgb_color = attrs.rgb_color;
+    else { const kelvin = attrsToKelvin(attrs); if (kelvin !== undefined) value.color_kelvin = kelvin; }
+    if (attrs.brightness !== undefined) value.brightness = attrs.brightness;
+    favoritesService.addFavorite(name.trim(), value);
   }
 
   // Splits visual feedback (instant, every move) from the actual service call
@@ -4803,6 +5036,8 @@ class ColorLightManagerCard extends HTMLElement {
       if (when && when.type === 'button_off') {
         return this._effectivePreset(preset).action === 'turn_off';
       }
+      // "Scene Tracker button only": applies to this button only when it is a Scene Tracker tile.
+      if (when && when.type === 'button_tracker') return buttonMode(preset) === 'tracker';
       // Light-state conditions on a FOLLOW-COLOR button (scene, or one with glow_entities) follow
       // THIS button's own glow-source light — so a light_on-gated glow layer doesn't collapse when a
       // scene turns the SECTION's representative light off while the scene's own lights are on (the
@@ -4837,6 +5072,7 @@ class ColorLightManagerCard extends HTMLElement {
       // Resolved per button in _buttonStyleForPreset; here they mean "base look only".
       case 'button_active': return false;
       case 'button_off': return false;
+      case 'button_tracker': return false;
       case 'light_on': { const st = this._sectionPrimaryState(section); return !!st && st.state === 'on'; }
       case 'light_off': { const st = this._sectionPrimaryState(section); return !!st && st.state === 'off'; }
       case 'light_unavailable': { const st = this._sectionPrimaryState(section); return !st || st.state === 'unavailable' || st.state === 'unknown'; }
@@ -4884,17 +5120,59 @@ class ColorLightManagerCard extends HTMLElement {
     const radius = Number(s.button_border_radius);
     const radiusCss = Number.isFinite(radius) ? `border-radius:${radius}px;` : '';
     const wrap = s.button_name_wrap;
+    const effLayout = normalizeButtonLayout(s.layout);
     return `<style>
-      ${sel} .cpc-presets { gap:${bgap}px; }
-      ${sel} .cpc-presets.layout-columns { flex-wrap:${s.wrap ? 'wrap' : 'nowrap'}; }
-      ${sel} .cpc-presets.layout-grid { grid-template-columns:repeat(${Number(s.columns)||3},minmax(0,1fr)); gap:${bgap}px; }
+      ${buttonLayoutCss(s, sel, scale)}
       ${sel} .cpc-preset-btn { padding:calc(${bh}px * ${scale} / 3.15) calc(18px * ${scale}); font-size:calc(${bfs}px * ${scale}); font-weight:${bnw}; gap:calc(${bIconGap}px * ${scale}); ${radiusCss}${bMaxW ? `max-width:calc(${bMaxW}px * ${scale});` : ''} }
       ${sel} .cpc-preset-btn .cpc-btn-label { font-weight:${bnw}; ${wrap ? 'white-space:normal; overflow-wrap:anywhere; text-align:center;' : 'white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'} }
       ${wrap ? `${sel} .cpc-preset-btn { min-height:calc(${bh}px * ${scale}); }` : ''}
-      ${(bMaxW && s.layout === 'columns') ? `${sel} .cpc-presets.layout-columns .cpc-preset-btn { flex:1 1 calc(${bMaxW}px * ${scale}); }` : ''}
+      ${(bMaxW && (effLayout === 'columns' || effLayout === 'scroll')) ? `${sel} .cpc-presets.layout-columns .cpc-preset-btn { flex:1 1 calc(${bMaxW}px * ${scale}); }` : ''}
       ${sel} .cpc-preset-btn.cpc-tile { gap:calc(${bIconGap}px * ${scale}); min-height:calc(${bh}px * ${scale} * 1.6); }
       ${sel} .cpc-preset-btn.cpc-tile .cpc-tile-name { font-size:calc(${bfs}px * ${scale}); }
     </style>`;
+  }
+
+  // Per-section Layout override. Same vocabulary as a Button Style's Button Layout group
+  // (stack | columns | scroll | grid). '' = inherit the style's layout. Byte-stable: absent unless set.
+  _sectionLayout(section) { return BUTTON_LAYOUTS.includes(section && section.button_layout) ? section.button_layout : ''; }
+  // Per-section horizontal alignment override (left | center | right). '' = inherit. Byte-stable.
+  _sectionButtonAlign(section) {
+    const a = section && section.button_align;
+    return (a === 'left' || a === 'center' || a === 'right') ? a : '';
+  }
+  // The layout class the section's buttons render under: the section's own Layout override if set,
+  // else the resolved style's layout (which, with no style preset, is Basic Theme's — unchanged).
+  _sectionLayoutClass(section, bstyle) { return buttonLayoutClass(this._sectionLayout(section) || bstyle.layout); }
+  // Scoped CSS for the section's layout overrides (layout type / columns / gap / wrap / align). Builds
+  // a MERGED appearance — the resolved style's layout keys with the section's set overrides layered on
+  // top — then runs it through the SAME buttonLayoutCss builder as the card default and applied style,
+  // so grid content-sizing, alignment, wrap and gap behave identically everywhere. Returns '' when the
+  // section overrides nothing (its style's layout already applies via _sectionButtonStyleCss/global).
+  _sectionLayoutOverrideCss(section, bstyle) {
+    const ov = this._sectionLayout(section);
+    const align = this._sectionButtonAlign(section);
+    const gapSet = section && section.button_gap !== undefined && section.button_gap !== '' && section.button_gap !== null;
+    const wrapSet = section && typeof section.button_wrap === 'boolean';
+    const colsSet = section && section.button_columns !== undefined && section.button_columns !== '' && section.button_columns !== null;
+    if (!ov && !align && !gapSet && !wrapSet && !colsSet) return '';
+    const sel = `.cpc-section[data-section-id="${section.id}"]`;
+    const scale = Number(this._config.scale) || 1.0;
+    // Merge: start from the style's layout group, overlay only the keys the section actually set.
+    const merged = {
+      layout: ov || normalizeButtonLayout(bstyle.layout),
+      columns: colsSet ? clamp(Number(section.button_columns) || 3, 1, 12) : (Number(bstyle.columns) || 3),
+      gap: gapSet ? clamp(Number(section.button_gap) || 0, 0, 64) : (Number(bstyle.gap) || 8),
+      wrap: wrapSet ? section.button_wrap : !!bstyle.wrap,
+      ...(align ? { align } : {}),
+    };
+    const parts = [buttonLayoutCss(merged, sel, scale)];
+    // Preserve the style's max-width stretch on a columns/scroll row (buttonLayoutCss doesn't emit it).
+    const effLayout = normalizeButtonLayout(merged.layout);
+    const bMaxW = Number(bstyle.button_max_width) || 0;
+    if (bMaxW && (effLayout === 'columns' || effLayout === 'scroll')) {
+      parts.push(`${sel} .cpc-presets.layout-columns .cpc-preset-btn { flex:1 1 calc(${bMaxW}px * ${scale}); }`);
+    }
+    return `<style>\n      ${parts.join('\n      ')}\n    </style>`;
   }
 
 
@@ -4925,16 +5203,90 @@ class ColorLightManagerCard extends HTMLElement {
     if (section.type === 'buttons') {
       // Resolve this section's effective button style (Card Default, or a system preset).
       const bstyle = this._sectionButtonStyle(section);
-      const layoutClass = `layout-${bstyle.layout || 'columns'}`;
+      // Per-section Layout override (stack | columns | scroll | grid) takes precedence over the
+      // style's own layout when set; unset keeps the style's layout. Same vocabulary as the style.
+      const layoutClass = this._sectionLayoutClass(section, bstyle);
       const div = '';   // legacy auto-dividers removed — dividers are their own sections now
-      // Per-section style overrides (scoped CSS) — empty when the section uses Card Default.
-      const overrideCss = this._sectionButtonStyleCss(section, bstyle);
+      // Per-section style overrides (scoped CSS) — empty when the section uses Card Default. The
+      // layout-override CSS is appended LAST so its section-scoped rules win over the style's.
+      const overrideCss = this._sectionButtonStyleCss(section, bstyle) + this._sectionLayoutOverrideCss(section, bstyle);
       // Each button re-flattens the stack for ITSELF so a `button_active` overlay applies only to
       // the button whose scene is live (section-scoped conditions still resolve the same for all).
       const stack = this._sectionButtonStack(section);
-      const presetsHtml = this._presetsForSection(section.id).filter(p => !p.hidden)
-        .map(p => this._renderPresetButton(p, this._buttonStyleForPreset(stack, section, p))).join('');
-      const body = this._wrapSectionBody(section, `<div class="cpc-presets ${layoutClass}">${presetsHtml}</div>`);
+      // tracker_hide_none: a Scene Tracker tile disappears while its group has no scene on (Off / None /
+      // -none- / unavailable). Edit/preview safe: it still shows while the dashboard is being edited.
+      const visiblePresets = this._presetsForSection(section.id).filter(p => !p.hidden
+        && !(p.tracker_hide_none && !this._editMode && buttonMode(p) === 'tracker' && !this._resolveAreaStatus(this._trackerArea(p)).isActive));
+      const btnHtml = (p) => buttonMode(p) === 'tracker'
+        ? this._renderTrackerButton(p, section, stack)
+        : this._renderPresetButton(p, this._buttonStyleForPreset(stack, section, p));
+      // Off-button placement: when set, the section's Off-mode buttons are pulled OUT of the main
+      // button flow into their own group, positioned as a row (above/below) or column (before/after)
+      // relative to the rest. 'inline' (default/unset) leaves everything in one group as before.
+      const PLACES = ['row-above', 'row-below', 'col-before', 'col-after'];
+      const offPlace = PLACES.includes(section.off_button_placement) ? section.off_button_placement : '';
+      // Scene Tracker placement uses the SAME four slots as Off placement (row above / row below / column
+      // before / column after). When Off and the trackers pick the same slot they share ONE row or
+      // column, so they line up with each other. With no tracker placement, the Off-only path below is
+      // unchanged (byte-identical output).
+      const trkPlace = PLACES.includes(section.tracker_placement) ? section.tracker_placement : '';
+      const trkP = trkPlace ? visiblePresets.filter(p => buttonMode(p) === 'tracker') : [];
+      const restP = trkPlace ? visiblePresets.filter(p => buttonMode(p) !== 'tracker') : visiblePresets;
+      const mainInfoFor = (inner) => ({
+        layoutClass,
+        layout: normalizeButtonLayout(this._sectionLayout(section) || bstyle.layout),
+        wrap: typeof section.button_wrap === 'boolean' ? section.button_wrap : !!bstyle.wrap,
+        inner,
+      });
+      let presetsBlock;
+      if (trkP.length) {
+        const offP = offPlace ? restP.filter(p => buttonMode(p) === 'off') : [];
+        const mainP = offPlace ? restP.filter(p => buttonMode(p) !== 'off') : restP;
+        if (!mainP.length) {
+          // Nothing left to place the trackers / Off beside → one plain group, in config order.
+          presetsBlock = `<div class="cpc-presets ${layoutClass}">${visiblePresets.map(btnHtml).join('')}</div>`;
+        } else {
+          const slots = {};
+          const put = (slot, g) => { (slots[slot] = slots[slot] || []).push(g); };
+          // Each group keeps its own Location, Size and Gap, even when it shares a slot with the other.
+          put(trkPlace, { html: trkP.map(btnHtml).join(''), scale: section.tracker_scale, align: section.tracker_align, gap: section.tracker_gap, cls: 'cpc-trk-group' });
+          if (offP.length) put(offPlace, { html: offP.map(btnHtml).join(''), scale: section.off_button_scale, align: section.off_button_align, gap: section.off_button_gap, cls: 'cpc-off-sub' });
+          const mainInner = mainP.map(btnHtml).join('');
+          const hasCol = !!(slots['col-before'] || slots['col-after']);
+          presetsBlock = this._composeDetachedSlots(section, slots,
+            `<div class="cpc-presets ${layoutClass}">${mainInner}</div>`, hasCol ? mainInfoFor(mainInner) : null);
+        }
+      } else if (offPlace) {
+        const offP = restP.filter(p => buttonMode(p) === 'off');
+        const mainP = restP.filter(p => buttonMode(p) !== 'off');
+        const mainInner = mainP.map(btnHtml).join('');
+        const mainGroup = `<div class="cpc-presets ${layoutClass}">${mainInner}</div>`;
+        // The Off buttons' inner HTML; empty → no detached group (no stray empty box).
+        const offInner = offP.length ? offP.map(btnHtml).join('') : '';
+        // A COLUMN placement needs the main group to shrink-wrap its buttons (so the gap beside Off is
+        // exactly off_button_gap), which depends on the LAYOUT. Pass the layout through so
+        // _composeOffPlacement can size it correctly while the group keeps its own .cpc-presets +
+        // layout class — i.e. a Vertical Stack still renders as a stack, a Single Row as a row, etc.
+        // (v268 substituted a grid for every layout here, which flattened all four into a grid.)
+        // `wrap` matters because only a WRAPPING row needs the post-layout row fit (see
+        // _fitWrappedOffRows); it resolves the section's Allow-buttons-to-wrap override over the style's.
+        const mainInfo = (offPlace === 'col-before' || offPlace === 'col-after') ? mainInfoFor(mainInner) : null;
+        presetsBlock = this._composeOffPlacement(section, offPlace, mainGroup, offInner, mainInfo);
+      } else {
+        presetsBlock = `<div class="cpc-presets ${layoutClass}">${restP.map(btnHtml).join('')}</div>`;
+      }
+      // Optional live "Only Control Lights Currently On" checkbox — identical to a slider section's
+      // (same generic renderer + config keys), so a button press only affects the section's target
+      // lights that are already on. Placement (top/bottom) is chosen here; alignment + text style
+      // live in the toggle renderer.
+      const onOnlyToggle = section.on_lights_only_toggle ? this._renderSliderOnlyOnToggle(section) : '';
+      const onOnlyPos = section.on_lights_only_label_position === 'bottom' ? 'bottom' : 'top';
+      // With the toggle, wrap in a flex column so the checkbox is spaced off the buttons like a
+      // slider section's is. Without it, render the presets directly (output unchanged).
+      const buttonsBody = onOnlyToggle
+        ? `<div class="cpc-buttons-wrap">${onOnlyPos === 'top' ? onOnlyToggle : ''}${presetsBlock}${onOnlyPos === 'bottom' ? onOnlyToggle : ''}</div>`
+        : presetsBlock;
+      const body = this._wrapSectionBody(section, buttonsBody);
       return `${overrideCss}<div class="cpc-section${div}" data-section-id="${section.id}">${heading}${body}</div>`;
     }
     if (section.type === 'sliders') {
@@ -4970,37 +5322,151 @@ class ColorLightManagerCard extends HTMLElement {
       // its own target's state and uses a per-section DOM id so multiple can coexist.
       const div = '';   // legacy auto-dividers removed
       const st = this._sectionPrimaryState(section);
-      const body = this._wrapSectionBody(section, this._currentValuesBlock(st, section.id));
+      const body = this._wrapSectionBody(section, this._currentValuesBlock(st, section.id, section));
       return `<div class="cpc-section${div}" data-section-id="${section.id}">${heading}${body}</div>`;
-    }
-    if (section.type === 'scene_tracker') {
-      const body = this._wrapSectionBody(section, this._renderSceneTracker(section));
-      return `<div class="cpc-section" data-section-id="${section.id}">${heading}${body}</div>`;
     }
     return '';
   }
 
-  // Scene Tracker: a read-only status board — one tile per Area. Each Area names an input_select
-  // (its scene state) and optionally a representative light (for a live color/brightness readout).
-  // Tiles reflect the current option + a status color; they never write state (v1 read-only).
-  _renderSceneTracker(section) {
-    const areas = Array.isArray(section.areas) ? section.areas : [];
-    if (!areas.length) return `<div class="cpc-scene-tracker-empty">No areas configured. Add areas in the section settings.</div>`;
-    // Optional Button Style binding: when the section names a style_preset, tiles render as styled
-    // buttons (that style's border/glow/gradient/background), reusing the exact button renderer so
-    // the tracker matches the buttons. Otherwise tiles use the default chip layout.
-    const styleSlug = fixtureRefSlug(section.style_preset);
-    const styled = styleSlug ? (buttonStyleStack(styleSlug) || null) : null;
-    if (styled) {
-      // Render EXACTLY like a buttons section: same `.cpc-presets` flex container + layout class +
-      // scoped style CSS, and NO `.cpc-scene-tracker` grid (which would override the button layout).
-      const bstyle = this._sectionButtonStyle(section);
-      const overrideCss = this._sectionButtonStyleCss(section, bstyle);
-      const layoutClass = `layout-${bstyle.layout || 'columns'}`;
-      return `${overrideCss}<div class="cpc-presets ${layoutClass}">${areas.map(a => this._renderAreaTileStyled(a, section, styled)).join('')}</div>`;
+  // Compose the main button group with the section's Off-mode buttons pulled into a detached group.
+  // Both placements use plain flexbox so alignment + gap behave identically and predictably:
+  //   row-above/below → wrap is a flex COLUMN; the Off group is a horizontal row whose L/C/R is
+  //     justify-content. The main group keeps its own layout/alignment.
+  //   col-before/after → wrap is a flex ROW; align-items gives the Off button's Top/Middle/Bottom
+  //     position relative to the main group, and justify-content centres the whole cluster on the card.
+  // off_button_gap sets the px space between the Off group and the main buttons for ALL placements
+  // (it's the wrap's `gap`). off_button_scale scales ONLY the Off group. Both per section, independent
+  // of the card scale.
+  _composeOffPlacement(section, placement, mainGroup, offGroup, mainInfo) {
+    if (!offGroup) return mainGroup;   // no Off buttons → just the main group, no wrapper
+    const a = ['start', 'center', 'end'].includes(section.off_button_align) ? section.off_button_align : 'center';
+    const scale = clamp(Number(section.off_button_scale) || 1, 0.3, 3);
+    const isRowPlacement = placement.startsWith('row');
+    // off_button_gap = space between the Off group and the main buttons — the flex wrap's `gap`, so it
+    // works for every placement (vertical for rows, horizontal for columns). Default 8px.
+    const gap = clamp(Number(section.off_button_gap), 0, 200);
+    const gapPx = Number.isFinite(gap) ? gap : 8;
+
+    if (isRowPlacement) {
+      // Off is its own horizontal row above/below the main group; its L/C/R is justify-content.
+      const flexAlign = a === 'start' ? 'flex-start' : (a === 'end' ? 'flex-end' : 'center');
+      const scaleCss = scale !== 1 ? `transform:scale(${scale});transform-origin:center;` : '';
+      const above = placement === 'row-above';
+      const offEl = `<div class="cpc-off-group" style="flex-direction:row;flex-wrap:wrap;justify-content:${flexAlign};${scaleCss}">${offGroup}</div>`;
+      const kids = above ? `${offEl}${mainGroup}` : `${mainGroup}${offEl}`;
+      return `<div class="cpc-off-wrap" style="display:flex;flex-direction:column;align-items:stretch;gap:${gapPx}px;">${kids}</div>`;
     }
-    return `<div class="cpc-scene-tracker">${areas.map(a => this._renderAreaTile(a)).join('')}</div>`;
+
+    // Column placement: a single (non-wrapping) flex ROW = [Off | gap | main], centred on the card.
+    //   • align-items gives the Off button its Top/Middle/Bottom position beside the main group.
+    //   • the wrap's `gap` is the ONLY space between Off and the main group → the visible gap equals
+    //     off_button_gap, PROVIDED the main group shrink-wraps to the width it actually uses.
+    //   • The main group KEEPS its own layout (.cpc-presets + layout class), so a Vertical Stack renders
+    //     as a stack, a Single Row as a scrolling row, a Grid as a grid. v268 replaced it with a grid for
+    //     every layout to solve the gap — which silently flattened all four layouts into a grid.
+    //   • Shrink-wrapping is layout-dependent (measured in a real browser, not assumed):
+    //       stack / grid   — already report their used width, so `flex:0 1 auto` hugs them. Nothing to do.
+    //       columns/scroll — a flex ROW's intrinsic width is its fully-UNWRAPPED width (every button on
+    //                        one line), so the box stays that wide even when its content wraps to two
+    //                        rows, and centring the cluster opens a phantom gap next to Off (the v264-267
+    //                        bug). It can't be shrink-wrapped, so instead we PACK its content toward the
+    //                        Off button (justify-content start/end, facing Off). The box may be wider
+    //                        than its content, but the nearest button is flush to its facing edge, so the
+    //                        visible gap is exactly off_button_gap at any width.
+    //     The section's Left/Center/Right still works: it positions the whole cluster via the wrap's
+    //     justify-content (below), not the main group's.
+    const crossAlign = a === 'start' ? 'flex-start' : (a === 'end' ? 'flex-end' : 'center');
+    const originV = a === 'end' ? 'bottom' : (a === 'start' ? 'top' : 'center');
+    const scaleCss = scale !== 1 ? `transform:scale(${scale});transform-origin:center ${originV};` : '';
+    const before = placement === 'col-before';
+    const offEl = `<div class="cpc-off-group cpc-off-col" style="flex:0 0 auto;flex-direction:column;flex-wrap:wrap;${scaleCss}">${offGroup}</div>`;
+    // A WRAPPING row keeps its own centring (so a short last row centres under the row above, e.g. a
+    // lone 3rd button sits between the first two) and is fitted to its widest used row after layout by
+    // _fitWrappedOffRows() — CSS can't do it, since a flex-wrap box's intrinsic width is its UNWRAPPED
+    // width and `fit-content` resolves to the AVAILABLE width, either of which leaves slack next to Off.
+    // v269 instead packed the row toward Off, which fixed the gap but left the wrapped rows flush-left.
+    // A non-wrapping row (Single Row) can't wrap, so packing it toward Off is exact and needs no fit.
+    const rowLayout = mainInfo && (mainInfo.layout === 'columns' || mainInfo.layout === 'scroll');
+    const wrapsRows = rowLayout && mainInfo.layout === 'columns' && mainInfo.wrap;
+    const packCss = (rowLayout && !wrapsRows) ? `justify-content:${before ? 'flex-start' : 'flex-end'};` : '';
+    const mainEl = mainInfo
+      ? `<div class="cpc-off-main cpc-presets ${mainInfo.layoutClass}"${wrapsRows ? ' data-cpc-fit-rows="1"' : ''} style="flex:0 1 auto;min-width:0;${packCss}">${mainInfo.inner}</div>`
+      : `<div class="cpc-off-main" style="flex:0 1 auto;min-width:0;">${mainGroup}</div>`;
+    const kids = before ? `${offEl}${mainEl}` : `${mainEl}${offEl}`;
+    // The cluster's own horizontal position = the section's Alignment (Left/Center/Right), defaulting
+    // to centre. This is what moves the [Off + buttons] group on the card.
+    const sa = this._sectionButtonAlign(section);
+    const clusterJC = sa === 'left' ? 'flex-start' : (sa === 'right' ? 'flex-end' : 'center');
+    return `<div class="cpc-off-wrap cpc-off-wrap-col" style="display:flex;flex-direction:row;flex-wrap:nowrap;justify-content:${clusterJC};align-items:${crossAlign};gap:${gapPx}px;">${kids}</div>`;
   }
+
+  // Compose the main button group with detached groups in up to four SLOTS — row-above, row-below,
+  // col-before, col-after — each holding one or more groups (the Scene Tracker tiles and/or the Off
+  // buttons). Groups that share a slot sit in the same row/column, so they line up with each other.
+  //   slots: { [slot]: [{ html, scale, align, gap, cls }] }   (in display order)
+  //     align = the group's Location; gap = its distance from the main buttons (default 8px).
+  // Same structure and rules as _composeOffPlacement, generalised to both sides at once:
+  //   • columns: one non-wrapping flex ROW [col-before | main | col-after]. Class cpc-off-wrap-col so
+  //     the ResizeObserver refits on width changes; the main group is .cpc-off-main and, for a wrapping
+  //     row layout, is fitted to its widest row by _fitWrappedOffRows (v270).
+  //   • rows: a flex COLUMN [row-above | middle | row-below].
+  //   • Location: each slot is split into three ZONES along its axis — start | center | end. The start
+  //     and end zones share the leftover space equally (flex:1 1 0), so the center zone is truly
+  //     centred in the slot. Each group goes in its Location's zone; two groups with the same Location
+  //     sit together in that zone (e.g. both Center → side by side in the middle).
+  //   • Gap: per group, as a margin toward the main buttons, and each zone aligns its groups toward
+  //     the main buttons — so groups with equal gaps line up, and each gap is exact.
+  //   • Size: per group, via CSS zoom (so it takes real space; see groupHtml).
+  // The wrappers set gap:0 inline: .cpc-off-wrap carries the button gap in the stylesheet, and here
+  // each group's gap is its own margin instead.
+  _composeDetachedSlots(section, slots, mainGroup, mainInfo) {
+    const alignOf = (v) => ['start', 'center', 'end'].includes(v) ? v : 'center';
+    const gapOf = (v) => { const n = clamp(Number(v), 0, 200); return Number.isFinite(n) ? n : 8; };
+    // Which edge of the slot faces the main buttons, and the margin that holds each group's gap.
+    const facing = { 'row-above': ['flex-end', 'margin-bottom'], 'row-below': ['flex-start', 'margin-top'],
+      'col-before': ['flex-end', 'margin-right'], 'col-after': ['flex-start', 'margin-left'] };
+    const slotHtml = (slot) => {
+      const gs = slots[slot]; if (!gs) return '';
+      const isRow = slot.startsWith('row');
+      const dir = isRow ? 'row' : 'column';
+      const [toMain, gapProp] = facing[slot];
+      // Size uses CSS zoom, not transform: a transform only scales the picture, leaving the full-size
+      // box in the layout, so a scaled group sat off-centre and its gap looked wrong. zoom resizes the
+      // box itself, so Location and Gap are measured from what you see. The gap margin is on an outer
+      // wrapper so the zoom doesn't scale the gap too.
+      const groupHtml = (g) => {
+        const sc = clamp(Number(g.scale) || 1, 0.3, 3);
+        const zoomCss = sc !== 1 ? `zoom:${sc};` : '';
+        return `<div class="cpc-off-gapbox" style="display:flex;flex:0 0 auto;${gapProp}:${gapOf(g.gap)}px;"><div class="cpc-off-group ${g.cls}" style="flex-direction:${dir};flex-wrap:wrap;${zoomCss}">${g.html}</div></div>`;
+      };
+      const zone = (a, flexCss, justify) => {
+        const inZone = gs.filter(g => alignOf(g.align) === a);
+        return `<div class="cpc-off-group cpc-off-zone" style="${flexCss}flex-direction:${dir};justify-content:${justify};align-items:${toMain};min-width:0;">${inZone.map(groupHtml).join('')}</div>`;
+      };
+      const zones = zone('start', 'flex:1 1 0;', 'flex-start') + zone('center', 'flex:0 0 auto;', 'center') + zone('end', 'flex:1 1 0;', 'flex-end');
+      // A row slot spans the section's width; a column slot stretches to the cluster's height.
+      return `<div class="cpc-off-slot" style="display:flex;flex-direction:${dir};align-items:stretch;${isRow ? '' : 'flex:0 0 auto;align-self:stretch;'}">${zones}</div>`;
+    };
+    let middle = mainGroup;
+    const before = slotHtml('col-before'), after = slotHtml('col-after');
+    if (before || after) {
+      // Pack a NON-wrapping row toward a single column (as _composeOffPlacement does); with columns on
+      // both sides there's no single side to pack toward, so it stays centred.
+      const rowLayout = mainInfo && (mainInfo.layout === 'columns' || mainInfo.layout === 'scroll');
+      const wrapsRows = rowLayout && mainInfo.layout === 'columns' && mainInfo.wrap;
+      const packCss = (rowLayout && !wrapsRows && !(before && after)) ? `justify-content:${before ? 'flex-start' : 'flex-end'};` : '';
+      const mainEl = mainInfo
+        ? `<div class="cpc-off-main cpc-presets ${mainInfo.layoutClass}"${wrapsRows ? ' data-cpc-fit-rows="1"' : ''} style="flex:0 1 auto;min-width:0;${packCss}">${mainInfo.inner}</div>`
+        : `<div class="cpc-off-main" style="flex:0 1 auto;min-width:0;">${mainGroup}</div>`;
+      const sa = this._sectionButtonAlign(section);
+      const clusterJC = sa === 'left' ? 'flex-start' : (sa === 'right' ? 'flex-end' : 'center');
+      middle = `<div class="cpc-off-wrap cpc-off-wrap-col" style="display:flex;flex-direction:row;flex-wrap:nowrap;justify-content:${clusterJC};align-items:center;gap:0;">${before}${mainEl}${after}</div>`;
+    }
+    const above = slotHtml('row-above'), below = slotHtml('row-below');
+    if (!above && !below) return middle;
+    return `<div class="cpc-off-wrap" style="display:flex;flex-direction:column;align-items:stretch;gap:0;">${above}${middle}${below}</div>`;
+  }
+
   // Find the Scene button whose Scene Select binding matches this (entity, option) — i.e. the button
   // that PUTS the group in this state. The Scene Tracker borrows that button's own color + icon so a
   // tile looks exactly like the button that produced its current scene. Returns the preset or null.
@@ -5043,7 +5509,7 @@ class ColorLightManagerCard extends HTMLElement {
     // Icon: matching button's own icon → per-option map → area icon → generic.
     const btnIcon = srcBtn ? resolvePresetIcon(srcBtn, buttonMode(srcBtn)) : null;
     const iconMap = (area && area.icon_map && typeof area.icon_map === 'object') ? area.icon_map : null;
-    const icon = normalizeIcon(btnIcon || (iconMap && iconMap[option]) || (area && area.icon) || 'mdi:palette-outline');
+    const icon = normalizeIcon(btnIcon || (iconMap && iconMap[option]) || (area && area.icon) || modeDefaultIcon('tracker'));
     let sub = '';
     if (lightSt) {
       if (lightSt.state === 'on') { const bri = lightSt.attributes && lightSt.attributes.brightness; sub = bri != null ? `${Math.round((bri / 255) * 100)}%` : 'On'; }
@@ -5053,45 +5519,48 @@ class ColorLightManagerCard extends HTMLElement {
     const isActive = !unavailable && !isNoScene;
     return { option, unavailable, color, icon, sub, isOff, isActive, lightSt };
   }
-  // Default chip tile (no Button Style bound).
-  _renderAreaTile(area) {
-    const st = this._resolveAreaStatus(area);
-    const color = st.color || (st.isOff ? 'var(--secondary-text-color)' : 'var(--primary-color)');
-    const name = escapeHtml((area && area.name) || (area && area.entity) || 'Area');
-    const optionLabel = st.unavailable ? '—' : escapeHtml(st.option || '—');
-    return `<div class="cpc-area-tile${st.unavailable ? ' cpc-area-unavailable' : ''}">
-      <span class="cpc-area-dot" style="background:${color};"></span>
-      <ha-icon class="cpc-area-icon" icon="${st.icon}" style="color:${color};"></ha-icon>
-      <span class="cpc-area-text"><span class="cpc-area-name">${name}</span><span class="cpc-area-option">${optionLabel}${st.sub ? ` · ${escapeHtml(st.sub)}` : ''}</span></span>
-    </div>`;
+  // A Scene Tracker button (mode 'tracker') as the "area" _resolveAreaStatus reads: its input_select
+  // (tracker_entity), optional representative light (tracker_light), and — as the last-resort icon —
+  // the button's own icon when the user set one (a mode-default icon doesn't count).
+  _trackerArea(preset) {
+    const ownIcon = preset && preset.icon && !GENERIC_DEFAULT_ICONS.has(preset.icon) ? preset.icon : undefined;
+    return { name: preset && preset.name, entity: preset && preset.tracker_entity, light: preset && preset.tracker_light, icon: ownIcon };
   }
-  // Styled tile: renders through the SAME button renderer as real buttons, using the bound Button
-  // Style's flattened look. The area's status color becomes the tile's button color; the active-glow
-  // (button_active layer / when_active glow) fires when the area is on a real scene (isActive).
-  _renderAreaTileStyled(area, section, stack) {
-    const st = this._resolveAreaStatus(area);
-    // Flatten the style with button_active resolved to THIS tile's active state; other section-scoped
-    // conditions evaluate against the section context.
+  // Render a Scene Tracker button: a READ-ONLY tile through the SAME button renderer as every other
+  // button in the section (same .cpc-presets container, layout and style), so it lines up with them
+  // and counts as ONE direct child — which _fitWrappedOffRows relies on. Its color/icon come from
+  // _resolveAreaStatus (matching Scene button → live light → neutral); the current option shows on
+  // the sub-line. It keeps its real preset id, and the cpc-tracker-tile class opts it out of the press
+  // handler and of updateStates' active/glow refresh (it re-renders on tracker-entity changes instead).
+  _renderTrackerButton(preset, section, stack) {
+    const st = this._resolveAreaStatus(this._trackerArea(preset));
+    // Per-button style flatten, with button_active / button_off resolved from THIS tile's status.
     const isActive = (when) => {
       if (when && when.type === 'button_active') return st.isActive;
       if (when && when.type === 'button_off') return st.isOff;
+      if (when && when.type === 'button_tracker') return true;   // this IS a Scene Tracker button
       return this._buttonConditionActive(when, section);
     };
-    const cfg = { ...this._config, ...extractButtonAppearance(flattenButtonStack(stack, isActive)) };
-    // Render IDENTICALLY to a button using this style: name is just the Area name (the current scene
-    // shows on the sub-line). The tile's color is the one resolved in _resolveAreaStatus — which now
-    // LEADS with the matching Scene button's own color, so the tile mirrors that button's look
-    // (match-mode glow/border/gradient resolve against the same color the button uses). No color
-    // (no matching button, no light) → colorless, exactly as the equivalent button would render.
-    const name = (area && area.name) || (area && area.entity) || 'Area';
-    const subLabel = st.unavailable ? '—' : (st.option || '');   // current scene shown on a second line
+    const cfg = stack ? { ...this._config, ...extractButtonAppearance(flattenButtonStack(stack, isActive)) } : this._config;
+    // Text: default = the button's name, with the current scene underneath. tracker_text 'scene' = the
+    // current scene as the main text, with the user's own tracker_subtext underneath (no second line
+    // when that's blank).
+    // tracker_none_text: what to show INSTEAD of the option when no scene is on (Off / None / "-none-"
+    // or the helper unavailable), in either text mode. Blank → the option as-is ('—' if unavailable).
+    const noneText = String(preset.tracker_none_text || '').trim();
+    const sceneText = (!st.isActive && noneText) ? noneText : (st.unavailable ? '—' : (st.option || ''));
+    const sceneFirst = preset.tracker_text === 'scene';
+    const name = sceneFirst ? (sceneText || '—') : (preset.name || preset.tracker_entity || 'Area');
+    const subLabel = sceneFirst ? String(preset.tracker_subtext || '') : sceneText;
     const colorHex = (st.color && /^#[0-9a-f]{6}$/i.test(st.color)) ? st.color : null;
-    const preset = { id: `area-${escapeHtml((area && area.entity) || name)}`, name, _sublabel: subLabel, icon: st.icon, mode: st.isOff ? 'off' : 'scene', look_none: !st.isOff, ...(st.isOff ? { action: 'turn_off' } : {}), ...(colorHex ? { button_style_color: colorHex } : {}) };
+    // mode 'tracker' only steers the icon fallback (renderPresetButtonHtml uses the mode for nothing
+    // else); the Off look comes from `look`/action, as for any button.
+    const tile = { id: preset.id, name, _sublabel: subLabel, icon: st.icon, mode: 'tracker', ...(preset.hide_icon ? { hide_icon: true } : {}), look_none: !st.isOff, ...(st.isOff ? { action: 'turn_off' } : {}), ...(colorHex ? { button_style_color: colorHex } : {}) };
     const look = st.isOff ? { action: 'turn_off' } : (colorHex ? { rgb_color: ColorUtils.hexToRgb(colorHex) } : { look_none: true });
-    // Pass the Area's representative light state so 'match'-mode glow/border track the live light,
-    // exactly as a real button pointed at that light would. selectsActive overrides active-detection
-    // for the glow: true when the area is on a real scene.
-    return renderPresetButtonHtml(look, preset, cfg, st.lightSt || null, this._config && this._config.temperature_output_format, null, st.isActive);
+    // The representative light's state lets 'match'-mode glow/border track it; selectsActive (last
+    // arg) forces active = "on a real scene".
+    const html = renderPresetButtonHtml(look, tile, cfg, st.lightSt || null, this._config && this._config.temperature_output_format, null, st.isActive);
+    return html.replace('<button class="cpc-preset-btn', '<button tabindex="-1" aria-readonly="true" class="cpc-preset-btn cpc-tracker-tile');
   }
 
   // Presets assigned to a section. A preset's section_id names its section; presets with no
@@ -5112,11 +5581,18 @@ class ColorLightManagerCard extends HTMLElement {
 
   // The color-value display block for one values section (per-section DOM id). Divider
   // classes live on the wrapping .cpc-section, so they're not repeated here.
-  _currentValuesBlock(state, sectionId) {
+  _currentValuesBlock(state, sectionId, section) {
     const cfg = this._config;
     const justify = { left: 'flex-start', center: 'center', right: 'flex-end' }[cfg.current_values_justify] || 'flex-start';
     const id = sectionId ? `cpc-current-values-${sectionId}` : 'cpc-current-values';
-    return `<div class="cpc-current-values" id="${id}" style="justify-items:${justify};">${this._currentValuesHtml(state)}</div>`;
+    // "Save as Favorite": captures THIS section's displayed color into Local Favorites (the
+    // only live-card persistence available). Shown by default; hidden per-section via
+    // section.hide_save_favorite. In the editor these Favorites can be converted to real buttons.
+    const showSave = sectionId && !(section && section.hide_save_favorite);
+    const saveRow = showSave
+      ? `<div class="cpc-cv-actions" style="justify-content:${justify};"><button class="cpc-cv-save-fav" data-section-id="${sectionId}" title="Save this color as a Favorite"><ha-icon icon="mdi:star-plus-outline"></ha-icon><span>Save as Favorite</span></button></div>`
+      : '';
+    return `<div class="cpc-current-values" id="${id}" style="justify-items:${justify};">${this._currentValuesHtml(state)}</div>${saveRow}`;
   }
 
   updateStates() {
@@ -5190,6 +5666,9 @@ class ColorLightManagerCard extends HTMLElement {
       btns.forEach(btn => {
         const preset = byId.get(btn.dataset.presetId);
         if (!preset) return;
+        // Scene Tracker tiles aren't matched against light state here (that would treat them as
+        // color buttons); they re-render whole when their input_select / light changes.
+        if (buttonMode(preset) === 'tracker') return;
         const sectionEl = btn.closest('.cpc-section');
         const sid = sectionEl && sectionEl.dataset.sectionId;
         const stack = sid ? stackBySection.get(sid) : null;
@@ -5229,6 +5708,7 @@ class ColorLightManagerCard extends HTMLElement {
                 this.updateStates();
               };
               btn.replaceWith(fresh);
+              if (fresh.closest('.cpc-off-wrap')) requestAnimationFrame(() => this._matchDetachedSizes());
             }
             return;
           }
@@ -5286,12 +5766,14 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this._sceneListCollapsed = true;     // Scene Manager "Your Scenes" list starts collapsed
     this._sceneCreateCollapsed = true;   // Scene Manager "Create a Scene" sub-area starts collapsed
     // Collapse state for the Color Entities sub-areas (they can get long with many entities).
-    this._ceCollapsed = { manage: false, create: true, orphans: true };
+    this._ceCollapsed = { manage: false, orphans: true };
     // Open collapsible subpanels (Card/Button Appearance groups), keyed by a stable id. A key
     // present in the set = expanded. All start collapsed.
     this._openSubpanels = new Set();
     this._openButtonStack = null;   // slug of the button-style stack whose layer editor is open
     this._editingLayer = null;          // { slug, idx } — the layer currently open for editing (pencil toggle)
+    this._btnPreviewSlug = null;        // slug of the Button Styles library row whose inline preview is open (eye toggle)
+    this._framePreviewId = null;        // id of the Frame Styles library row whose inline preview is open (eye toggle)
     this._openFrame = null;             // id (lib:<slug>) of the frame preset whose builder is open
     this._frameDraft = null;            // { id, fx, dirty } — working copy while the frame builder is open; edits stay here until Save
     this._openHeaderSet = null;         // slug of the Header Rule Set whose editor is open
@@ -5312,6 +5794,20 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
   // Editor-side resolver (shares the module helper with the renderer).
   _sliderStyle(sectionId) { return resolveSliderStyle(this._config, sectionId); }
+
+  // Editor-side section-layout helpers. The renderer's _sectionLayout/_sectionButtonStyle live on the
+  // CARD class; the editor resolves the same values from module-level helpers it already uses (the
+  // section's style stack → its layout-group keys) so the Section Layout controls can show the right
+  // "Style default" fallbacks without reaching into the card class.
+  _sectionLayout(section) { return BUTTON_LAYOUTS.includes(section && section.button_layout) ? section.button_layout : ''; }
+  // The layout-group defaults (layout/columns/gap/wrap) of the section's resolved Button Style. Falls
+  // back to the Basic Theme built-in when the section names no style (same as the renderer).
+  _sectionStyleLayout(section) {
+    const slug = fixtureRefSlug(section && section.style_preset);
+    const stack = (slug && buttonStyleStack(slug)) ? buttonStyleStack(slug) : builtinButtonStack(BTN_STYLE_BASIC_SLUG);
+    const appr = stack ? extractButtonAppearance(flattenButtonStack(stack, () => false)) : {};
+    return { layout: appr.layout || 'columns', columns: Number(appr.columns) || 3, gap: Number(appr.gap) || 8, wrap: !!appr.wrap };
+  }
 
   // Section objects (migrating legacy configs on the fly). The editor is a separate class
   // from the card, so it has its own copies of these helpers.
@@ -5565,6 +6061,18 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this._render();
   }
 
+  // Keep the Local Favorites panel in sync with favorites saved elsewhere: the card preview's Save
+  // actions, another tab, or edits made in this panel. Only re-render while that panel is open, so a
+  // favorite saved on the card never disturbs editing in another panel.
+  connectedCallback() {
+    if (!this._favUnsub) this._favUnsub = favoritesService.subscribe(() => { if (this._openSection === 'favorites') this._render(); });
+  }
+  disconnectedCallback() {
+    if (this._favUnsub) { this._favUnsub(); this._favUnsub = null; }
+    _offLibListeners(this._libChanged);
+    _offLibListeners(this._btnLibChanged);
+  }
+
   setConfig(config) {
     this._config = { ...ColorLightManagerCard.getStubConfig(), ...config };
     this._config.presets = dedupePresetIds(this._config.presets);
@@ -5576,17 +6084,25 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this._hass = hass;
     // The editor always loads the shared Fixture Profile Library so the manager + preset
     // profile picker reflect it live (re-render on updates), regardless of any ref existing.
-    ensureFixtureLibrary(hass, (this._config && this._config.fixture_library_scope) || 'system', () => this._render());
+    // One stable listener per editor, reused on every hass update (see the card's set hass for why a
+    // fresh arrow per update was a leak). Library updates are coalesced into one render per frame.
+    if (!this._libChanged) this._libChanged = () => {
+      if (this._libRenderPending) return;
+      this._libRenderPending = true;
+      requestAnimationFrame(() => { this._libRenderPending = false; this._render(); });
+    };
+    if (!this._btnLibChanged) this._btnLibChanged = () => { this._migrateSectionDefaults(); this._libChanged(); };
+    ensureFixtureLibrary(hass, (this._config && this._config.fixture_library_scope) || 'system', this._libChanged);
     // Load + live-sync the shared Button Appearance preset library so the list reflects it.
-    ensureButtonStyleLibrary(hass, () => { this._migrateSectionDefaults(); this._render(); });
+    ensureButtonStyleLibrary(hass, this._btnLibChanged);
     // Load + live-sync the shared Frame Style library so the Frame Styles panel
     // shows every System frame (incl. those authored in the Easy Entity Styler
     // card) — always, regardless of whether this card references one yet.
-    ensureFrameLibrary(hass, (this._config && this._config.frame_library_scope) || 'system', () => this._render());
+    ensureFrameLibrary(hass, (this._config && this._config.frame_library_scope) || 'system', this._libChanged);
     // Load + live-sync the shared Header Rule library so the Header Rules panel
     // shows every System rule set (incl. those authored in the Easy Entity Styler
     // card — same `ltek_header_library` key) — always, like the Frame library.
-    ensureHeaderLibrary(hass, (this._config && this._config.header_library_scope) || 'system', () => this._render());
+    ensureHeaderLibrary(hass, (this._config && this._config.header_library_scope) || 'system', this._libChanged);
     // Load the input_select storage-helper collection once (to know which helpers are editable in
     // the Scene Groups panel). Admin-gated at use; a non-admin/unsupported list just yields [].
     this._ensureSceneHelpers();
@@ -6466,13 +6982,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
         // The wheel picks a hue/sat → convert to whatever the preset's current format needs.
         this._setPresetColorFromRgb(presetIndex, ColorUtils.hsToRgb(hue, sat));
       };
-      let dragging = false;
-      canvas.addEventListener('mousedown', (e) => { e.preventDefault(); dragging = true; updateFromWheel(e.clientX, e.clientY); });
-      window.addEventListener('mousemove', (e) => { if (dragging) updateFromWheel(e.clientX, e.clientY); });
-      window.addEventListener('mouseup', () => { dragging = false; });
-      canvas.addEventListener('touchstart', (e) => { dragging = true; updateFromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
-      window.addEventListener('touchmove', (e) => { if (dragging) updateFromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
-      window.addEventListener('touchend', () => { dragging = false; });
+      canvas.addEventListener('mousedown', (e) => { e.preventDefault(); updateFromWheel(e.clientX, e.clientY); trackWindowDrag(updateFromWheel); });
+      canvas.addEventListener('touchstart', (e) => { updateFromWheel(e.touches[0].clientX, e.touches[0].clientY); trackWindowDrag(updateFromWheel); }, {passive:true});
     }
 
     // Hex box → sets color from an RGB hex (respects the current format's storage).
@@ -6658,15 +7169,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
   //   Scene(s)          → mdi:palette
   _presetLinkIcon(preset) {
     const badges = [];
-    // Section chip (no icon): which buttons section this button lives in — or "Unassigned" for a
-    // tile-only button. Purely informational; always shown first.
-    const unassigned = preset.section_id === '__none__';
-    if (unassigned) {
-      badges.push(`<span class="cpce-summary-chip" title="Not shown on the card — tile look only">Unassigned</span>`);
-    } else {
-      const sec = this._sectionForPreset(preset);
-      const secName = (sec && sec.name) || 'Buttons';
-      badges.push(`<span class="cpce-summary-chip" title="In button section “${escapeHtml(secName)}”">${escapeHtml(secName)}</span>`);
+    // "Unassigned" chip for a button not shown on the card. There is no chip naming the section a
+    // button IS in: the Buttons list is grouped by section, so its divider already says that.
+    if (preset.section_id === '__none__') {
+      badges.push(`<span class="cpce-summary-chip" title="Not shown on the card">Unassigned</span>`);
     }
     // Color Entity link → a chip showing the bound entity's NAME, prefixed with a link icon.
     const linked = preset.input_color_entity;
@@ -7070,18 +7576,47 @@ class ColorLightManagerCardEditor extends HTMLElement {
         if (!when || !when.type) return true;
         if (when.type === 'button_active') return activeType === 'active';
         if (when.type === 'button_off') return activeType === 'off';
+        if (when.type === 'button_tracker') return activeType === 'tracker';
         return true;   // section-scoped conditions: show in preview
       };
       return { ...baseCfg, ...extractButtonAppearance(flattenButtonStack(stack, isActive)) };
     };
     const sampleCfg = cfgFor(samplePreset, 'active');
     const offCfg = cfgFor(offPreset, 'off');
+    // A third, Scene Tracker sample only when some layer targets tracker buttons (else it'd just repeat
+    // the Sample). Rendered like a tracker tile: name + current scene below, no color of its own.
+    const usesTracker = Array.isArray(stack && stack.layers) && stack.layers.some(l => l && l.when && l.when.type === 'button_tracker');
+    const trkPreset = { id: '__preview_tracker__', name: 'Tracker', _sublabel: 'Scene', icon: modeDefaultIcon('tracker'), mode: 'tracker', look_none: true };
+    const trkCfg = usesTracker ? cfgFor(trkPreset, 'tracker') : null;
     // Scoped CSS uses layout/metric keys, which are the same across samples → use the Sample's cfg.
     return `${this._buttonPreviewScopedCss(sampleCfg)}<div class="cpce-btn-preview" style="padding:10px;border:1px dashed var(--divider-color,#333);border-radius:6px;margin-bottom:8px;background:var(--ha-card-background,#1a1a1a);">
       <div class="cpc-presets">
         ${renderPresetButtonHtml(samplePreset, samplePreset, sampleCfg, sampleState, sampleCfg.temperature_output_format)}
         ${renderPresetButtonHtml(offPreset, offPreset, offCfg, offState, offCfg.temperature_output_format)}
+        ${trkCfg ? renderPresetButtonHtml({ look_none: true }, trkPreset, trkCfg, null, trkCfg.temperature_output_format) : ''}
       </div>
+    </div>`;
+  }
+
+  // Inline preview for a Frame Styles library row: renders the frame's resolved look (border / glow /
+  // shadow / background / edge) on a small sample box. The preset's own condition is IGNORED here so
+  // a conditional frame still shows its styled look. Empty frame → a "nothing to preview" note.
+  _renderFrameSample(view) {
+    const acc = {};
+    ['glow', 'shadow', 'border', 'background', 'edges'].forEach(g => { if (view && view[g]) acc[g] = view[g]; });
+    if (!Object.keys(acc).length) return `<div class="cpce-hint" style="padding:6px 0;">This frame has no visible styling to preview.</div>`;
+    const fx = this._frameBundleToFx(acc, null);
+    const bv = fx && fx.borderVars;
+    const style = [
+      'box-sizing:border-box', 'padding:16px 18px', 'border-radius:10px', 'min-height:44px',
+      'display:flex', 'align-items:center', 'justify-content:center', 'color:var(--secondary-text-color)', 'font-size:12px',
+      fx && fx.boxShadow && fx.boxShadow !== 'none' ? `box-shadow:${fx.boxShadow}` : '',
+      bv ? `border-top:${bv.top};border-bottom:${bv.bottom};border-left:${bv.left};border-right:${bv.right};border-radius:${bv.radius}` : '',
+      fx && fx.background != null ? `background-color:${fx.background === 'theme' ? 'var(--ha-card-background,#1c1c1c)' : fx.background}` : 'background-color:var(--ha-card-background,#1c1c1c)',
+      fx && fx.edge ? `background-image:${fx.edge.image};background-size:${fx.edge.size};background-position:${fx.edge.position};background-repeat:${fx.edge.repeat}` : '',
+    ].filter(Boolean).join(';');
+    return `<div style="padding:12px;background:var(--secondary-background-color,#151515);border-radius:6px;margin-bottom:8px;overflow:visible;">
+      <div style="${style}">Frame preview</div>
     </div>`;
   }
 
@@ -7149,7 +7684,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       <div class="cpce-hint">Build, edit and store styles. To apply a Frame, use Card Appearance → Card Frame or per section in the section under Section Order.<br><br>Library items are shared system-wide. Built-In is read-only; duplicate to customize.</div>
       <div class="cpce-row" style="gap:8px; margin-bottom:6px;">
         <button class="cpce-create-preset-btn" id="cpce-frame-add"><ha-icon icon="mdi:plus"></ha-icon> New Frame</button>
-        <button class="cpce-mini-btn" id="cpce-frame-import"><ha-icon icon="mdi:import"></ha-icon> Import JSON…</button>
+        <button class="cpce-mini-btn" id="cpce-frame-import" title="Import a Frame Style from JSON"><ha-icon icon="mdi:import"></ha-icon> Import</button>
       </div>
       <div class="cpce-manage-list">${rows.map(({ id, e, builtin }) => {
         const used = applied.includes(id);
@@ -7163,11 +7698,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <ha-icon icon="${builtin ? 'mdi:lock' : 'mdi:auto-fix'}" style="color:var(--primary-color);flex-shrink:0;"></ha-icon>
           <span class="cpce-ce-name">${escapeHtml(view.name || id)}${dirty ? ' <span class="cpce-unsaved-dot" title="Unsaved changes">●</span>' : ''}<span class="cpce-entity-id">${builtin ? 'built-in (read-only) · ' : ''}${escapeHtml(groupsOf(view))}${escapeHtml(condOf(view))}${view.note ? ' · 📝 ' + escapeHtml(view.note) : ''}</span></span>
           ${used ? '<span class="cpce-order-type">on card</span>' : ''}
+          <button class="cpce-icon-btn cpce-frame-preview${this._framePreviewId === id ? ' active' : ''}" data-frame-id="${escapeHtml(id)}" title="${this._framePreviewId === id ? 'Hide preview' : 'Preview'}"><ha-icon icon="${this._framePreviewId === id ? 'mdi:eye-off-outline' : 'mdi:eye-outline'}"></ha-icon></button>
           ${builtin ? '' : `<button class="cpce-icon-btn cpce-frame-edit${open ? ' active' : ''}" data-frame-id="${escapeHtml(id)}" title="Edit this frame's visuals"><ha-icon icon="mdi:pencil"></ha-icon></button>`}
           <button class="cpce-icon-btn cpce-frame-duplicate" data-frame-id="${escapeHtml(id)}" title="Duplicate into an editable System frame"><ha-icon icon="mdi:content-duplicate"></ha-icon></button>
           <button class="cpce-icon-btn cpce-frame-export" data-frame-id="${escapeHtml(id)}" title="Export JSON"><ha-icon icon="mdi:download"></ha-icon></button>
           ${builtin ? '' : `<button class="cpce-delete-entity-btn cpce-frame-delete" data-frame-id="${escapeHtml(id)}" title="Delete from the shared library"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>`}
-        </div>${open && !builtin ? `<div class="cpce-frame-builder-panel${dirty ? ' cpce-panel-unsaved' : ''}" data-frame-id="${escapeHtml(id)}">${this._renderFrameBuilder(id, view)}${this._renderFrameSaveRow(id, dirty)}</div>` : ''}`;
+        </div>${this._framePreviewId === id ? `<div class="cpce-frame-preview-row">${this._renderFrameSample(view)}</div>` : ''}${open && !builtin ? `<div class="cpce-frame-builder-panel${dirty ? ' cpce-panel-unsaved' : ''}" data-frame-id="${escapeHtml(id)}">${this._renderFrameBuilder(id, view)}${this._renderFrameSaveRow(id, dirty)}</div>` : ''}`;
       }).join('')}</div>
     `;
   }
@@ -7220,46 +7756,40 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // one or more conditional overlays (each layer's optional `when` decides if it
   // applies; last active layer wins per property). Building/editing frames stays
   // in the Frame Styles library; this only applies them.
-  // Scene Tracker section config: a repeatable Areas list. Each Area = a name + an input_select
-  // (the scene state) + an optional representative light (for a live color/brightness readout).
-  _renderSceneTrackerConfig(s) {
-    const areas = Array.isArray(s.areas) ? s.areas : [];
+  // Scene Tracker button fields: the input_select whose current option the tile shows, plus an
+  // optional representative light for a live color/brightness readout. One Area per button.
+  _renderTrackerFields(preset, index) {
     const selects = this._allInputSelectEntities();
     const lights = (this._hass && this._hass.states) ? Object.keys(this._hass.states).filter(id => id.startsWith('light.')).sort() : [];
-    const row = (a, i) => `<div class="cpce-row cpce-area-row" data-section-id="${s.id}" data-area="${i}" style="gap:6px;flex-wrap:wrap;">
-      <input type="text" class="cpce-area-name" data-section-id="${s.id}" data-area="${i}" placeholder="Area name" value="${escapeHtml((a && a.name) || '')}" style="flex:1;min-width:110px;">
-      <select class="cpce-area-entity" data-section-id="${s.id}" data-area="${i}" style="flex:1.5;min-width:150px;">
-        <option value="">input_select…</option>
-        ${selects.map(x => `<option value="${escapeHtml(x.entity)}" ${a && a.entity === x.entity ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, x.entity))}</option>`).join('')}
-        ${(a && a.entity && !selects.some(x => x.entity === a.entity)) ? `<option value="${escapeHtml(a.entity)}" selected>${escapeHtml(a.entity)} (missing)</option>` : ''}
-      </select>
-      <select class="cpce-area-light" data-section-id="${s.id}" data-area="${i}" style="flex:1.5;min-width:150px;">
-        <option value="">(optional light)</option>
-        ${lights.map(id => `<option value="${escapeHtml(id)}" ${a && a.light === id ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, id))}</option>`).join('')}
-        ${(a && a.light && !lights.includes(a.light)) ? `<option value="${escapeHtml(a.light)}" selected>${escapeHtml(a.light)} (missing)</option>` : ''}
-      </select>
-      <button class="cpce-delete-entity-btn cpce-area-remove" data-section-id="${s.id}" data-area="${i}" title="Remove area"><ha-icon icon="mdi:close"></ha-icon></button>
-    </div>`;
-    // Optional Button Style binding: render the tiles as styled buttons (that style's border/glow/
-    // gradient/background). "Default tiles" = the simple chip layout.
-    const lib = buttonStyleLibraryMap();
-    const curStyle = fixtureRefSlug(s.style_preset) || '';
-    const styleEntries = [...Object.keys(BUILTIN_BUTTON_STYLES).map(bs => ({ slug: bs, name: BUILTIN_BUTTON_STYLES[bs].name })),
-      ...Object.keys(lib).map(sl => ({ slug: sl, name: lib[sl].name || sl }))].sort((a, b) => a.name.localeCompare(b.name));
-    return `<div class="cpce-sub-title">Tile Style</div>
-      <div class="cpce-row"><label class="lbl">Button Style</label>
-        <select class="cpce-tracker-style" data-id="${s.id}">
-          <option value="" ${!curStyle ? 'selected' : ''}>Default tiles (status chips)</option>
-          ${styleEntries.map(e => `<option value="lib:${escapeHtml(e.slug)}" ${curStyle === e.slug ? 'selected' : ''}>${escapeHtml(e.name)}</option>`).join('')}
-          ${(curStyle && !isBuiltinButtonSlug(curStyle) && !lib[curStyle]) ? `<option value="lib:${escapeHtml(curStyle)}" selected>${escapeHtml(curStyle)} (missing)</option>` : ''}
+    const ent = preset.tracker_entity || '';
+    const light = preset.tracker_light || '';
+    return `<div class="cpce-row"><label class="lbl">Scene Group</label>
+        <select class="cpce-tracker-entity" data-index="${index}">
+          <option value="">Choose input_select…</option>
+          ${selects.map(x => `<option value="${escapeHtml(x.entity)}" ${ent === x.entity ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, x.entity))}</option>`).join('')}
+          ${(ent && !selects.some(x => x.entity === ent)) ? `<option value="${escapeHtml(ent)}" selected>${escapeHtml(ent)} (missing)</option>` : ''}
         </select>
       </div>
-      <div class="cpce-hint">Bind a <strong>Button Style</strong> to render the Area tiles like buttons (border, glow, gradient). The active-scene glow fires when an Area is on a real (non-off) scene. Leave as “Default tiles” for the simple chip look.</div>
-      <div class="cpce-sub-title">Areas</div>
-      <div class="cpce-hint">Each Area shows the current option of its <code>input_select</code>. Add an optional light to show its live color/brightness. Read-only status board.</div>
-      ${areas.map((a, i) => row(a, i)).join('')}
-      <button class="cpce-mini-btn cpce-area-add" data-section-id="${s.id}"><ha-icon icon="mdi:plus"></ha-icon> Add area</button>
-      ${selects.length ? '' : '<div class="cpce-hint">No <code>input_select</code> helpers found — create one in Home Assistant first.</div>'}`;
+      <div class="cpce-row"><label class="lbl">Light</label>
+        <select class="cpce-tracker-light" data-index="${index}">
+          <option value="">None (optional)</option>
+          ${lights.map(id => `<option value="${escapeHtml(id)}" ${light === id ? 'selected' : ''}>${escapeHtml(friendlyName(this._hass, id))}</option>`).join('')}
+          ${(light && !lights.includes(light)) ? `<option value="${escapeHtml(light)}" selected>${escapeHtml(light)} (missing)</option>` : ''}
+        </select>
+      </div>
+      <div class="cpce-row"><label class="lbl">Text</label>
+        <select class="cpce-tracker-text" data-index="${index}">
+          <option value="" ${preset.tracker_text !== 'scene' ? 'selected' : ''}>Button name, current scene below</option>
+          <option value="scene" ${preset.tracker_text === 'scene' ? 'selected' : ''}>Current scene, custom text below</option>
+        </select>
+      </div>
+      <div class="cpce-check"><input type="checkbox" class="cpce-tracker-hidenone" data-index="${index}" ${preset.tracker_hide_none ? 'checked' : ''}><label>Hide this tile when no scene is on</label></div>
+      <div class="cpce-hint">The tile disappears while its group is Off, None, <code>-none-</code> or unavailable, and comes back when a scene is set. It stays visible while you edit the dashboard.</div>
+      ${preset.tracker_hide_none ? '' : `<div class="cpce-row"><label class="lbl">No Scene Text</label><input type="text" class="cpce-tracker-nonetext" data-index="${index}" value="${escapeHtml(preset.tracker_none_text || '')}" placeholder="e.g. No scene (blank = show the option as-is)"></div>
+      <div class="cpce-hint">Shown in place of the scene name when no scene is on, meaning Off, None or <code>-none-</code>, or the helper is unavailable.</div>`}
+      ${preset.tracker_text === 'scene' ? `<div class="cpce-row"><label class="lbl">Text Below</label><input type="text" class="cpce-tracker-subtext" data-index="${index}" value="${escapeHtml(preset.tracker_subtext || '')}" placeholder="e.g. Kitchen (leave blank for none)"></div>` : ''}
+      <div class="cpce-hint">A read-only tile. It shows the current option of this <code>input_select</code> and does nothing when pressed. Its color and icon come from the Scene button whose Scene Selects set that option. If no button matches, it uses the light's live color. The tile glows while the group is on a real scene, meaning anything other than Off or None. Add a light to show its brightness too.</div>
+      ${selects.length ? '' : '<div class="cpce-hint">No <code>input_select</code> helpers found. Create one in Home Assistant first, or check the Scene Group filter in the Scene Groups panel.</div>'}`;
   }
 
   // Section default scene reset: when set, any NON-scene button in this section (color / profile /
@@ -7552,7 +8082,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       <div class="cpce-hint">State-driven header styling. Each rule sets any/all of: icon color, MDI icon, text color, icon/text size, and a secondary line — anything left <strong>Not set</strong> defers to the card's own header logic. Build sets here, then <strong>apply</strong> one to the <strong>Card Header</strong> (Card Appearance → Header) or a <strong>Section</strong> (Section Layout) — applying a set is what turns it on; nothing happens until you do. Shared system-wide (and with the Easy Entity Styler card); Built-In is read-only — duplicate to customize.</div>
       <div class="cpce-row" style="gap:8px; margin:6px 0;">
         <button class="cpce-create-preset-btn" id="cpce-hdr-add"><ha-icon icon="mdi:plus"></ha-icon> New Rule Set</button>
-        <button class="cpce-mini-btn" id="cpce-hdr-import"><ha-icon icon="mdi:import"></ha-icon> Import JSON…</button>
+        <button class="cpce-mini-btn" id="cpce-hdr-import" title="Import a Header Rule Set from JSON"><ha-icon icon="mdi:import"></ha-icon> Import</button>
       </div>
       <div class="cpce-manage-list">${rows.map(({ id, e, builtin }) => {
         const slug = builtin ? BUILTIN_HEADER_SLUG : id.slice(4);
@@ -7781,7 +8311,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       <div class="cpce-hint">Styles are shared across every section (and every Color Light &amp; Scene Manager card) that uses them — edit a style here and all its sections update. <strong>Basic Theme</strong> and <strong>Neon Lux</strong> are fixed built-in looks you can’t edit (duplicate one, or use it as a <em>starter</em> for a new style). Each section picks its own style in Section settings.</div>
       <div class="cpce-row" style="gap:8px; margin-bottom:6px;">
         <button class="cpce-create-preset-btn" id="cpce-btnstyle-new" title="Create a new style from a chosen starter"><ha-icon icon="mdi:plus"></ha-icon> New style</button>
-        <button class="cpce-mini-btn" id="cpce-btnstyle-import"><ha-icon icon="mdi:import"></ha-icon> Import as new preset…</button>
+        <button class="cpce-mini-btn" id="cpce-btnstyle-import" title="Import a Button Style from JSON as a new style"><ha-icon icon="mdi:import"></ha-icon> Import</button>
       </div>
       <div class="cpce-manage-list">${rowsData.map(({ slug: s, entry: e, builtin }) => {
             const nLayers = Array.isArray(e.layers) ? e.layers.length : 0;
@@ -7793,11 +8323,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
               <ha-icon icon="${builtin ? 'mdi:lock' : 'mdi:palette-swatch'}" style="color:var(--primary-color);flex-shrink:0;"></ha-icon>
               <span class="cpce-ce-name">${escapeHtml(e.name || s)}${rowDirty ? ' <span class="cpce-unsaved-dot" title="Unsaved changes">●</span>' : ''}<span class="cpce-entity-id">${escapeHtml(meta)}</span></span>
               ${usedSlugs.has(s) ? '<span class="cpce-order-type">in use</span>' : ''}
+              <button class="cpce-icon-btn cpce-btnstyle-preview${this._btnPreviewSlug === s ? ' active' : ''}" data-slug="${escapeHtml(s)}" title="${this._btnPreviewSlug === s ? 'Hide preview' : 'Preview'}"><ha-icon icon="${this._btnPreviewSlug === s ? 'mdi:eye-off-outline' : 'mdi:eye-outline'}"></ha-icon></button>
               ${builtin ? '' : `<button class="cpce-icon-btn cpce-btnstyle-layers${open?' active':''}" data-slug="${escapeHtml(s)}" title="Edit layers &amp; conditions"><ha-icon icon="mdi:pencil"></ha-icon></button>`}
               <button class="cpce-icon-btn cpce-btnstyle-duplicate" data-slug="${escapeHtml(s)}" title="Duplicate this preset"><ha-icon icon="mdi:content-duplicate"></ha-icon></button>
               <button class="cpce-icon-btn cpce-btnstyle-export" data-slug="${escapeHtml(s)}" title="Export JSON"><ha-icon icon="mdi:download"></ha-icon></button>
               ${builtin ? '' : `<button class="cpce-delete-entity-btn cpce-btnstyle-delete" data-slug="${escapeHtml(s)}" title="Delete preset"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>`}
-            </div>${open && !builtin ? `<div class="cpce-btnstyle-layers-panel${rowDirty ? ' cpce-panel-unsaved' : ''}" data-slug="${escapeHtml(s)}">${this._renderButtonStackLayers(s, e)}</div>` : ''}`;
+            </div>${this._btnPreviewSlug === s ? `<div class="cpce-btnstyle-preview-row">${this._renderButtonSampleRow(buttonStyleStack(s) || e, this._config)}</div>` : ''}${open && !builtin ? `<div class="cpce-btnstyle-layers-panel${rowDirty ? ' cpce-panel-unsaved' : ''}" data-slug="${escapeHtml(s)}">${this._renderButtonStackLayers(s, e)}</div>` : ''}`;
           }).join('')}</div>
     `;
   }
@@ -7871,7 +8402,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       </div>` : ''}
       <div class="cpce-row" style="gap:8px;margin-top:6px;">
         <button class="cpce-mini-btn cpce-layer-add" data-slug="${escapeHtml(slug)}"><ha-icon icon="mdi:plus"></ha-icon> Add layer</button>
-        <button class="cpce-mini-btn cpce-layer-import" data-slug="${escapeHtml(slug)}" title="Paste Button Appearance JSON and append it as new layer(s) to this preset"><ha-icon icon="mdi:import"></ha-icon> Import a Layer</button>
+        <button class="cpce-mini-btn cpce-layer-import" data-slug="${escapeHtml(slug)}" title="Import layers: paste Button Appearance JSON to append it as new layer(s) to this style"><ha-icon icon="mdi:import"></ha-icon> Import</button>
       </div>
       ${this._renderSavedPresetPreview(slug)}
       ${dirty ? this._renderDraftPreview(slug) : ''}
@@ -8369,7 +8900,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this.querySelectorAll(`.cpce-ce-save[data-entity="${id}"], .cpce-ce-discard[data-entity="${id}"]`).forEach(b => { b.disabled = !dirty; b.classList.toggle('cpce-btn-enabled', dirty); });
   }
 
-  _renderPresetEditor(preset, index) {
+  // nav = { prev, next }: CONFIG indexes of the neighbouring buttons in the same section group
+  // (null at either end), which the reorder arrows swap with. Omitted → no arrows rendered.
+  _renderPresetEditor(preset, index, nav) {
     // The Button Mode drives which settings are relevant; everything else is hidden.
     //   off/scene → Button Styling (appearance only, since the button sends no color of its own)
     //   profile   → the Fixture Profile selector (the library owns the look)
@@ -8380,6 +8913,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const isTemp = mode === 'temp';
     const isOff = mode === 'off';
     const isScene = mode === 'scene';
+    const isTracker = mode === 'tracker';   // read-only status tile: only its Scene Tracker fields apply
     // A Color-Entity-linked button holds NO color of its own — the entity is the source of
     // truth. So when linked we HIDE the inline look editors entirely and edit the value in the
     // Color Entities panel instead. Only Custom Color/Temp buttons can link.
@@ -8401,6 +8935,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <ha-icon icon="${escapeHtml(resolvePresetIcon(preset, mode))}"></ha-icon>
           <span class="cpce-preset-summary-name">${escapeHtml(preset.name || 'Preset')}</span>
           ${this._presetLinkIcon(preset)}
+          ${nav ? `<button class="cpce-icon-btn cpce-preset-up" data-swap="${nav.prev ?? ''}" ${nav.prev == null ? 'disabled' : ''} title="Move up"><ha-icon icon="mdi:arrow-up-bold"></ha-icon></button>
+          <button class="cpce-icon-btn cpce-preset-down" data-swap="${nav.next ?? ''}" ${nav.next == null ? 'disabled' : ''} title="Move down"><ha-icon icon="mdi:arrow-down-bold"></ha-icon></button>` : ''}
           <button class="cpce-icon-btn cpce-preset-hide" title="${preset.hidden?'Show on card':'Hide from card'}"><ha-icon icon="${preset.hidden?'mdi:eye-off':'mdi:eye'}"></ha-icon></button>
           <button class="cpce-icon-btn cpce-preset-duplicate" title="Duplicate this button"><ha-icon icon="mdi:content-duplicate"></ha-icon></button>
           <button class="cpce-delete-entity-btn cpce-preset-remove" title="Delete this button"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>
@@ -8410,22 +8946,23 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-subgroup"><ha-icon icon="mdi:link-variant"></ha-icon>Button</div>
           <div class="cpce-preset-header">
             <input type="text" class="cpce-preset-name" value="${escapeHtml(preset.name)}" placeholder="Name">
-            <input type="text" class="cpce-preset-icon" value="${escapeHtml(preset.icon && !GENERIC_DEFAULT_ICONS.has(preset.icon) ? preset.icon : '')}" placeholder="${escapeHtml(modeDefaultIcon(mode))}">
+            <input type="text" class="cpce-preset-icon" value="${escapeHtml(preset.icon && !GENERIC_DEFAULT_ICONS.has(preset.icon) ? preset.icon : '')}" placeholder="${escapeHtml(preset.hide_icon ? 'no icon' : modeDefaultIcon(mode))}" ${preset.hide_icon ? 'disabled' : ''}>
           </div>
+          <div class="cpce-check"><input type="checkbox" class="cpce-preset-noicon" ${preset.hide_icon ? 'checked' : ''}><label>No icon (text only)</label></div>
           ${(() => {
             const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
-            // A button may be UNASSIGNED (section_id === '__none__'): it's not shown on the card, but
-            // still defines a Scene-tile look (color/icon) the Scene Tracker borrows via Scene Selects.
+            // A button may be UNASSIGNED (section_id === '__none__'): it's not shown on the card, but a
+            // Scene button can still define the color/icon a Scene Tracker tile borrows for its option.
             // A missing/blank section_id defaults to the first buttons section (legacy behavior).
             const unassigned = preset.section_id === '__none__';
             const current = unassigned ? '__none__' : (buttonsSections.some(s => s.id === preset.section_id) ? preset.section_id : (buttonsSections[0] && buttonsSections[0].id) || '');
             return `<div class="cpce-row"><label class="lbl">In Button Section</label>
               <select class="cpce-preset-section" data-index="${index}">
                 ${buttonsSections.map(s => `<option value="${s.id}" ${s.id===current?'selected':''}>${escapeHtml(s.name || 'Buttons')}</option>`).join('')}
-                <option value="__none__" ${unassigned?'selected':''}>None — not shown on card (tile look only)</option>
+                <option value="__none__" ${unassigned?'selected':''}>None — not shown on card</option>
               </select>
             </div>
-            ${unassigned ? '<div class="cpce-hint">This button is <strong>hidden from the card</strong>. It still defines a look the Scene Tracker can borrow (via its Scene Selects binding) — use it to style a scene tile without exposing a button.</div>' : ''}`;
+            ${unassigned ? '<div class="cpce-hint">This button is <strong>not shown on the card</strong>. A Scene button here can still give a Scene Tracker tile its color and icon for the option its Scene Selects set, without adding a visible button.</div>' : ''}`;
           })()}
           <div class="cpce-row"><label class="lbl">Mode</label>
             <select class="cpce-preset-mode">
@@ -8434,8 +8971,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
               <option value="scene" ${isScene ? 'selected' : ''}>Scene</option>
               <option value="temp" ${isTemp ? 'selected' : ''}>Custom Temperature</option>
               <option value="color" ${isColor ? 'selected' : ''}>Custom Color</option>
+              <option value="tracker" ${isTracker ? 'selected' : ''}>Scene Tracker (read-only)</option>
             </select>
           </div>
+          ${isTracker ? `<div class="cpce-subgroup"><ha-icon icon="mdi:view-grid-outline"></ha-icon>Scene Tracker</div>${this._renderTrackerFields(preset, index)}` : ''}
           ${isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:palette"></ha-icon>Scene</div>${this._renderPresetScenePicker(preset, index)}` : ''}
           ${isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:lightbulb-on-outline"></ha-icon>Follow Lights for Color</div>${this._renderPresetGlowFollow(preset, index)}` : ''}
           ${showButtonStyle ? this._renderButtonStyling(preset, index) : ''}
@@ -8458,11 +8997,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
           ` : ''}
           ${(isColor || isTemp) ? this._renderInputColorLink(preset, index) : ''}
 
-          ${!isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:lightbulb-group-outline"></ha-icon>Target Lights</div>
+          ${!isScene && !isTracker ? `<div class="cpce-subgroup"><ha-icon icon="mdi:lightbulb-group-outline"></ha-icon>Target Lights</div>
           ${this._renderPresetActions(preset, index, mode)}` : ''}
 
-          <div class="cpce-subgroup"><ha-icon icon="mdi:format-list-bulleted"></ha-icon>Scene Selects</div>
-          ${this._renderPresetSelects(preset, index)}
+          ${!isTracker ? `<div class="cpce-subgroup"><ha-icon icon="mdi:format-list-bulleted"></ha-icon>Scene Selects</div>
+          ${this._renderPresetSelects(preset, index)}` : ''}
         </div>
       </div>
     `;
@@ -8507,7 +9046,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     `;
   }
   // All input_select entities in HA (as Scene Groups), with their options — for every Scene Selects
-  // picker + tracker Area picker. Filtered by the card-level Scene Group filter (Scene Groups panel):
+  // picker + Scene Tracker button picker. Filtered by the card-level Scene Group filter (Scene Groups panel):
   //   • string — the entity_id must contain this substring (default 'scene'); empty = no string filter.
   //   • label  — the entity must carry this HA label; empty = no label filter.
   // When BOTH are set a group must match BOTH (AND). One place to set it, every picker respects it.
@@ -8651,7 +9190,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const refCount = (entity) => {
       let n = 0;
       (this._config.presets || []).forEach(p => { if (presetSelects(p).some(b => b.entity === entity)) n++; });
-      ((this._config.sections) || []).forEach(s => { if (s && s.type === 'scene_tracker' && Array.isArray(s.areas)) s.areas.forEach(a => { if (a && a.entity === entity) n++; }); });
+      (this._config.presets || []).forEach(p => { if (p && buttonMode(p) === 'tracker' && p.tracker_entity === entity && !presetSelects(p).some(b => b.entity === entity)) n++; });
       return n;
     };
     const draft = this._sceneHelperDraft || null;   // { name, options:'multiline', initial, icon }
@@ -8665,7 +9204,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const labelName = (id) => (this._hass && this._hass.labels && this._hass.labels[id] && this._hass.labels[id].name) || id;
     const filterUi = `
       <div class="cpce-sub-title">Scene Group filter</div>
-      <div class="cpce-hint">Which <code>input_select</code> helpers count as Scene Groups everywhere in this card (button Scene Selects, tracker areas, this list). Both filters apply together.</div>
+      <div class="cpce-hint">Which <code>input_select</code> helpers count as Scene Groups everywhere in this card (button Scene Selects, Scene Tracker buttons, this list). Both filters apply together.</div>
       <div class="cpce-row"><label class="lbl">Name contains</label><input type="text" id="cpce-sg-filter-str" placeholder="scene" value="${escapeHtml(filterStr)}"></div>
       <div class="cpce-row"><label class="lbl">Has label</label>
         <select id="cpce-sg-filter-label">
@@ -8691,23 +9230,24 @@ class ColorLightManagerCardEditor extends HTMLElement {
         ${editing && editable ? `<div class="cpce-order-style-panel">
           <div class="cpce-sub-title">Options (one per line)</div>
           <textarea class="cpce-sh-options" data-entity="${escapeHtml(entity)}" rows="${Math.max(3, options.length + 1)}" style="width:100%;box-sizing:border-box;">${escapeHtml(options.join('\n'))}</textarea>
-          <div class="cpce-hint">Changing or removing an option can orphan buttons/tracker areas that reference the old value (${refs} reference${refs===1?'':'s'}). They’ll simply stop matching until repointed.</div>
+          <div class="cpce-hint">Changing or removing an option can orphan buttons that reference the old value (${refs} reference${refs===1?'':'s'}). They’ll simply stop matching until repointed.</div>
           <div class="cpce-row" style="gap:8px;margin-top:6px;"><button class="cpce-create-preset-btn cpce-sh-options-save" data-entity="${escapeHtml(entity)}"><ha-icon icon="mdi:content-save"></ha-icon> Save options</button><button class="cpce-mini-btn cpce-sh-edit" data-entity="${escapeHtml(entity)}">Cancel</button></div>
         </div>` : ''}`;
     }).join('');
     return `
       <div class="cpce-hint">Manage the <code>input_select</code> helpers that hold each area's current scene. Buttons set them (Scene Selects) and the Scene Tracker displays them. These are standard Home Assistant helpers — usable anywhere.</div>
-      ${filterUi}
-      ${isAdmin ? `
-      <div class="cpce-collapse-head${createOpen ? '' : ' collapsed'}" id="cpce-sh-create-toggle"><span class="cpce-subpanel-name">Create a Scene Group</span><ha-icon icon="mdi:chevron-down"></ha-icon></div>
-      ${createOpen ? `
+      ${isAdmin ? `<div class="cpce-row" style="gap:8px; margin-bottom:6px;">
+        <button class="cpce-create-preset-btn${createOpen ? ' active' : ''}" id="cpce-sh-create-toggle" title="${createOpen ? 'Close the new Scene Group form' : 'Create a new Scene Group (input_select helper)'}"><ha-icon icon="${createOpen ? 'mdi:close' : 'mdi:plus'}"></ha-icon> ${createOpen ? 'Cancel' : 'New Scene Group'}</button>
+      </div>
+      ${createOpen ? `<div class="cpce-order-style-panel" style="margin-bottom:8px;">
         <div class="cpce-row"><label class="lbl">Name</label><input type="text" id="cpce-sh-name" placeholder="e.g. Family Room Scenes" value="${escapeHtml((draft && draft.name) || '')}"></div>
         <div class="cpce-sub-title">Options (one per line)</div>
         <textarea id="cpce-sh-new-options" rows="5" style="width:100%;box-sizing:border-box;" placeholder="Sports&#10;Dinner&#10;Bright&#10;Comfort&#10;-none-">${escapeHtml((draft && draft.options) || '')}</textarea>
         <div class="cpce-row"><label class="lbl">Initial option</label><input type="text" id="cpce-sh-initial" placeholder="(optional — defaults to first)" value="${escapeHtml((draft && draft.initial) || '')}"></div>
         <div class="cpce-row"><label class="lbl">Icon</label><input type="text" id="cpce-sh-icon" placeholder="mdi:lightbulb-group (optional)" value="${escapeHtml((draft && draft.icon) || '')}"></div>
         <div class="cpce-row" style="margin-top:6px;"><button class="cpce-create-preset-btn" id="cpce-sh-create"><ha-icon icon="mdi:plus"></ha-icon> Create helper</button></div>
-      ` : ''}` : '<div class="cpce-hint">⚠️ Creating and editing helpers requires an <strong>admin</strong> Home Assistant user. You can still bind buttons to existing helpers.</div>'}
+      </div>` : ''}` : '<div class="cpce-hint">⚠️ Creating and editing helpers requires an <strong>admin</strong> Home Assistant user. You can still bind buttons to existing helpers.</div>'}
+      ${filterUi}
       <div class="cpce-collapse-head" id="cpce-sh-list-header" style="pointer-events:none;"><span class="cpce-subpanel-name">Scene Groups (${all.length})</span></div>
       ${all.length ? `<div class="cpce-manage-list">${listRows}</div>` : '<div class="cpce-hint">No input_select helpers yet.</div>'}
     `;
@@ -8732,29 +9272,32 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const hit = list.find(h => this._helperEntityId(h) === entity);
     return hit ? hit.id : null;
   }
-  // Count references to an input_select entity across button selects + tracker areas.
+  // Count references to an input_select entity: buttons whose Scene Selects bind it, and Scene
+  // Tracker buttons that display it.
   _sceneHelperReferences(entity) {
-    let buttons = 0, areas = 0;
-    (this._config.presets || []).forEach(p => { if (presetSelects(p).some(b => b.entity === entity)) buttons++; });
-    ((this._config.sections) || []).forEach(s => { if (s && s.type === 'scene_tracker' && Array.isArray(s.areas)) s.areas.forEach(a => { if (a && a.entity === entity) areas++; }); });
-    return { buttons, areas, total: buttons + areas };
+    let buttons = 0, trackers = 0;
+    (this._config.presets || []).forEach(p => {
+      if (!p) return;
+      if (buttonMode(p) === 'tracker') { if (p.tracker_entity === entity) trackers++; }
+      else if (presetSelects(p).some(b => b.entity === entity)) buttons++;
+    });
+    return { buttons, trackers, total: buttons + trackers };
   }
-  // Remove every reference to a (deleted) input_select entity: strip matching button selects and
-  // tracker areas so no binding dangles. Writes config once.
+  // Remove every reference to a (deleted) input_select entity: strip matching button selects, and
+  // clear it from Scene Tracker buttons (the button stays, showing "—" until repointed — deleting a
+  // whole button because a helper went away would be too destructive). Writes config once.
   _cleanupHelperReferences(entity) {
     const presets = (this._config.presets || []).map(p => {
-      if (!Array.isArray(p.selects)) return p;
-      const kept = p.selects.filter(b => !(b && b.entity === entity));
-      if (kept.length === p.selects.length) return p;
-      const np = { ...p }; if (kept.length) np.selects = kept; else delete np.selects; return np;
+      if (!p) return p;
+      let np = p;
+      if (np.tracker_entity === entity) { np = { ...np }; delete np.tracker_entity; }
+      if (Array.isArray(np.selects)) {
+        const kept = np.selects.filter(b => !(b && b.entity === entity));
+        if (kept.length !== np.selects.length) { np = { ...np }; if (kept.length) np.selects = kept; else delete np.selects; }
+      }
+      return np;
     });
-    const sections = (this._config.sections || []).map(s => {
-      if (!s || s.type !== 'scene_tracker' || !Array.isArray(s.areas)) return s;
-      const areas = s.areas.filter(a => !(a && a.entity === entity));
-      if (areas.length === s.areas.length) return s;
-      return { ...s, areas };
-    });
-    this._updateConfig({ presets, sections });
+    this._updateConfig({ presets });
   }
   // Load the storage-helper collection once hass is available (admin only; non-admins can't list-edit
   // but the list command still returns for read — we only USE it to know which are editable).
@@ -8774,8 +9317,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
     return `
       <div class="cpce-hint">Manage real Home Assistant <code>scene.*</code> entities — snapshots of the entities you choose (lights <em>and</em> switches, fans, covers, climate, media players…). They work anywhere in HA (native cards, <code>select</code> helpers, automations, voice) and can be triggered by a Scene-mode button.</div>
 
-      <div class="cpce-collapse-head${this._sceneCreateCollapsed ? ' collapsed' : ''}" id="cpce-scene-create-toggle"><span class="cpce-subpanel-name">Create a Scene</span><ha-icon icon="mdi:chevron-down"></ha-icon></div>
-      ${this._sceneCreateCollapsed ? '' : `
+<div class="cpce-row" style="gap:8px; margin-bottom:6px;">
+        <button class="cpce-create-preset-btn${this._sceneCreateCollapsed ? '' : ' active'}" id="cpce-scene-create-toggle" title="${this._sceneCreateCollapsed ? 'Create a new scene by capturing entities' : 'Close the new scene form'}"><ha-icon icon="${this._sceneCreateCollapsed ? 'mdi:plus' : 'mdi:close'}"></ha-icon> ${this._sceneCreateCollapsed ? 'New Scene' : 'Cancel'}</button>
+      </div>
+      ${this._sceneCreateCollapsed ? '' : `<div class="cpce-order-style-panel" style="margin-bottom:8px;">
       <div class="cpce-hint">Set everything how you want it, choose which entities to include, then Capture. Seeded from your Default Entities; add or remove any supported entity. (A scene is a frozen snapshot — re-capture to update it.)</div>
       ${this._renderAddPicker(candidates, captureIds, 'on', 'cpce-scene-cap-add', 'cpce-scene-cap-sel', 'Add an entity to capture…')}
       ${captureIds.length
@@ -8788,7 +9333,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       <div class="cpce-row"><label class="lbl">Icon</label><input type="text" id="cpce-scene-new-icon" placeholder="mdi:ticket"></div>
       <div class="cpce-row" style="margin-top:6px;">
         <button class="cpce-create-preset-btn" id="cpce-scene-capture"${captureIds.length?'':' disabled'}><ha-icon icon="mdi:camera-plus-outline"></ha-icon> Capture</button>
-      </div>`}
+      </div></div>`}
 
       <div class="cpce-collapse-head${this._sceneListCollapsed ? ' collapsed' : ''}" id="cpce-scene-list-toggle"><span class="cpce-subpanel-name">Your Scenes (${scenes.length})</span><ha-icon icon="mdi:chevron-down"></ha-icon></div>
       ${this._sceneListCollapsed ? '' : (scenes.length
@@ -9072,6 +9617,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const usedSlugs = new Set((this._config.presets || []).map(p => fixtureRefSlug(p && p.profile_ref)).filter(Boolean));
     return `
       <div class="cpce-hint">Reusable fixture profiles (color/brightness/transition/effect) shared across all Color Light & Scene Manager cards via Home Assistant's built-in store. Create and edit profiles here; a button uses one by setting Mode = Fixture Profile — one edit updates every button referencing it.</div>
+      <div class="cpce-row" style="gap:8px; margin-bottom:6px;">
+        <button class="cpce-create-preset-btn" id="cpce-add-profile"><ha-icon icon="mdi:plus"></ha-icon> Add Profile</button>
+      </div>
       ${slugs.length
         ? `<div class="cpce-manage-list">${slugs.map(s => {
             const open = this._openProfile === s;
@@ -9089,8 +9637,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
               <button class="cpce-delete-entity-btn cpce-profile-lib-delete" data-slug="${escapeHtml(s)}" title="Delete profile from library"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>
             </div>${open ? `<div class="cpce-profile-edit-panel${dirty ? ' cpce-panel-unsaved' : ''}" data-slug="${escapeHtml(s)}">${this._renderProfileEditPanel(s, e)}${this._renderProfileSaveRow(s, dirty)}</div>` : ''}`;
           }).join('')}</div>`
-        : `<div class="cpce-hint">No profiles yet. Click “Add Profile” to create one.</div>`}
-      <button class="cpce-add-btn" id="cpce-add-profile"><ha-icon icon="mdi:plus"></ha-icon> Add Profile</button>
+        : `<div class="cpce-hint">No profiles yet. Use <strong>Add Profile</strong> above to create one.</div>`}
+
     `;
   }
 
@@ -9316,13 +9864,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
         let angle = Math.atan2(py, px) * 180 / Math.PI; if (angle < 0) angle += 360;
         this._setProfileColorFromRgb(slug, ColorUtils.hsToRgb(Math.round(angle) % 360, Math.round((dist / radius) * 100)));
       };
-      let dragging = false;
-      canvas.addEventListener('mousedown', (e) => { e.preventDefault(); dragging = true; updateFromWheel(e.clientX, e.clientY); });
-      window.addEventListener('mousemove', (e) => { if (dragging) updateFromWheel(e.clientX, e.clientY); });
-      window.addEventListener('mouseup', () => { dragging = false; });
-      canvas.addEventListener('touchstart', (e) => { dragging = true; updateFromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
-      window.addEventListener('touchmove', (e) => { if (dragging) updateFromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
-      window.addEventListener('touchend', () => { dragging = false; });
+      canvas.addEventListener('mousedown', (e) => { e.preventDefault(); updateFromWheel(e.clientX, e.clientY); trackWindowDrag(updateFromWheel); });
+      canvas.addEventListener('touchstart', (e) => { updateFromWheel(e.touches[0].clientX, e.touches[0].clientY); trackWindowDrag(updateFromWheel); }, {passive:true});
     }
     const hexEl = panel.querySelector('.cpce-hex-input');
     if (hexEl) hexEl.addEventListener('change', () => { const rgb = ColorUtils.hexToRgb(hexEl.value); if (rgb) this._setProfileColorFromRgb(slug, rgb); });
@@ -9388,7 +9931,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // data-ss-toggle, not data-preset-toggle) so this doesn't clobber their toggle handler.
     this.querySelectorAll('.cpce-preset-summary[data-preset-toggle]').forEach(summary => {
       summary.onclick = (e) => {
-        if (e.target.closest('.cpce-preset-remove') || e.target.closest('.cpce-preset-duplicate') || e.target.closest('.cpce-preset-hide')) return;
+        if (e.target.closest('.cpce-preset-remove') || e.target.closest('.cpce-preset-duplicate') || e.target.closest('.cpce-preset-hide') || e.target.closest('.cpce-preset-up') || e.target.closest('.cpce-preset-down')) return;
         const index = Number(summary.dataset.presetToggle);
         // If we're CLOSING a preset that has unsaved edits to a linked entity, revert its
         // values to the entity's (the entity is the source of truth; edits need explicit Save).
@@ -9428,6 +9971,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         // owned by Scene mode only; profile_ref by Profile mode only.
         delete p.action; ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]); delete p.color_kelvin;
         delete p.look_none; delete p.profile_ref; delete p.scene_ref; delete p.transition; delete p.effect;
+        delete p.tracker_entity; delete p.tracker_light; delete p.tracker_text; delete p.tracker_subtext; delete p.tracker_none_text; delete p.tracker_hide_none;
         const v = modeEl.value;
         // If the icon isn't a user-customized one (empty or a generic/mode default), follow the
         // new mode's default icon so the button glyph matches its function automatically.
@@ -9437,6 +9981,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
         else if (v === 'scene') { p.look_none = true; delete p.brightness; delete p.input_color_entity; }  // scene_ref set by the picker
         else if (v === 'profile') { delete p.brightness; delete p.input_color_entity; }  // profile_ref set by the picker
         else if (v === 'temp') p.color_kelvin = midKelvin;
+        else if (v === 'tracker') {
+          // Never pressed, so nothing it would send or set applies: drop the press-side fields.
+          delete p.brightness; delete p.input_color_entity; delete p.selects; delete p.no_scene_reset;
+          delete p.glow_entities;
+        }
         else seedColor();  // color
         presets[index] = p;
         this._updateConfig({ presets });
@@ -9453,6 +10002,17 @@ class ColorLightManagerCardEditor extends HTMLElement {
         this._render();
       };
 
+      // No icon (text only). Byte-stable: the key exists only while checked.
+      const noIconEl = container.querySelector('.cpce-preset-noicon');
+      if (noIconEl) noIconEl.addEventListener('change', () => {
+        const presets = [...(this._config.presets || [])];
+        const p = { ...presets[index] };
+        if (noIconEl.checked) p.hide_icon = true; else delete p.hide_icon;
+        presets[index] = p;
+        this._updateConfig({ presets });
+        this._render();
+      });
+
       // Hide/show this button on the card (kept in the editor list either way).
       const hideBtn = container.querySelector('.cpce-preset-hide');
       if (hideBtn) hideBtn.onclick = () => {
@@ -9463,6 +10023,54 @@ class ColorLightManagerCardEditor extends HTMLElement {
         this._updateConfig({ presets });
         this._render();
       };
+
+      // Hide the tile when no scene is on. Byte-stable: key present only while checked.
+      const hideNoneEl = container.querySelector('.cpce-tracker-hidenone');
+      if (hideNoneEl) hideNoneEl.addEventListener('change', () => {
+        const presets = [...(this._config.presets || [])];
+        const p = { ...presets[index] };
+        if (hideNoneEl.checked) p.tracker_hide_none = true; else delete p.tracker_hide_none;
+        presets[index] = p;
+        this._updateConfig({ presets });
+        this._render();
+      });
+
+      // Scene Tracker fields: input_select (tracker_entity), optional light (tracker_light), and the
+      // text choice (tracker_text '' | 'scene') + the custom text below (tracker_subtext).
+      // A blank choice deletes the key, so an unset field never appears in the saved config.
+      [['.cpce-tracker-entity', 'tracker_entity'], ['.cpce-tracker-light', 'tracker_light'], ['.cpce-tracker-text', 'tracker_text'], ['.cpce-tracker-subtext', 'tracker_subtext'], ['.cpce-tracker-nonetext', 'tracker_none_text']].forEach(([sel, key]) => {
+        const el = container.querySelector(sel);
+        if (!el) return;
+        el.addEventListener('change', () => {
+          const presets = [...(this._config.presets || [])];
+          const p = { ...presets[index] };
+          if (el.value.trim()) p[key] = el.value; else delete p[key];
+          // Back to the default text → the custom text below no longer shows, so don't keep it either.
+          if (key === 'tracker_text' && !el.value) delete p.tracker_subtext;
+          presets[index] = p;
+          this._updateConfig({ presets });
+          this._render();
+        });
+      });
+
+      // Reorder: swap this button with its neighbour in the same section group. The neighbour's
+      // CONFIG index is baked into data-swap at render time (section members aren't contiguous in
+      // cfg.presets, so it is not simply index ± 1). Swapping config positions is what reorders the
+      // card, since each section renders its buttons in config order. The open editor follows its
+      // button so an expanded button stays expanded after moving.
+      container.querySelectorAll('.cpce-preset-up, .cpce-preset-down').forEach(btn => {
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          const other = btn.dataset.swap === '' ? NaN : Number(btn.dataset.swap);
+          const presets = [...(this._config.presets || [])];
+          if (!Number.isInteger(other) || !presets[index] || !presets[other]) return;
+          [presets[index], presets[other]] = [presets[other], presets[index]];
+          if (this._openPreset === index) this._openPreset = other;
+          else if (this._openPreset === other) this._openPreset = index;
+          this._updateConfig({ presets });
+          this._render();
+        };
+      });
 
       // Duplicate this button: deep-copy the preset with a fresh id + "(copy)" name, insert
       // right after it, and open the copy for editing.
@@ -10338,6 +10946,14 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-entity-id { font-size:var(--ltek-fs-small); color:var(--secondary-text-color); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .cpce-cm-chips { margin-left:auto; display:flex; gap:var(--ltek-sp-1); flex-wrap:wrap; justify-content:flex-end; }
         .cpce-cm-chip { font-size:var(--ltek-fs-tiny); padding:1px 6px; border-radius:999px; background:var(--secondary-background-color,#2a2a2a); border:1px solid var(--divider-color,#333); color:var(--secondary-text-color); white-space:nowrap; }
+        /* Assigned-button chips under a Buttons section (Section Layout & Config). */
+        .cpce-btn-chips { display:flex; flex-wrap:wrap; gap:var(--ltek-sp-1); margin:4px 0 2px; }
+        .cpce-btn-chip { display:inline-flex; align-items:center; gap:4px; padding:2px 4px 2px 8px; border-radius:999px; background:var(--secondary-background-color,#2a2a2a); border:1px solid var(--divider-color,#333); color:var(--ltek-c-text); font-size:var(--ltek-fs-body); max-width:100%; }
+        .cpce-btn-chip ha-icon { --mdc-icon-size:14px; color:var(--secondary-text-color); flex:0 0 auto; }
+        .cpce-btn-chip-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:140px; }
+        .cpce-btn-chip-remove { display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; width:18px; height:18px; padding:0; border:none; border-radius:50%; background:transparent; color:var(--ltek-c-icon); cursor:pointer; }
+        .cpce-btn-chip-remove ha-icon { --mdc-icon-size:14px; color:inherit; }
+        .cpce-btn-chip-remove:hover { background:var(--ltek-c-error-fade); color:var(--ltek-c-error); }
         .cpce-entity-add { flex-shrink:0; width:26px; height:26px; display:flex; align-items:center; justify-content:center; border:none; border-radius:var(--ltek-r-ctrl); background:var(--primary-color); color:#fff; cursor:pointer; font-size:18px; line-height:1; }
         .cpce-entity-add:hover { filter:brightness(1.1); }
         .cpce-entity-added { flex-shrink:0; color:var(--ltek-c-success); --mdc-icon-size:18px; }
@@ -10515,7 +11131,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-add-plus.on { background:var(--ltek-c-success); }
         .cpce-add-plus.off { background:var(--ltek-c-error); }
         .cpce-add-plus.scene { background:var(--ltek-c-info); }
-        .cpce-order-up ha-icon, .cpce-order-down ha-icon { --mdc-icon-size:18px; }
+        .cpce-order-up ha-icon, .cpce-order-down ha-icon, .cpce-preset-up ha-icon, .cpce-preset-down ha-icon { --mdc-icon-size:18px; }
         .cpce-unmatched-list, .cpce-manage-list { border:1px solid var(--divider-color,#333); border-radius:var(--ltek-r-ctrl); overflow:hidden; margin-bottom:8px; }
         .cpce-unmatched-item, .cpce-manage-item { display:flex; align-items:center; gap:var(--ltek-sp-3); padding:8px; border-top:1px solid var(--divider-color,#333); font-size:var(--ltek-fs-label); color:var(--primary-text-color); }
         .cpce-unmatched-item:first-child, .cpce-manage-item:first-child { border-top:none; }
@@ -10592,6 +11208,15 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-esm-field { display:flex; flex-direction:column; gap:2px; font-size:var(--ltek-fs-small); color:var(--secondary-text-color); flex:1; min-width:130px; }
         .cpce-esm-field select { font-size:var(--ltek-fs-body); }
         .cpce-ce-name { display:flex; flex-direction:column; flex:1; min-width:0; }
+        .cpce-fav-row { gap:var(--ltek-sp-2); }
+        .cpce-fav-row .cpce-fav-name { flex:1; min-width:80px; }
+        .cpce-fav-row input[type="text"], .cpce-fav-row input[type="number"] { padding:var(--ltek-ctrl-pad); background:var(--secondary-background-color,#2a2a2a); border:1px solid var(--divider-color,#333); border-radius:var(--ltek-r-ctrl); color:var(--primary-text-color); font-size:var(--ltek-fs-label); box-sizing:border-box; }
+        .cpce-fav-row .cpce-fav-color { width:32px; height:28px; padding:0; border:none; background:none; flex-shrink:0; cursor:pointer; }
+        .cpce-fav-kelvin-wrap, .cpce-fav-bri-wrap { display:inline-flex; align-items:center; gap:2px; flex-shrink:0; font-size:var(--ltek-fs-small); color:var(--secondary-text-color); }
+        .cpce-fav-kswatch { width:18px; height:18px; border-radius:50%; border:1px solid rgba(255,255,255,0.3); margin-right:4px; }
+        .cpce-fav-kelvin { width:78px; }
+        .cpce-fav-bri { width:60px; }
+        .cpce-fav-row ha-icon { --mdc-icon-size:18px; }
         .cpce-link-unused { color:var(--secondary-text-color); opacity:0.6; }
         .cpce-ce-edit-panel, .cpce-scene-edit-panel { padding:10px 8px; border-top:1px solid var(--divider-color,#333); background:var(--secondary-background-color,rgba(255,255,255,0.03)); }
         .cpce-ce-create-preset { padding:4px 8px; font-size:var(--ltek-fs-body); }
@@ -10600,6 +11225,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
           border:none; border-radius:var(--ltek-r-ctrl); background:var(--primary-color); color:#fff; cursor:pointer; font-size:var(--ltek-fs-body); white-space:nowrap;
         }
         .cpce-create-preset-btn ha-icon { --mdc-icon-size:14px; }
+        /* A row of several add buttons: keep them together at the right (as a single New button sits),
+           instead of each button's margin-left:auto spreading them across the row. */
+        .cpce-add-actions { justify-content:flex-end; }
+        .cpce-add-actions > .cpce-create-preset-btn { margin-left:0; }
         .cpce-manage-entities { margin-top:16px; padding-top:12px; border-top:1px dashed var(--divider-color,#333); }
         .cpce-delete-entity-btn {
           display:flex; align-items:center; justify-content:center; margin-left:auto; padding:6px;
@@ -10627,8 +11256,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
         ${this._section('mdi:palette-outline', 'Card Appearance', 'appearance', `
           <div class="cpce-check"><input type="checkbox" id="cpce-card-collapsible" ${cfg.card_collapsible?'checked':''}><label for="cpce-card-collapsible">Make card collapsible (click title to expand/collapse)</label></div>
           ${cfg.card_collapsible ? `
+            <div class="cpce-check"><input type="checkbox" id="cpce-card-start-expanded" ${cfg.card_start_expanded===true?'checked':''}><label for="cpce-card-start-expanded">Default state: expanded</label></div>
             <div class="cpce-check"><input type="checkbox" id="cpce-card-show-chevron" ${cfg.card_show_chevron!==false?'checked':''}><label for="cpce-card-show-chevron">Show chevron in title</label></div>
-            ${!cfg.title ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">A Card Title (below) is recommended for the collapsible header.</div>` : `<div class="cpce-hint">The card starts collapsed; clicking the title expands it.</div>`}
+            ${!cfg.title ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">A Card Title (below) is recommended for the collapsible header.</div>` : `<div class="cpce-hint">The card starts ${cfg.card_start_expanded===true ? 'expanded' : 'collapsed'}; clicking the title ${cfg.card_start_expanded===true ? 'collapses' : 'expands'} it.</div>`}
           ` : ''}
 
           ${this._subpanel('card-header', 'Header', `
@@ -10711,19 +11341,18 @@ class ColorLightManagerCardEditor extends HTMLElement {
         <div class="cpce-group-divider"><ha-icon icon="mdi:view-dashboard-outline"></ha-icon>Sections</div>
 
         ${this._section('mdi:view-grid-outline', 'Section Layout &amp; Config', 'layout', `
-          <div class="cpce-add-row">
-            <button class="cpce-ees-add-btn" id="cpce-add-buttons-section"><ha-icon icon="mdi:plus"></ha-icon> Buttons</button>
-            <button class="cpce-ees-add-btn" id="cpce-add-values-section"><ha-icon icon="mdi:plus"></ha-icon> Color Values</button>
-            <button class="cpce-ees-add-btn" id="cpce-add-tracker-section"><ha-icon icon="mdi:view-grid-plus-outline"></ha-icon> Scene Tracker</button>
-            <button class="cpce-ees-add-btn" id="cpce-add-divider-section"><ha-icon icon="mdi:minus"></ha-icon> Divider</button>
-            <button class="cpce-ees-add-btn" id="cpce-import-section"><ha-icon icon="mdi:import"></ha-icon> Import Section…</button>
+          <div class="cpce-row cpce-add-actions" style="gap:8px; margin-bottom:6px; flex-wrap:nowrap;">
+            <button class="cpce-create-preset-btn" id="cpce-add-buttons-section" title="Add a Buttons section"><ha-icon icon="mdi:plus"></ha-icon> Buttons</button>
+            <button class="cpce-create-preset-btn" id="cpce-add-values-section" title="Add a Color Values section"><ha-icon icon="mdi:plus"></ha-icon> Color Values</button>
+            <button class="cpce-create-preset-btn" id="cpce-add-divider-section" title="Add a Divider"><ha-icon icon="mdi:plus"></ha-icon> Divider</button>
+            <button class="cpce-mini-btn" id="cpce-import-section" title="Import a section (with its buttons) from JSON"><ha-icon icon="mdi:import"></ha-icon> Import</button>
           </div>
           <div class="cpce-order-list">
             ${this._orderedSections().map((s, i, arr) => {
-              const typeLabel = { buttons: 'Buttons', sliders: 'Sliders', values: 'Color Values', divider: 'Divider', scene_tracker: 'Scene Tracker' }[s.type] || s.type;
+              const typeLabel = { buttons: 'Buttons', sliders: 'Sliders', values: 'Color Values', divider: 'Divider' }[s.type] || s.type;
               const open = this._openSectionStyle === s.id;
               const isDivider = s.type === 'divider';
-              const typeIcon = { buttons:'mdi:gesture-tap-button', sliders:'mdi:tune-variant', values:'mdi:palette', divider:'mdi:minus', scene_tracker:'mdi:view-grid-outline' }[s.type] || 'mdi:shape-outline';
+              const typeIcon = { buttons:'mdi:gesture-tap-button', sliders:'mdi:tune-variant', values:'mdi:palette', divider:'mdi:minus' }[s.type] || 'mdi:shape-outline';
               return `<div class="cpce-order-entry${open?' cpce-order-open':''}">
                 <div class="cpce-order-item${s.hidden?' cpce-order-hidden':''}" data-section-id="${s.id}">
                 ${isDivider
@@ -10764,12 +11393,149 @@ class ColorLightManagerCardEditor extends HTMLElement {
                       </select>
                     </div>
                     <div class="cpce-hint">Pick the style for this section. Edit styles in the <strong>Button Styles</strong> library — changes there update every section using that style.</div>
-                    ${this._renderSectionDefaultScene(s)}` ;
+                    ${(() => {
+                      // Section Layout override — SAME controls as a Button Style's Button Layout group.
+                      // Blank layout = inherit the style. The effective layout (override or style) drives
+                      // which extra controls show (Grid → columns; Columns/Scroll → wrap).
+                      const sl = this._sectionStyleLayout(s);
+                      const effLayout = normalizeButtonLayout(this._sectionLayout(s) || sl.layout);
+                      const gapVal = (s.button_gap!==undefined&&s.button_gap!==''&&s.button_gap!==null) ? clamp(Number(s.button_gap)||0,0,64) : sl.gap;
+                      const colsVal = (s.button_columns!==undefined&&s.button_columns!==''&&s.button_columns!==null) ? clamp(Number(s.button_columns)||3,1,12) : sl.columns;
+                      const wrapChecked = (typeof s.button_wrap==='boolean') ? s.button_wrap : sl.wrap;
+                      return `<div class="cpce-sub-title">Section Layout</div>
+                    <div class="cpce-row"><label class="lbl">Layout Type</label>
+                      <select class="cpce-bs-layout" data-id="${s.id}">
+                        <option value="" ${!s.button_layout?'selected':''}>Style default</option>
+                        <option value="stack" ${s.button_layout==='stack'?'selected':''}>Vertical Stack</option>
+                        <option value="columns" ${s.button_layout==='columns'?'selected':''}>Horizontal Stack</option>
+                        <option value="scroll" ${s.button_layout==='scroll'?'selected':''}>Single Row</option>
+                        <option value="grid" ${s.button_layout==='grid'?'selected':''}>Grid</option>
+                      </select>
+                    </div>
+                    <div class="cpce-hint">Overrides the button style's own layout (set in the <strong>Button Styles</strong> library's <em>Button Layout</em> group); leave on <strong>Style default</strong> to follow it.</div>
+                    ${effLayout==='grid' ? `<div class="cpce-row"><label class="lbl">Grid Columns</label><input type="range" class="cpce-bs-columns" data-id="${s.id}" min="1" max="12" step="1" value="${colsVal}"><span class="cpce-strength-val cpce-bs-columns-val">${colsVal}</span></div>` : ''}
+                    ${effLayout==='columns' ? `<div class="cpce-check"><input type="checkbox" class="cpce-bs-wrap" data-id="${s.id}" ${wrapChecked?'checked':''}><label>Allow buttons to wrap</label></div>` : ''}
+                    <div class="cpce-row"><label class="lbl">Alignment</label>
+                      <select class="cpce-bs-align" data-id="${s.id}">
+                        <option value="" ${!s.button_align?'selected':''}>Default (center)</option>
+                        <option value="left" ${s.button_align==='left'?'selected':''}>Left</option>
+                        <option value="center" ${s.button_align==='center'?'selected':''}>Center</option>
+                        <option value="right" ${s.button_align==='right'?'selected':''}>Right</option>
+                      </select>
+                    </div>
+                    <div class="cpce-row"><label class="lbl">Gap (px)</label><input type="range" class="cpce-bs-gap" data-id="${s.id}" min="0" max="64" step="1" value="${gapVal}"><span class="cpce-strength-val cpce-bs-gap-val">${gapVal}px</span></div>
+                    <div class="cpce-hint">Gap between buttons for this section. Leave alignment on <strong>Default</strong> and gap at the style value to inherit the button style.</div>`;
+                    })()}
+                    ${(() => {
+                      // Off-button placement — pull this section's Off button(s) into a separate row or
+                      // column. The alignment options relabel by orientation (row → L/C/R; column → T/M/B).
+                      const place = ['row-above','row-below','col-before','col-after'].includes(s.off_button_placement) ? s.off_button_placement : '';
+                      const isRow = place.startsWith('row');
+                      const alignOpts = isRow
+                        ? [['start','Left'],['center','Center'],['end','Right']]
+                        : [['start','Top'],['center','Middle'],['end','Bottom']];
+                      const curAlign = ['start','center','end'].includes(s.off_button_align) ? s.off_button_align : 'center';
+                      return `<div class="cpce-sub-title">Off Button Layout</div>
+                    <div class="cpce-row">
+                      <select class="cpce-bs-offplace" data-id="${s.id}">
+                        <option value="" ${!place?'selected':''}>Inline (with other buttons)</option>
+                        <option value="row-above" ${place==='row-above'?'selected':''}>Row above</option>
+                        <option value="row-below" ${place==='row-below'?'selected':''}>Row below</option>
+                        <option value="col-before" ${place==='col-before'?'selected':''}>Column before</option>
+                        <option value="col-after" ${place==='col-after'?'selected':''}>Column after</option>
+                      </select>
+                    </div>
+                    <div class="cpce-hint">Move this section's <strong>Off</strong> button(s) into their own row or column, separate from the rest.</div>
+                    ${place ? `<div class="cpce-row"><label class="lbl">Off Location</label>
+                      <select class="cpce-bs-offalign" data-id="${s.id}">
+                        ${alignOpts.map(([v,l]) => `<option value="${v}" ${curAlign===v?'selected':''}>${l}</option>`).join('')}
+                      </select>
+                    </div>
+                    ${(() => { const osc = clamp(Number(s.off_button_scale)||1, 0.3, 3); return `<div class="cpce-row"><label class="lbl">Button Size</label><input type="range" class="cpce-bs-offscale" data-id="${s.id}" min="0.3" max="2" step="0.05" value="${osc}"><span class="cpce-strength-val cpce-bs-offscale-val">${Math.round(osc*100)}%</span></div>`; })()}
+                    <div class="cpce-hint">Scales just the Off button(s) in this section — independent of the card scale.</div>
+                    ${(() => { const og = clamp(Number(s.off_button_gap)!==undefined&&s.off_button_gap!==null&&s.off_button_gap!==''?Number(s.off_button_gap):8, 0, 200); return `<div class="cpce-row"><label class="lbl">Button Gap</label><input type="range" class="cpce-bs-offgap" data-id="${s.id}" min="0" max="120" step="1" value="${og}"><span class="cpce-strength-val cpce-bs-offgap-val">${og}px</span></div><div class="cpce-hint">Space between the Off button and the main buttons.</div>`; })()}` : ''}`;
+                    })()}
+                    ${(() => {
+                      // Scene Tracker placement: the same four options as Off placement, for this section's
+                      // Scene Tracker buttons, with their own alignment, size and gap (tracker_* keys).
+                      const place = ['row-above','row-below','col-before','col-after'].includes(s.tracker_placement) ? s.tracker_placement : '';
+                      const isRow = place.startsWith('row');
+                      const alignOpts = isRow
+                        ? [['start','Left'],['center','Center'],['end','Right']]
+                        : [['start','Top'],['center','Middle'],['end','Bottom']];
+                      const curAlign = ['start','center','end'].includes(s.tracker_align) ? s.tracker_align : 'center';
+                      const tsc = clamp(Number(s.tracker_scale)||1, 0.3, 3);
+                      const tg = (s.tracker_gap!==undefined&&s.tracker_gap!==null&&s.tracker_gap!=='') ? clamp(Number(s.tracker_gap), 0, 200) : 8;
+                      // Same slot as a placed Off button → they share one row/column; Location, Size and
+                      // Gap stay per group (see _composeDetachedSlots).
+                      const offPl = ['row-above','row-below','col-before','col-after'].includes(s.off_button_placement) ? s.off_button_placement : '';
+                      const shared = !!place && place === offPl;
+                      return `<div class="cpce-sub-title">Scene Tracker Layout</div>
+                    <div class="cpce-row">
+                      <select class="cpce-bs-trkplace" data-id="${s.id}">
+                        <option value="" ${!place?'selected':''}>Inline (with other buttons)</option>
+                        <option value="row-above" ${place==='row-above'?'selected':''}>Row above</option>
+                        <option value="row-below" ${place==='row-below'?'selected':''}>Row below</option>
+                        <option value="col-before" ${place==='col-before'?'selected':''}>Column before</option>
+                        <option value="col-after" ${place==='col-after'?'selected':''}>Column after</option>
+                      </select>
+                    </div>
+                    <div class="cpce-hint">Move this section's <strong>Scene Tracker</strong> buttons into a row or column of their own, using the same slots as Off placement. Pick the <strong>same</strong> layout as the Off button to put them in the Off button's row or column, lined up with it.</div>
+                    ${shared ? `<div class="cpce-hint">Sharing the Off button's ${place.startsWith('row') ? 'row' : 'column'}. Location, Size and Gap still apply to the Scene Tracker buttons on their own; give both the same Gap to line them up exactly.</div>` : ''}
+                    ${place ? `<div class="cpce-row"><label class="lbl">Tracker Location</label>
+                      <select class="cpce-bs-trkalign" data-id="${s.id}">
+                        ${alignOpts.map(([v,l]) => `<option value="${v}" ${curAlign===v?'selected':''}>${l}</option>`).join('')}
+                      </select>
+                    </div>
+                    ` : ''}
+                    ${place ? `<div class="cpce-row"><label class="lbl">Size</label><input type="range" class="cpce-bs-trkscale" data-id="${s.id}" min="0.3" max="2" step="0.05" value="${tsc}"><span class="cpce-strength-val cpce-bs-trkscale-val">${Math.round(tsc*100)}%</span></div>
+                    <div class="cpce-hint">Scales just the Scene Tracker buttons in this section — independent of the card scale.</div>` : ''}
+                    ${place ? `<div class="cpce-row"><label class="lbl">Gap</label><input type="range" class="cpce-bs-trkgap" data-id="${s.id}" min="0" max="120" step="1" value="${tg}"><span class="cpce-strength-val cpce-bs-trkgap-val">${tg}px</span></div><div class="cpce-hint">Space between the Scene Tracker buttons and the main buttons.</div>` : ''}`;
+                    })()}
+                    ${this._renderSectionDefaultScene(s)}
+                    <div class="cpce-check" style="margin-top:8px;"><input type="checkbox" class="cpce-bs-onlyon" data-id="${s.id}" ${s.on_lights_only?'checked':''}><label>Only Control Lights Currently On</label></div>
+                    <div class="cpce-hint">When on, this section's buttons adjust only the target lights that are already on — they won't turn off lights on. Applies to Color, Temperature, Fixture Profile and Off buttons; <strong>Scene</strong> buttons fire the scene as-is and are unaffected.</div>
+                    <div class="cpce-check"><input type="checkbox" class="cpce-bs-onlyon-toggle" data-id="${s.id}" ${s.on_lights_only_toggle?'checked':''}><label>Show an "Only Control Lights Currently On" checkbox on the card</label></div>
+                    <div class="cpce-hint">Lets viewers flip the above on/off live in this section. Its starting state follows the setting above.</div>
+                    ${s.on_lights_only_toggle ? `
+                    <div class="cpce-row"><label class="lbl">Checkbox Position</label>
+                      <select class="cpce-bs-onlyon-pos" data-id="${s.id}">
+                        <option value="top" ${(s.on_lights_only_label_position||'top')==='top'?'selected':''}>Top</option>
+                        <option value="bottom" ${s.on_lights_only_label_position==='bottom'?'selected':''}>Bottom</option>
+                      </select>
+                    </div>
+                    <div class="cpce-row"><label class="lbl">Alignment</label>
+                      <select class="cpce-bs-onlyon-align" data-id="${s.id}">
+                        <option value="left" ${(s.on_lights_only_label_align||'left')==='left'?'selected':''}>Left</option>
+                        <option value="center" ${s.on_lights_only_label_align==='center'?'selected':''}>Center</option>
+                        <option value="right" ${s.on_lights_only_label_align==='right'?'selected':''}>Right</option>
+                      </select>
+                    </div>
+                    ${this._textStyleControls(`cpce-bs-onlyon-${s.id}`, { size: s.on_lights_only_font_size, weight: s.on_lights_only_font_weight || '400', color: s.on_lights_only_font_color }, 12)}
+                    ` : ''}` ;
+                })() : ''}
+                ${s.type === 'buttons' ? (() => {
+                  // Buttons assigned to THIS section, shown as removable chips. Uses the same
+                  // fallback the card render uses (a missing/stale section_id lands in the first
+                  // buttons section), so the chip list matches exactly what renders on the card.
+                  // Removing a chip unassigns the button (section_id → '__none__'): it disappears
+                  // from the card but keeps its look (Scene Tracker can still borrow it).
+                  const assigned = this._presetsBelongingTo(s.id).filter(p => !p.hidden);
+                  const chips = assigned.map(p => `<span class="cpce-btn-chip" title="${escapeHtml(p.name || 'Button')}">
+                      <ha-icon icon="${escapeHtml(normalizeIcon(p.icon || modeDefaultIcon(buttonMode(p))))}"></ha-icon>
+                      <span class="cpce-btn-chip-name">${escapeHtml(p.name || 'Button')}</span>
+                      <button class="cpce-btn-chip-remove" data-preset-id="${escapeHtml(p.id)}" title="Remove from this section"><ha-icon icon="mdi:close"></ha-icon></button>
+                    </span>`).join('');
+                  return `<div class="cpce-sub-title">Buttons in this section</div>
+                    ${assigned.length
+                      ? `<div class="cpce-btn-chips" data-section-id="${s.id}">${chips}</div>`
+                      : `<div class="cpce-hint">No buttons assigned. Add buttons in the <strong>Buttons</strong> panel and set their section, or duplicate one here.</div>`}`;
                 })() : ''}
                 ${s.type === 'values' ? `<div class="cpce-sub-title">Monitored Lights</div>
                   <div class="cpce-hint">Which light(s) this section reads color values from.</div>
-                  ${this._renderTargetPicker(s, `data-vs-target="${s.id}"`)}` : ''}
-                ${s.type === 'scene_tracker' ? this._renderSceneTrackerConfig(s) : ''}
+                  ${this._renderTargetPicker(s, `data-vs-target="${s.id}"`)}
+                  <div class="cpce-check" style="margin-top:8px;"><input type="checkbox" class="cpce-vs-save-fav" data-id="${s.id}" ${!s.hide_save_favorite?'checked':''}><label>Show "Save as Favorite" button on the card</label></div>
+                  <div class="cpce-hint">Lets viewers save the displayed color to <strong>Local Favorites</strong>. You can edit them, or turn them into buttons or Color Entities, in the <strong>Local Favorites</strong> panel.</div>` : ''}
                 ${this._renderSectionFramePicker(s)}
                 ${this._renderSectionHeaderApply(s)}`}
               </div>` : ''}
@@ -10780,27 +11546,51 @@ class ColorLightManagerCardEditor extends HTMLElement {
 
         ${this._section('mdi:lightbulb-multiple-outline', 'Buttons', 'presets', `
           <div class="cpce-hint">Configure the quick-select buttons. Use the color wheel for precise color selection.</div>
+          <div class="cpce-hint">Buttons are grouped by the button section they appear in. Use the arrows to reorder a button within its section — this changes the order on the card.</div>
+          <div class="cpce-row cpce-add-actions" style="gap:8px; margin-bottom:6px;">
+            <button class="cpce-create-preset-btn" id="cpce-add-preset" title="Add a new button (unassigned — pick its section afterwards)"><ha-icon icon="mdi:plus"></ha-icon> Add Button</button>
+            <button class="cpce-create-preset-btn" id="cpce-add-preset-entity" title="Create a new Color Entity and a button linked to it"><ha-icon icon="mdi:link-variant-plus"></ha-icon> Add Button &amp; Entity</button>
+          </div>
           <div id="cpce-preset-list">${(() => {
-            // Group buttons by where their look is STORED: Local (inline look on the button) vs Library
-            // (follows a shared Fixture Profile via profile_ref). Original indices are preserved so
-            // each editor still edits the right preset. Each group's header shows whenever that group
-            // is non-empty (so the labels act as organizers even in an all-local setup).
+            // One group per buttons section (in card order), then an Unassigned group. Uses the same
+            // section-resolution the card render uses, so groupings match what's shown on the card.
+            // Within a group, buttons appear in SAVED CONFIG order — that is the card order, so the
+            // arrows below are what set it. Never re-sort here (e.g. alphabetically): that would hide
+            // the real order and silently undo every move.
+            // Each button carries its ORIGINAL config index (x.i) so its editor edits the right preset.
+            // Section members are not contiguous in cfg.presets, so "move up" swaps with the previous
+            // member of the SAME group (prev/next config indexes), not with index - 1.
             const all = (cfg.presets || []).map((p, i) => ({ p, i }));
-            const library = all.filter(x => fixtureRefSlug(x.p.profile_ref));
-            const local = all.filter(x => !fixtureRefSlug(x.p.profile_ref));
             const div = (icon, label, hint) => `<div class="cpce-preset-group-divider"><ha-icon icon="${icon}"></ha-icon><span>${label}</span><span class="cpce-preset-group-hint">${hint}</span></div>`;
+            const renderGroup = (list) => list.map((x, k) => this._renderPresetEditor(x.p, x.i, {
+              prev: k > 0 ? list[k - 1].i : null,
+              next: k < list.length - 1 ? list[k + 1].i : null,
+            })).join('');
+            const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+            const firstId = buttonsSections.length ? buttonsSections[0].id : null;
+            const validIds = new Set(buttonsSections.map(s => s.id));
+            const groupOf = (p) => p.section_id === '__none__' ? '__none__' : (validIds.has(p.section_id) ? p.section_id : firstId);
             let html = '';
-            if (local.length) html += div('mdi:cellphone', 'Local', 'this card only');
-            html += local.map(x => this._renderPresetEditor(x.p, x.i)).join('');
-            if (library.length) html += div('mdi:bookshelf', 'Library', 'shared Fixture Profiles');
-            html += library.map(x => this._renderPresetEditor(x.p, x.i)).join('');
+            buttonsSections.forEach(sec => {
+              const mine = all.filter(x => groupOf(x.p) === sec.id);
+              if (!mine.length) return;
+              html += div('mdi:gesture-tap-button', escapeHtml(sec.name || 'Buttons'), `${mine.length} button${mine.length === 1 ? '' : 's'}`);
+              html += renderGroup(mine);
+            });
+            // No buttons section at all: groupOf() yields null for every assigned button — still list them.
+            const orphan = all.filter(x => groupOf(x.p) === null);
+            if (orphan.length) html += renderGroup(orphan);
+            const none = all.filter(x => groupOf(x.p) === '__none__');
+            if (none.length) { html += div('mdi:eye-off-outline', 'Unassigned', 'not shown on card'); html += renderGroup(none); }
             return html;
           })()}</div>
-          <button class="cpce-add-btn" id="cpce-add-preset"><ha-icon icon="mdi:plus"></ha-icon> Add Button</button>
         `)}
 
         ${this._section('mdi:tune', 'Sliders', 'sliders', `
           <div class="cpce-hint">Each slider section shows the sliders you pick and controls its own target entities. Add multiple sections to control different lights independently. Styling below (orientation, size, gradient, text) is shared across all slider sections.</div>
+          <div class="cpce-row" style="gap:8px; margin-bottom:6px;">
+            <button class="cpce-create-preset-btn" id="cpce-add-slider-section"><ha-icon icon="mdi:plus"></ha-icon> Add Slider Section</button>
+          </div>
           ${this._orderedSectionsRaw().filter(s => s.type === 'sliders').map((s, i, arr) => {
             const sel = s.sliders || { brightness: true, temperature: true, rgb: true };
             const collapsed = this._openSliderSection === s.id ? '' : ' collapsed';
@@ -10847,7 +11637,6 @@ class ColorLightManagerCardEditor extends HTMLElement {
               </div>
             </div>`;
           }).join('')}
-          <button class="cpce-add-btn" id="cpce-add-slider-section"><ha-icon icon="mdi:plus"></ha-icon> Add Slider Section</button>
 
           ${this._subpanel('sl-shared', 'Shared Slider Settings', `
           <div class="cpce-hint">Kelvin range and movement smoothing apply to <strong>all</strong> slider sections. The visual style below is the <strong>card default</strong> — each slider section can override it with its own "Custom" styling.</div>
@@ -10970,9 +11759,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-hint">Note: the mired display option also applies to the temperature slider readout.</div>
         `)}
 
-        ${this._section('mdi:palette-swatch-outline', 'Scratchpad', 'favorites', `
-          <div class="cpce-check"><input type="checkbox" id="cpce-show-favorites" ${cfg.show_favorites?'checked':''}><label for="cpce-show-favorites">Show scratchpad bar on the card</label></div>
-          <div class="cpce-hint">Scratchpad colors are temporary and saved in this browser only (not synced across devices), shared across all Color Light & Scene Manager cards in it. Use them to quickly stash a color you're experimenting with.</div>
+        ${this._section('mdi:palette-swatch-outline', 'Local Favorites', 'favorites', `
+          <div class="cpce-check"><input type="checkbox" id="cpce-show-favorites" ${cfg.show_favorites?'checked':''}><label for="cpce-show-favorites">Show Local Favorites bar on the card</label></div>
+          <div class="cpce-hint">Local Favorites are saved in this browser only and aren't synced to other devices. Every Color Light & Scene Manager card in this browser shares them. Use them to stash a color you're experimenting with. To keep one, turn it into a button or a Color Entity.</div>
+          ${this._renderLocalFavorites()}
         `)}
 
         ${this._section('mdi:lightbulb-group', 'Default Entities', 'entities', `
@@ -11003,17 +11793,14 @@ class ColorLightManagerCardEditor extends HTMLElement {
             <strong>Custom Color/Temperature</strong> can link to one — the button then applies that entity's
             value <strong>live</strong> (edit it here, every linked button updates). Legacy <code>input_color.*</code> helpers still work.
           </div>
+          <div class="cpce-row" style="gap:8px; margin-bottom:6px;">
+            <input type="text" id="cpce-new-input-color-name" placeholder="New entity name (e.g. Theater Golden)">
+            <button class="cpce-create-preset-btn" id="cpce-create-input-color-entity"><ha-icon icon="mdi:plus"></ha-icon> Create Entity</button>
+          </div>
+          <div class="cpce-hint">Creates a <code>color</code> helper entity and, once it exists, a button linked to it (unassigned). If the entity can't be created, no button is added.</div>
 
           <div class="cpce-collapse-head${this._ceCollapsed.manage ? ' collapsed' : ''}" data-ce-toggle="manage"><span class="cpce-subpanel-name">Manage Entities (${this._allInputColorEntities.length})</span><ha-icon icon="mdi:chevron-down"></ha-icon></div>
           ${this._ceCollapsed.manage ? '' : this._renderColorEntitiesManageList()}
-
-          <div class="cpce-collapse-head${this._ceCollapsed.create ? ' collapsed' : ''}" data-ce-toggle="create"><span class="cpce-subpanel-name">Create New Entity</span><ha-icon icon="mdi:chevron-down"></ha-icon></div>
-          ${this._ceCollapsed.create ? '' : `
-            <div class="cpce-row">
-              <input type="text" id="cpce-new-input-color-name" placeholder="Entity name (e.g. Theater Golden)">
-              <button class="cpce-create-preset-btn" id="cpce-create-input-color-entity"><ha-icon icon="mdi:plus"></ha-icon> Create Entity</button>
-            </div>
-            <div class="cpce-hint">Creates a new <code>color</code> helper entity and, once confirmed, a new preset automatically linked to it. If the entity can't be created, no preset is created.</div>`}
 
           <div class="cpce-collapse-head${this._ceCollapsed.orphans ? ' collapsed' : ''}" data-ce-toggle="orphans"><span class="cpce-subpanel-name">Clean Up Orphans</span><ha-icon icon="mdi:chevron-down"></ha-icon></div>
           ${this._ceCollapsed.orphans ? '' : `
@@ -11049,12 +11836,21 @@ class ColorLightManagerCardEditor extends HTMLElement {
           ${this._btnGroupSubpanel('btn-layout', 'layout', 'Button Layout', `
           <div class="cpce-row"><label class="lbl">Layout Type</label>
             <select id="cpce-layout">
-              <option value="stack" ${cfg.layout==='stack'?'selected':''}>Stack (vertical)</option>
-              <option value="columns" ${cfg.layout==='columns'?'selected':''}>Columns (row)</option>
+              <option value="stack" ${cfg.layout==='stack'?'selected':''}>Vertical Stack</option>
+              <option value="columns" ${cfg.layout==='columns'?'selected':''}>Horizontal Stack</option>
+              <option value="scroll" ${cfg.layout==='scroll'?'selected':''}>Single Row</option>
               <option value="grid" ${cfg.layout==='grid'?'selected':''}>Grid</option>
             </select>
           </div>
           <div class="cpce-row"><label class="lbl">Grid Columns</label><input type="range" id="cpce-columns" min="1" max="6" value="${Number(cfg.columns)||3}"><span class="cpce-strength-val" id="cpce-columns-val">${Number(cfg.columns)||3}</span></div>
+          <div class="cpce-row"><label class="lbl">Alignment</label>
+            <select id="cpce-align">
+              <option value="" ${!cfg.align?'selected':''}>Default (center)</option>
+              <option value="left" ${cfg.align==='left'?'selected':''}>Left</option>
+              <option value="center" ${cfg.align==='center'?'selected':''}>Center</option>
+              <option value="right" ${cfg.align==='right'?'selected':''}>Right</option>
+            </select>
+          </div>
           <div class="cpce-row"><label class="lbl">Gap (px)</label><input type="range" id="cpce-gap" min="0" max="48" value="${Number(cfg.gap)||8}"><span class="cpce-strength-val" id="cpce-gap-val">${Number(cfg.gap)||8}px</span></div>
           <div class="cpce-check"><input type="checkbox" id="cpce-wrap" ${cfg.wrap?'checked':''}><label for="cpce-wrap">Allow buttons to wrap</label></div>`)}
 
@@ -11336,6 +12132,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     bind('#cpce-icon-off-color', 'icon_off_color');
     bindBtn('#cpce-layout', 'layout');
     bindBtn('#cpce-columns', 'columns', v => clamp(parseInt(v,10)||3,1,6));
+    bindBtn('#cpce-align', 'align', v => v || undefined);   // '' (Default) → omit the key (byte-stable)
     bindBtn('#cpce-gap', 'gap', v => clamp(parseInt(v,10)||0,0,48));
     bindBtn('#cpce-button-icon-gap', 'button_icon_gap', v => clamp(parseInt(v,10)||0,0,24));
     bindBtn('#cpce-wrap', 'wrap');
@@ -11374,6 +12171,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
       const id = panel.dataset.sectionId;
       const showCb = panel.querySelector('.cpce-sn-show');
       if (showCb) showCb.addEventListener('change', () => { patchSection(id, { name_show: showCb.checked }); this._render(); });
+      // Values section: show/hide the card's "Save as Favorite" button. Byte-stable — the key is
+      // written only when HIDDEN (checked = shown = default = key absent).
+      const vsSaveFav = panel.querySelector('.cpce-vs-save-fav');
+      if (vsSaveFav) vsSaveFav.addEventListener('change', () => { patchSection(id, { hide_save_favorite: vsSaveFav.checked ? undefined : true }); this._render(); });
       // Per-section collapse toggles.
       const collCb = panel.querySelector('.cpce-sn-collapsible');
       if (collCb) collCb.addEventListener('change', () => { patchSection(id, { collapsible: collCb.checked }); this._render(); });
@@ -11382,6 +12183,97 @@ class ColorLightManagerCardEditor extends HTMLElement {
       // Per-section Button Style preset: '' = Card Default (clear ref), else lib:<slug>.
       const stylePresetSel = panel.querySelector('.cpce-sn-style-preset');
       if (stylePresetSel) stylePresetSel.addEventListener('change', () => { patchSection(id, { style_preset: stylePresetSel.value || undefined }); this._render(); });
+      // Buttons section "Only Control Lights Currently On" (static + live-toggle) — mirrors the
+      // sliders editor. Byte-stable: boolean flags are written only when true (deleted when off).
+      const bsSetFlag = (key, on, rerender) => {
+        patchSection(id, { [key]: on ? true : undefined });
+        if (rerender) this._render();
+      };
+      // Section Layout override — same vocabulary as the Button Style's Button Layout group
+      // (stack | columns | scroll | grid). Byte-stable: '' clears the key (inherits the style layout);
+      // columns/wrap are written only when their control is shown for the effective layout.
+      const bsLayout = panel.querySelector('.cpce-bs-layout');
+      if (bsLayout) bsLayout.addEventListener('change', () => { patchSection(id, { button_layout: bsLayout.value || undefined }); this._render(); });
+      const bsColumns = panel.querySelector('.cpce-bs-columns');
+      if (bsColumns) {
+        const valEl = panel.querySelector('.cpce-bs-columns-val');
+        bsColumns.addEventListener('input', () => { if (valEl) valEl.textContent = bsColumns.value; });
+        bsColumns.addEventListener('change', () => { patchSection(id, { button_columns: clamp(Number(bsColumns.value) || 3, 1, 12) }); this._render(); });
+      }
+      const bsWrap = panel.querySelector('.cpce-bs-wrap');
+      if (bsWrap) bsWrap.addEventListener('change', () => { patchSection(id, { button_wrap: bsWrap.checked }); this._render(); });
+      // Horizontal alignment (left/center/right). '' clears the key (inherits the center default).
+      const bsAlignBtns = panel.querySelector('.cpce-bs-align');
+      if (bsAlignBtns) bsAlignBtns.addEventListener('change', () => { patchSection(id, { button_align: bsAlignBtns.value || undefined }); this._render(); });
+      // Column gap (px). Byte-stable: written only when set; no explicit "clear" — a gap equal to the
+      // style default still stores the number (harmless), matching how other section sliders behave.
+      const bsGap = panel.querySelector('.cpce-bs-gap');
+      if (bsGap) {
+        const gVal = panel.querySelector('.cpce-bs-gap-val');
+        bsGap.addEventListener('input', () => { if (gVal) gVal.textContent = `${bsGap.value}px`; });
+        bsGap.addEventListener('change', () => { patchSection(id, { button_gap: clamp(Number(bsGap.value) || 0, 0, 64) }); this._render(); });
+      }
+      // Off-button placement + alignment. Byte-stable: '' clears placement (inline default). Switching
+      // row↔column re-renders so the alignment labels relabel; align stored as start|center|end.
+      const bsOffPlace = panel.querySelector('.cpce-bs-offplace');
+      if (bsOffPlace) bsOffPlace.addEventListener('change', () => { patchSection(id, { off_button_placement: bsOffPlace.value || undefined }); this._render(); });
+      const bsOffAlign = panel.querySelector('.cpce-bs-offalign');
+      if (bsOffAlign) bsOffAlign.addEventListener('change', () => { patchSection(id, { off_button_align: (bsOffAlign.value && bsOffAlign.value !== 'center') ? bsOffAlign.value : undefined }); this._render(); });
+      // Off-button scale (per section). Byte-stable: 1.0 (100%) = default → key cleared.
+      const bsOffScale = panel.querySelector('.cpce-bs-offscale');
+      if (bsOffScale) {
+        const ov = panel.querySelector('.cpce-bs-offscale-val');
+        bsOffScale.addEventListener('input', () => { if (ov) ov.textContent = `${Math.round(Number(bsOffScale.value) * 100)}%`; });
+        bsOffScale.addEventListener('change', () => { const v = clamp(Number(bsOffScale.value) || 1, 0.3, 3); patchSection(id, { off_button_scale: v === 1 ? undefined : v }); this._render(); });
+      }
+      // Off-button gap (column placements). Byte-stable: 8px = default → key cleared.
+      const bsOffGap = panel.querySelector('.cpce-bs-offgap');
+      if (bsOffGap) {
+        const gv = panel.querySelector('.cpce-bs-offgap-val');
+        bsOffGap.addEventListener('input', () => { if (gv) gv.textContent = `${bsOffGap.value}px`; });
+        bsOffGap.addEventListener('change', () => { const v = clamp(Number(bsOffGap.value) || 0, 0, 200); patchSection(id, { off_button_gap: v === 8 ? undefined : v }); this._render(); });
+      }
+      // Scene Tracker placement: same controls and byte-stable defaults as Off placement
+      // ('' / center / 100% / 8px → key cleared), stored under tracker_*.
+      const bsTrkPlace = panel.querySelector('.cpce-bs-trkplace');
+      if (bsTrkPlace) bsTrkPlace.addEventListener('change', () => { patchSection(id, { tracker_placement: bsTrkPlace.value || undefined }); this._render(); });
+      const bsTrkAlign = panel.querySelector('.cpce-bs-trkalign');
+      if (bsTrkAlign) bsTrkAlign.addEventListener('change', () => { patchSection(id, { tracker_align: (bsTrkAlign.value && bsTrkAlign.value !== 'center') ? bsTrkAlign.value : undefined }); this._render(); });
+      const bsTrkScale = panel.querySelector('.cpce-bs-trkscale');
+      if (bsTrkScale) {
+        const tv = panel.querySelector('.cpce-bs-trkscale-val');
+        bsTrkScale.addEventListener('input', () => { if (tv) tv.textContent = `${Math.round(Number(bsTrkScale.value) * 100)}%`; });
+        bsTrkScale.addEventListener('change', () => { const v = clamp(Number(bsTrkScale.value) || 1, 0.3, 3); patchSection(id, { tracker_scale: v === 1 ? undefined : v }); this._render(); });
+      }
+      const bsTrkGap = panel.querySelector('.cpce-bs-trkgap');
+      if (bsTrkGap) {
+        const tgv = panel.querySelector('.cpce-bs-trkgap-val');
+        bsTrkGap.addEventListener('input', () => { if (tgv) tgv.textContent = `${bsTrkGap.value}px`; });
+        bsTrkGap.addEventListener('change', () => { const v = clamp(Number(bsTrkGap.value) || 0, 0, 200); patchSection(id, { tracker_gap: v === 8 ? undefined : v }); this._render(); });
+      }
+      const bsOnlyOn = panel.querySelector('.cpce-bs-onlyon');
+      if (bsOnlyOn) bsOnlyOn.addEventListener('change', () => bsSetFlag('on_lights_only', bsOnlyOn.checked, false));
+      const bsOnlyOnToggle = panel.querySelector('.cpce-bs-onlyon-toggle');
+      if (bsOnlyOnToggle) bsOnlyOnToggle.addEventListener('change', () => bsSetFlag('on_lights_only_toggle', bsOnlyOnToggle.checked, true));
+      // Placement / alignment / text style for the live checkbox (present only when the toggle is on).
+      // Byte-stable: non-default values only (a key is deleted when it returns to its default).
+      const bsSetOpt = (key, val, def) => patchSection(id, { [key]: (val === undefined || val === null || val === '' || val === def) ? undefined : val });
+      const bsPos = panel.querySelector('.cpce-bs-onlyon-pos');
+      if (bsPos) bsPos.addEventListener('change', () => bsSetOpt('on_lights_only_label_position', bsPos.value, 'top'));
+      const bsAlign = panel.querySelector('.cpce-bs-onlyon-align');
+      if (bsAlign) bsAlign.addEventListener('change', () => bsSetOpt('on_lights_only_label_align', bsAlign.value, 'left'));
+      this._wireTextStyleControls(panel, `cpce-bs-onlyon-${id}`, (patch) => {
+        if ('size' in patch) bsSetOpt('on_lights_only_font_size', patch.size, 12);
+        if ('weight' in patch) bsSetOpt('on_lights_only_font_weight', patch.weight, '400');
+        if ('color' in patch) bsSetOpt('on_lights_only_font_color', patch.color, '');
+      }, '#ffffff');
+      // Assigned-button chips: the × removes a button from this section (unassigns it → '__none__').
+      panel.querySelectorAll('.cpce-btn-chip-remove').forEach(btn => btn.onclick = () => {
+        const pid = btn.dataset.presetId;
+        const presets = (this._config.presets || []).map(p => p.id === pid ? { ...p, section_id: '__none__' } : p);
+        this._updateConfig({ presets });
+        this._render();
+      });
       // Section default scene reset: group + option.
       const defGroupSel = panel.querySelector('.cpce-sn-default-group');
       if (defGroupSel) defGroupSel.addEventListener('change', () => {
@@ -11399,24 +12291,6 @@ class ColorLightManagerCardEditor extends HTMLElement {
       const defOptSel = panel.querySelector('.cpce-sn-default-option');
       if (defOptSel) defOptSel.addEventListener('change', () => { patchSection(id, { default_scene_option: defOptSel.value || undefined }); this._render(); });
 
-      // Scene Tracker Areas: add / edit / remove. Each Area = { name, entity, light? }. Blank-entity
-      // rows are kept while editing (render tolerates them); the card render ignores Areas with no entity.
-      const areasMutate = (fn) => {
-        const cur = this._orderedSectionsRaw().find(x => x.id === id) || {};
-        const arr = Array.isArray(cur.areas) ? cur.areas.map(a => ({ ...a })) : [];
-        fn(arr);
-        patchSection(id, { areas: arr });
-        this._render();
-      };
-      // Scene Tracker: bind (or clear) a Button Style for the tiles.
-      const trackerStyle = panel.querySelector('.cpce-tracker-style');
-      if (trackerStyle) trackerStyle.addEventListener('change', () => { patchSection(id, { style_preset: trackerStyle.value || undefined }); this._render(); });
-      const areaAdd = panel.querySelector('.cpce-area-add');
-      if (areaAdd) areaAdd.onclick = () => areasMutate(arr => arr.push({ name: '', entity: '' }));
-      panel.querySelectorAll('.cpce-area-name').forEach(el => el.addEventListener('change', () => { const i = Number(el.dataset.area); areasMutate(arr => { if (arr[i]) arr[i].name = el.value; }); }));
-      panel.querySelectorAll('.cpce-area-entity').forEach(el => el.addEventListener('change', () => { const i = Number(el.dataset.area); areasMutate(arr => { if (arr[i]) arr[i].entity = el.value; }); }));
-      panel.querySelectorAll('.cpce-area-light').forEach(el => el.addEventListener('change', () => { const i = Number(el.dataset.area); areasMutate(arr => { if (arr[i]) { if (el.value) arr[i].light = el.value; else delete arr[i].light; } }); }));
-      panel.querySelectorAll('.cpce-area-remove').forEach(btn => btn.onclick = () => { const i = Number(btn.dataset.area); areasMutate(arr => arr.splice(i, 1)); });
       // Per-section Frame Style stack (layered, like the Card Frame) — supports
       // a base style plus conditional overlays. Mutates section.frame.presets.
       const sfMutate = (fn) => {
@@ -11641,12 +12515,6 @@ class ColorLightManagerCardEditor extends HTMLElement {
       sections.push({ id: newSectionId('divider'), type: 'divider' });
       this._updateSections(sections); this._render();
     };
-    const addTrackerSection = this.querySelector('#cpce-add-tracker-section');
-    if (addTrackerSection) addTrackerSection.onclick = () => {
-      const sections = this._orderedSectionsRaw();
-      sections.push({ id: newSectionId('tracker'), type: 'scene_tracker', name: 'Scene Tracker', areas: [] });
-      this._updateSections(sections); this._render();
-    };
     // Export a section (+ its buttons) as portable JSON — copied to the clipboard. Buttons are bundled
     // because they have no shared library (they live inline in cfg.presets), so the payload carries
     // them. Clipboard, not window.prompt: prompt truncates large payloads (the "..." import bug).
@@ -11668,6 +12536,13 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // Toggling collapsible shows/hides its sub-options, so it needs a full re-render.
     const collapsibleEl = this.querySelector('#cpce-card-collapsible');
     if (collapsibleEl) collapsibleEl.addEventListener('change', () => { this._updateConfig({ card_collapsible: collapsibleEl.checked }); this._render(); });
+    // Default state: expanded. Byte-stable: written only while checked.
+    const startExpEl = this.querySelector('#cpce-card-start-expanded');
+    if (startExpEl) startExpEl.addEventListener('change', () => {
+      const next = { ...this._config };
+      if (startExpEl.checked) next.card_start_expanded = true; else delete next.card_start_expanded;
+      this._config = next; this._fire(next); this._render();
+    });
     this.querySelectorAll('input[name="cpce-temp-output-format"]').forEach(radio => {
       radio.addEventListener('change', () => { if (radio.checked) this._updateConfig({ temperature_output_format: radio.value }); });
     });
@@ -11755,6 +12630,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // Button Appearance Presets: new/apply/rename/delete + export/import.
     const bsNew = this.querySelector('#cpce-btnstyle-new');
     if (bsNew) bsNew.onclick = () => this._newButtonStyle();
+    // Preview eye-toggle: expand/collapse an inline sample of this style below its row.
+    this.querySelectorAll('.cpce-btnstyle-preview').forEach(btn => btn.onclick = () => {
+      const slug = btn.dataset.slug;
+      this._btnPreviewSlug = this._btnPreviewSlug === slug ? null : slug;
+      this._render();
+    });
     // Duplicate any preset (incl. the synthetic Built-In) into a new editable "… (copy)" entry.
     this.querySelectorAll('.cpce-btnstyle-duplicate').forEach(btn => btn.onclick = () => {
       const slug = btn.dataset.slug; const e = buttonStyleStack(slug); if (!e) return;
@@ -11808,6 +12689,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
     });
 
     // ---- Frame Styles library (shared ltek_frame_library) ----
+    // Preview eye-toggle: expand/collapse an inline sample of this frame below its row.
+    this.querySelectorAll('.cpce-frame-preview').forEach(btn => btn.onclick = () => {
+      const id = btn.dataset.frameId;
+      this._framePreviewId = this._framePreviewId === id ? null : id;
+      this._render();
+    });
     const frameScope = () => (this._config && this._config.frame_library_scope) || 'system';
     const framePresetById = (id) => {
       if (id === BUILTIN_FRAME_ID) return builtinFramePreset();
@@ -12524,6 +13411,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
               name,
               icon: modeDefaultIcon('color'),
               mode: 'color',
+              section_id: '__none__',   // start unassigned — user picks a section to show it
               input_color_entity: entityId,
             });
             this._openPreset = presets.length - 1;
@@ -12550,6 +13438,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           name: friendlyName(this._hass, entityId),
           icon: modeDefaultIcon('color'),
           mode: 'color',
+          section_id: '__none__',   // start unassigned — user picks a section to show it
           input_color_entity: entityId,
         });
         this._openPreset = presets.length - 1;
@@ -12675,12 +13564,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
         };
         const startDrag = () => { this._ceWheelDragging = true; };
         const endDrag = () => { this._ceWheelDragging = false; this._render(); };
-        canvas.addEventListener('mousedown', (e) => { e.preventDefault(); startDrag(); fromWheel(e.clientX, e.clientY); });
-        window.addEventListener('mousemove', (e) => { if (this._ceWheelDragging) fromWheel(e.clientX, e.clientY); });
-        window.addEventListener('mouseup', () => { if (this._ceWheelDragging) endDrag(); });
-        canvas.addEventListener('touchstart', (e) => { startDrag(); fromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
-        window.addEventListener('touchmove', (e) => { if (this._ceWheelDragging) fromWheel(e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
-        window.addEventListener('touchend', () => { if (this._ceWheelDragging) endDrag(); });
+        canvas.addEventListener('mousedown', (e) => { e.preventDefault(); startDrag(); fromWheel(e.clientX, e.clientY); trackWindowDrag(fromWheel, endDrag); });
+        canvas.addEventListener('touchstart', (e) => { startDrag(); fromWheel(e.touches[0].clientX, e.touches[0].clientY); trackWindowDrag(fromWheel, endDrag); }, {passive:true});
       }
       const hexEl = panel.querySelector('.cpce-ce-hex');
       if (hexEl) hexEl.addEventListener('change', () => { const rgb = ColorUtils.hexToRgb(hexEl.value); if (rgb) { this._mutateEntityDraft(id, { rgb_color: rgb }); this._render(); } });
@@ -12869,7 +13754,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       const id = this._helperCollectionId(ent);
       if (!id) { window.alert('Could not resolve this helper for deletion (it may be YAML-defined).'); return; }
       const refs = this._sceneHelperReferences(ent);
-      const refMsg = refs.total ? `\n\n${refs.total} reference${refs.total===1?'':'s'} (${refs.buttons} button${refs.buttons===1?'':'s'}, ${refs.areas} tracker area${refs.areas===1?'':'s'}) point at it and will be removed.` : '';
+      const refMsg = refs.total ? `\n\n${refs.total} reference${refs.total===1?'':'s'} (${refs.buttons} button${refs.buttons===1?'':'s'}, ${refs.trackers} Scene Tracker button${refs.trackers===1?'':'s'}) point at it and will be removed.` : '';
       if (!this._confirmDelete(`Delete the helper "${friendlyName(this._hass, ent)}"?${refMsg} This deletes the Home Assistant helper itself.`)) return;
       wsInputSelectDelete(this._hass, id)
         .then(() => { if (refs.total) this._cleanupHelperReferences(ent); this._sceneHelpers = null; this._ensureSceneHelpers(); this._render(); })
@@ -13043,39 +13928,165 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // Presets
     this._attachPresetListeners();
     const addBtn = this.querySelector('#cpce-add-preset');
-    if (addBtn) addBtn.onclick = () => this._addNewPreset();
+    if (addBtn) addBtn.onclick = () => this._addNewPreset(false);
+    const addBtnEntity = this.querySelector('#cpce-add-preset-entity');
+    if (addBtnEntity) addBtnEntity.onclick = () => this._addNewPreset(true);
+    this._wireLocalFavorites();
   }
 
-  // Adds a new preset, optionally creating and linking a new input_color entity
-  // for it when the user opts in.
-  _addNewPreset() {
-    // Seed the new button's color in the NATIVE format of the target lights (rgb → xy → hs),
-    // so it's stored/sent without a lossy conversion — same rule the mode switcher uses.
-    const supported = getUnionColorModes(this._hass, this._entityIds ? this._entityIds() : (this._config.entities || []));
-    const preferFmt = ['rgb', 'xy', 'hs'].find(f => supported.includes(FORMAT_TO_COLOR_MODE[f])) || 'rgb';
-    const seedVal = preferFmt === 'xy' ? ColorUtils.rgbToXy(255, 0, 0) : (preferFmt === 'hs' ? ColorUtils.rgbToHs(255, 0, 0) : [255, 0, 0]);
-    const newPreset = { id: newPresetId(), name: 'New Preset', icon: modeDefaultIcon('color'), mode: 'color', [PRESET_COLOR_KEYS[preferFmt]]: seedVal };
+  // Local Favorites panel list: EVERY favorite saved in this browser (from the card's Save Current /
+  // Save as Favorite actions), each editable in place — name, color (RGB swatch or Kelvin), optional
+  // brightness — plus reorder, Convert to Button, Convert to Color Entity and delete.
+  // Favorites live in localStorage via favoritesService, NOT in the card config, so edits here never
+  // touch the saved config (byte-stable). The swatch stays hex-only on purpose: it is a color sent to a
+  // bulb (rgb_color), not a CSS color, so Theme / Custom CSS modes would be meaningless.
+  _renderLocalFavorites() {
+    const favs = favoritesService.getFavorites();
+    if (!favs.length) return `<div class="cpce-hint">No Local Favorites yet. Save one from the card with <strong>Save Current</strong> on the Local Favorites bar, or <strong>Save as Favorite</strong> under a Color Values section.</div>`;
+    const minK = Number(this._config.min_kelvin) || 2000;
+    const maxK = Number(this._config.max_kelvin) || 6500;
+    const rows = favs.map((f, i) => {
+      const v = f.value || {};
+      const id = escapeHtml(f.id);
+      const isRgb = Array.isArray(v.rgb_color);
+      const isK = !isRgb && v.color_kelvin !== undefined;
+      const colorCtl = isRgb
+        ? `<input type="color" class="cpce-fav-color" data-fav-id="${id}" value="${ColorUtils.rgbToHex(...v.rgb_color.slice(0, 3))}" title="Color">`
+        : (isK ? `<span class="cpce-fav-kelvin-wrap" title="Color temperature"><span class="cpce-fav-kswatch" style="background:${ColorUtils.rgbToHex(...ColorUtils.kelvinToRgb(v.color_kelvin))};"></span><input type="number" class="cpce-fav-kelvin" data-fav-id="${id}" min="${minK}" max="${maxK}" step="50" value="${Math.round(v.color_kelvin)}">K</span>`
+          : `<span class="cpce-entity-id">no color</span>`);
+      const bri = v.brightness != null ? Math.round((v.brightness / 255) * 100) : '';
+      return `<div class="cpce-manage-item cpce-fav-row" data-fav-id="${id}">
+        ${colorCtl}
+        <input type="text" class="cpce-fav-name" data-fav-id="${id}" value="${escapeHtml(f.name || '')}" placeholder="Name" title="Name">
+        <span class="cpce-fav-bri-wrap" title="Brightness (blank = leave brightness unchanged)"><input type="number" class="cpce-fav-bri" data-fav-id="${id}" min="1" max="100" step="1" value="${bri}" placeholder="—">%</span>
+        <button class="cpce-icon-btn cpce-fav-up" data-fav-id="${id}" ${i === 0 ? 'disabled' : ''} title="Move up"><ha-icon icon="mdi:arrow-up-bold"></ha-icon></button>
+        <button class="cpce-icon-btn cpce-fav-down" data-fav-id="${id}" ${i === favs.length - 1 ? 'disabled' : ''} title="Move down"><ha-icon icon="mdi:arrow-down-bold"></ha-icon></button>
+        <button class="cpce-icon-btn cpce-fav-to-btn" data-fav-id="${id}" ${isRgb || isK ? '' : 'disabled'} title="Convert to Button"><ha-icon icon="mdi:gesture-tap-button"></ha-icon></button>
+        <button class="cpce-icon-btn cpce-fav-to-entity" data-fav-id="${id}" ${isRgb || isK ? '' : 'disabled'} title="Convert to Color Entity"><ha-icon icon="mdi:link-variant-plus"></ha-icon></button>
+        <button class="cpce-delete-entity-btn cpce-fav-del" data-fav-id="${id}" title="Delete this favorite"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>
+      </div>`;
+    }).join('');
+    return `<div class="cpce-sub-title">Saved in this browser (${favs.length})</div>
+      <div class="cpce-manage-list">${rows}</div>
+      <div class="cpce-hint"><ha-icon icon="mdi:gesture-tap-button" style="--mdc-icon-size:14px;"></ha-icon> <strong>Convert to Button</strong> adds a Custom Color or Custom Temperature button, <strong>unassigned</strong>, so pick a section for it afterwards. <ha-icon icon="mdi:link-variant-plus" style="--mdc-icon-size:14px;"></ha-icon> <strong>Convert to Color Entity</strong> creates a Color helper in Home Assistant with this color and brightness. It then appears under <strong>Color Entities</strong>. Both keep the favorite; delete it yourself once you're done.</div>`;
+  }
+  // Wire the Local Favorites panel. Every write goes through favoritesService, which saves to
+  // localStorage and notifies subscribers (the live card's bar and this editor) so all stay in sync.
+  _wireLocalFavorites() {
+    const favById = (id) => favoritesService.getFavorites().find(f => f.id === id);
+    const patchValue = (id, fn) => {
+      const f = favById(id); if (!f) return;
+      const value = { ...(f.value || {}) }; fn(value);
+      favoritesService.updateFavorite(id, { value });
+    };
+    this.querySelectorAll('.cpce-fav-name').forEach(el => el.addEventListener('change', () => {
+      favoritesService.updateFavorite(el.dataset.favId, { name: el.value.trim() || 'Unnamed' });
+    }));
+    this.querySelectorAll('.cpce-fav-color').forEach(el => el.addEventListener('change', () => {
+      const rgb = ColorUtils.hexToRgb(el.value); if (!rgb) return;
+      patchValue(el.dataset.favId, v => { v.rgb_color = rgb; });
+    }));
+    this.querySelectorAll('.cpce-fav-kelvin').forEach(el => el.addEventListener('change', () => {
+      const k = parseInt(el.value, 10); if (!Number.isFinite(k)) return;
+      const minK = Number(this._config.min_kelvin) || 2000, maxK = Number(this._config.max_kelvin) || 6500;
+      patchValue(el.dataset.favId, v => { v.color_kelvin = clamp(k, minK, maxK); });
+    }));
+    this.querySelectorAll('.cpce-fav-bri').forEach(el => el.addEventListener('change', () => {
+      const pct = parseInt(el.value, 10);
+      patchValue(el.dataset.favId, v => { if (Number.isFinite(pct)) v.brightness = Math.round((clamp(pct, 1, 100) / 100) * 255); else delete v.brightness; });
+    }));
+    const move = (id, dir) => {
+      const ids = favoritesService.getFavorites().map(f => f.id);
+      const i = ids.indexOf(id), j = i + dir;
+      if (i < 0 || j < 0 || j >= ids.length) return;
+      [ids[i], ids[j]] = [ids[j], ids[i]];
+      favoritesService.reorderFavorites(ids);
+    };
+    this.querySelectorAll('.cpce-fav-up').forEach(btn => btn.onclick = () => move(btn.dataset.favId, -1));
+    this.querySelectorAll('.cpce-fav-down').forEach(btn => btn.onclick = () => move(btn.dataset.favId, 1));
+    this.querySelectorAll('.cpce-fav-to-btn').forEach(btn => btn.onclick = () => this._convertFavoriteToButton(btn.dataset.favId));
+    this.querySelectorAll('.cpce-fav-to-entity').forEach(btn => btn.onclick = () => this._convertFavoriteToColorEntity(btn.dataset.favId, btn));
+    this.querySelectorAll('.cpce-fav-del').forEach(btn => btn.onclick = () => {
+      const f = favById(btn.dataset.favId);
+      if (this._confirmDelete(`Delete the favorite “${(f && f.name) || 'Favorite'}”? This cannot be undone.`)) favoritesService.deleteFavorite(btn.dataset.favId);
+    });
+  }
+  // Create a Color helper (Color Entity) from a favorite, via the same config flow as the Color
+  // Entities panel's Create. The flow's chromatic step takes RGB, so a Kelvin favorite is sent as
+  // that temperature's RGB equivalent. Brightness carries over when the favorite has one. Creates NO
+  // button (that's Convert to Button); the new entity shows up in the Color Entities panel.
+  _convertFavoriteToColorEntity(favId, btn) {
+    const fav = favoritesService.getFavorites().find(f => f.id === favId);
+    if (!fav) return;
+    const v = fav.value || {};
+    const rgb = Array.isArray(v.rgb_color) ? v.rgb_color.slice(0, 3)
+      : (v.color_kelvin !== undefined ? ColorUtils.kelvinToRgb(v.color_kelvin) : null);
+    if (!rgb) { window.alert('This favorite has no color to convert.'); return; }
+    const name = window.prompt('Name for the new Color Entity:', fav.name || 'Favorite');
+    if (!name || !name.trim()) return;
+    if (btn) btn.disabled = true;
+    this._createInputColorEntity(name.trim(), { rgb_color: rgb, ...(v.brightness != null ? { brightness: v.brightness } : {}) })
+      .then(entityId => {
+        if (btn) btn.disabled = false;
+        // A null id means creation failed and the reason was already shown.
+        if (entityId) window.alert(`Created Color Entity ${entityId}. It's listed under Color Entities.`);
+        this._render();
+      });
+  }
+  // Create a real config preset from a saved Favorite. rgb → a Color button; kelvin → a Temperature
+  // button. Added unassigned (section_id '__none__') and opened for editing. A favorite's brightness
+  // (0-255, same scale as preset.brightness) carries over; none → the button leaves brightness alone.
+  _convertFavoriteToButton(favId) {
+    const fav = favoritesService.getFavorites().find(f => f.id === favId);
+    if (!fav) return;
+    const v = fav.value || {};
+    const base = { id: newPresetId(), name: fav.name || 'Favorite', section_id: '__none__', ...(v.brightness != null ? { brightness: v.brightness } : {}) };
+    let preset;
+    if (Array.isArray(v.rgb_color)) {
+      preset = { ...base, icon: modeDefaultIcon('color'), mode: 'color', rgb_color: v.rgb_color.slice(0, 3) };
+    } else if (v.color_kelvin !== undefined) {
+      preset = { ...base, icon: modeDefaultIcon('temp'), mode: 'temp', color_kelvin: v.color_kelvin };
+    } else {
+      window.alert('This favorite has no color to convert.'); return;
+    }
+    const presets = [...(this._config.presets || []), preset];
+    this._openPreset = presets.length - 1;
+    this._updateConfig({ presets });
+    this._render();
+  }
 
+  // Adds a new button. Two explicit actions, no "also create an entity?" confirm in between:
+  //   withEntity = false → Add Button: a Custom Color button, unassigned, opened for editing.
+  //   withEntity = true  → Add Button & Entity: asks for a name, creates a Color Entity (color helper)
+  //     and, only once it exists, a button LINKED to it. A linked button stores no color of its own
+  //     (the entity is the source of truth), same as the Color Entities panel's Create Entity. If the
+  //     entity can't be created, the reason is shown and no button is added.
+  _addNewPreset(withEntity) {
     const finish = (preset) => {
       const presets = [...(this._config.presets || []), preset];
       this._openPreset = presets.length - 1;
       this._updateConfig({ presets });
       this._render();
     };
-
-    if (!this._hass || !window.confirm('Create a linked Color Entity (color helper) for this new preset?')) {
-      finish(newPreset);
+    if (withEntity) {
+      if (!this._hass) return;
+      const name = window.prompt('Name for the new button and its Color Entity:', '');
+      if (!name || !name.trim()) return;
+      this._createInputColorEntity(name.trim()).then(entityId => {
+        if (!entityId) return;   // failure already surfaced
+        finish({ id: newPresetId(), name: name.trim(), icon: modeDefaultIcon('color'), mode: 'color', section_id: '__none__', input_color_entity: entityId });
+      });
       return;
     }
-
-    const entityName = window.prompt('Name for the new Color Entity:', newPreset.name);
-    if (!entityName || !entityName.trim()) { finish(newPreset); return; }
-
-    newPreset.name = entityName.trim();
-    this._createInputColorEntity(entityName.trim(), newPreset).then(entityId => {
-      if (entityId) newPreset.input_color_entity = entityId;
-      finish(newPreset);
-    });
+    // Seed the new button's color in the NATIVE format of the target lights (rgb → xy → hs),
+    // so it's stored/sent without a lossy conversion — same rule the mode switcher uses.
+    const supported = getUnionColorModes(this._hass, this._entityIds ? this._entityIds() : (this._config.entities || []));
+    const preferFmt = ['rgb', 'xy', 'hs'].find(f => supported.includes(FORMAT_TO_COLOR_MODE[f])) || 'rgb';
+    const seedVal = preferFmt === 'xy' ? ColorUtils.rgbToXy(255, 0, 0) : (preferFmt === 'hs' ? ColorUtils.rgbToHs(255, 0, 0) : [255, 0, 0]);
+    // New buttons start UNASSIGNED (section_id '__none__') — not shown on the card until the user picks
+    // a section for them (In Button Section, in the button editor). Prevents surprise buttons landing
+    // in the first section.
+    finish({ id: newPresetId(), name: 'New Preset', icon: modeDefaultIcon('color'), mode: 'color', section_id: '__none__', [PRESET_COLOR_KEYS[preferFmt]]: seedVal });
   }
 }
 
