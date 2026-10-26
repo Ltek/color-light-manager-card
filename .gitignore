@@ -1,0 +1,8 @@
+archive/
+past/
+*.zip
+.DS_Store
+CLAUDE.md
+HANDOFF*.md
+ACTIVITY_TABLE_DESIGN.md
+BUTTON-BUILDER-STYLE-GAPS.md

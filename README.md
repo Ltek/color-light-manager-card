@@ -4,7 +4,7 @@ A Home Assistant Dashboard **custom card** for controlling colored lights (color
 
 > The Dashboard resource, card `type:` (`custom:color-light-manager-card`), and JS filename keep their original `color-light-manager-card` names for backward compatibility — only the display name changed.
 
-Current build: **v2026.10.01.282** · full history in [CHANGELOG.md](CHANGELOG.md)
+Current build: **v2026.10.04.284** · full history in [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
@@ -124,7 +124,7 @@ Both this card and the **Easy Entity Styler** card share style libraries stored 
 - **Inline preview.** Button Styles and Frame Styles rows have an eye toggle that shows a live sample of the entry in place.
 
 ### Button Styles
-Named, reusable button appearance — layout/columns, background style, border, gradient border, glow, drop shadow, sizing, and name/icon styling. A style is a **layered stack**: a base look plus optional conditional overlays (e.g. an "active" overlay that adds a glow only when a button is active). Two built-ins ship: **Basic Theme** (a clean, neutral look) and **Neon Lux** (transparent tiles with a blue gradient edge and active glow). Create a new style from any **starter** (a built-in or an existing style); the card records what it was based on. A section picks one style for all its buttons, including its Scene Tracker tiles. Per-button layer conditions — **Button Active**, **Off button only** and **Scene Tracker button only** — let one style give those buttons their own look.
+Named, reusable button appearance — layout/columns, background style, border, gradient border, glow, drop shadow, sizing, and name/icon styling. A style is a **layered stack**: a base look plus optional conditional overlays (e.g. an "active" overlay that adds a glow only when a button is active). Two built-ins ship: **Basic Theme** (a clean, neutral look) and **Neon Lux** (transparent tiles with a blue gradient edge and active glow). Create a new style from any **starter** (a built-in or an existing style); the card records what it was based on. A section picks one style for all its buttons, including its Scene Tracker tiles. Styles saved in the [Button Builder](https://github.com/aspenrt78/button-builder) card also appear, **read-only**, in the Button Styles panel and the section Style Preset picker (under *Button Builder*). Apply one to a section and it follows edits made in Button Builder live. Its ON look applies to active buttons and its OFF look to inactive ones. The design's icon, name wrapping and max width are not applied, so each button keeps its own. Each row has an **Export** for troubleshooting, showing Button Builder's stored entry next to how this card reads it. Per-button layer conditions — **Button Active**, **Button Inactive**, **Off button only** and **Scene Tracker button only** — let one style give those buttons their own look.
 
 ### Frame Styles
 Named, reusable frame bundles — borders, glow, shadow, background, and per-side edge lines. Each style is **sparse** (it stores only the properties you set), so you can layer an ordered list on a section or the whole card and the last one wins per property. Styles can be **conditional** — applied only when an entity is in a given state.
@@ -165,7 +165,7 @@ A scene button that **Follows Lights for Color** shows the live room color only 
 
 ## Installation - HACS
 
-[![Open your Home Assistant instance and open this repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Ltek&repository=color-light-manager-card&category=dashboard)
+[![Open your Home Assistant instance and open this repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Ltek&repository=color-light-manager-card&category=plugin)
 
 1. Click the button above (or in HACS: **⋮ → Custom repositories**, add `https://github.com/Ltek/color-light-manager-card` as category **Dashboard**).
 2. Open the repository in HACS and click **Download**.

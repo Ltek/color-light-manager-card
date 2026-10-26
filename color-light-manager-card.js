@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.10.01.282
+// Version: v2026.10.04.284
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.10.01.282';
+const BUILD_NUMBER = 'v2026.10.04.284';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -889,7 +889,7 @@ function trackWindowDrag(onMove, onEnd) {
 }
 function _offLibListeners(fn) {
   if (typeof fn !== 'function') return;
-  [FIXTURE_LIBRARY, BTN_STYLE_LIBRARY, SEED_FRAME_LIBRARY, SEED_HEADER_LIBRARY].forEach(lib => {
+  [FIXTURE_LIBRARY, BTN_STYLE_LIBRARY, SEED_FRAME_LIBRARY, SEED_HEADER_LIBRARY, BB_LIBRARY].forEach(lib => {
     if (!lib) return;
     Object.values(lib).forEach(st => { if (st && st.listeners) st.listeners.delete(fn); });
   });
@@ -1173,6 +1173,68 @@ function ensureButtonStyleLibrary(hass, onChange) {
     .catch(() => { st.loading = false; st.loaded = true; st.map = {}; });
 }
 function buttonStyleLibraryMap() { return BTN_STYLE_LIBRARY.system.map || {}; }
+
+// ---------------------------------------------------------------------------
+// BUTTON BUILDER LIBRARY (third party, READ-ONLY) — the shared library published by the Button
+// Builder card (github.com/aspenrt78/button-builder, docs/SHARED_BUTTON_LIBRARY.md). Same HA store
+// as ours (frontend/*_system_data), key `button_builder_library`, envelope
+// { button_builder_library: 1, migration_complete, presets: { slug: { slug, name, kind:'button',
+//   note?, layers:[{ groups, when?:{type:'button_active'|'button_off'}, label? }], button_builder } } }.
+// Its layer groups use exactly our flat button_* appearance keys, so a preset renders through our
+// stack renderer unchanged. Referenced from a section as style_preset 'lib:bb:<slug>'.
+// This card NEVER writes this key (read + subscribe only), so it can't disturb Button Builder data.
+// Its OFF layer ('button_off' = entity off) is read as our 'button_inactive' condition.
+// Three keys are dropped on import because they'd override per-button/section choices here:
+//   button_icon (would replace EVERY button's icon), button_name_wrap and button_max_width (Button
+//   Builder always writes true / 0, overriding the section).
+// ---------------------------------------------------------------------------
+const BB_LIB_KEY = 'button_builder_library';
+const BB_SLUG_PREFIX = 'bb:';
+const BB_DROPPED_KEYS = ['button_icon', 'button_name_wrap', 'button_max_width'];
+const BB_LIBRARY = { system: { map: {}, loaded: false, loading: false, subscribed: false, listeners: new Set() } };
+function _bbParseValue(value) {
+  const raw = value && typeof value === 'object' && value.presets && typeof value.presets === 'object' ? value.presets : {};
+  const out = {};
+  Object.keys(raw).forEach(slug => {
+    const p = raw[slug];
+    if (!p || typeof p !== 'object' || (p.kind && p.kind !== 'button') || !Array.isArray(p.layers)) return;
+    const layers = p.layers.filter(l => l && typeof l === 'object' && l.groups && typeof l.groups === 'object').map(l => {
+      const groups = {};
+      Object.keys(l.groups).forEach(k => { if (k.startsWith('button_') && !BB_DROPPED_KEYS.includes(k)) groups[k] = l.groups[k]; });
+      // Button Builder's OFF layer is the look when the ENTITY is off. Our 'button_off' means a Light
+      // Off-mode button, so map it to 'button_inactive' (not active) instead.
+      const wt = l.when && typeof l.when === 'object' ? l.when.type : '';
+      const when = wt === 'button_active' ? { type: 'button_active' } : (wt === 'button_off' ? { type: 'button_inactive' } : undefined);
+      return { groups, ...(when ? { when } : {}), ...(l.label ? { label: String(l.label) } : {}) };
+    });
+    if (!layers.length) return;
+    out[slug] = { slug: BB_SLUG_PREFIX + slug, name: String(p.name || slug), kind: 'button', layers, readonly: true, source: 'button_builder', ...(p.note ? { note: String(p.note) } : {}) };
+    // The entry exactly as Button Builder stored it — kept only for the troubleshooting export.
+    Object.defineProperty(out[slug], 'raw', { value: JSON.parse(JSON.stringify(p)), enumerable: false });
+  });
+  return out;
+}
+function ensureButtonBuilderLibrary(hass, onChange) {
+  const st = BB_LIBRARY.system;
+  if (typeof onChange === 'function') st.listeners.add(onChange);
+  if (!hass || !hass.connection || st.subscribed) return;
+  const conn = hass.connection;
+  if (typeof conn.subscribeMessage === 'function') {
+    st.subscribed = true;
+    try {
+      conn.subscribeMessage((ev) => { st.map = _bbParseValue(ev && ev.value); st.loaded = true; _notifyLibListeners(st); },
+        { type: 'frontend/subscribe_system_data', key: BB_LIB_KEY });
+    } catch (e) { st.subscribed = false; }
+    return;
+  }
+  if (st.loaded || st.loading || typeof conn.sendMessagePromise !== 'function') return;
+  st.loading = true;
+  conn.sendMessagePromise({ type: 'frontend/get_system_data', key: BB_LIB_KEY })
+    .then(res => { st.map = _bbParseValue(res && res.value); st.loaded = true; st.loading = false; _notifyLibListeners(st); })
+    .catch(() => { st.loading = false; st.loaded = true; st.map = {}; });
+}
+function buttonBuilderLibraryMap() { return BB_LIBRARY.system.map || {}; }
+function isButtonBuilderSlug(slug) { return typeof slug === 'string' && slug.startsWith(BB_SLUG_PREFIX); }
 function saveButtonStyleLibrary(hass, map) {
   if (!hass || !hass.connection || typeof hass.connection.sendMessagePromise !== 'function') return Promise.reject(new Error('No connection'));
   const presets = {};
@@ -1261,6 +1323,7 @@ function builtinButtonStack(slug) {
 // Resolve a stack by slug: a synthetic built-in, else a stored preset (or undefined).
 function buttonStyleStack(slug) {
   if (isBuiltinButtonSlug(slug)) return builtinButtonStack(slug);
+  if (isButtonBuilderSlug(slug)) return buttonBuilderLibraryMap()[slug.slice(BB_SLUG_PREFIX.length)];
   return buttonStyleLibraryMap()[slug];
 }
 // LEGACY-ONLY: what the old system-wide-default pointer resolved to, used solely by the one-time
@@ -1280,6 +1343,7 @@ function legacyDefaultResolvedSlug() {
 const BTN_STYLE_CONDITIONS = [
   { type: '', label: 'Always', kinds: ['button', 'frame'] },
   { type: 'button_active', label: 'Button Active', kinds: ['button'] },
+  { type: 'button_inactive', label: 'Button Inactive', kinds: ['button'] },
   { type: 'button_off', label: 'Off button only', kinds: ['button'] },
   { type: 'button_tracker', label: 'Scene Tracker button only', kinds: ['button'] },
   { type: 'light_on', label: 'Light On', kinds: ['button', 'frame'] },
@@ -2952,6 +3016,10 @@ class ColorLightManagerCard extends HTMLElement {
     // every buttons section's look. Subscribe so the card re-renders when a preset is saved
     // elsewhere (e.g. the editor) — otherwise a saved preset wouldn't apply until a full reload.
     ensureButtonStyleLibrary(hass, this._libChanged);
+    // Button Builder library (read-only): only when a section uses one of its styles.
+    if (this._config && (this._config.sections || []).some(s => s && isButtonBuilderSlug(fixtureRefSlug(s.style_preset)))) {
+      ensureButtonBuilderLibrary(hass, this._libChanged);
+    }
     // Frame Style library: load/subscribe only if a card/section frame ref uses
     // a lib:<slug> preset. Re-render on updates so a frame edited elsewhere applies.
     if (this._usesLibraryRef()) {
@@ -3053,10 +3121,10 @@ class ColorLightManagerCard extends HTMLElement {
         const w = l && l.when; if (!w || !w.type) return;
         anyCond = true;
         if (w.type === 'entity_state' && w.entity) ids.add(w.entity);
-        else if (w.type === 'light_on' || w.type === 'light_off' || w.type === 'light_unavailable' || w.type === 'button_active') {
+        else if (w.type === 'light_on' || w.type === 'light_off' || w.type === 'light_unavailable' || w.type === 'button_active' || w.type === 'button_inactive') {
           // button_active depends on each button's own target; those live within the section's
           // target scope, so watching the section's targets covers them (full re-render on change).
-          if (w.type === 'button_active') attrSensitive = true;
+          if (w.type === 'button_active' || w.type === 'button_inactive') attrSensitive = true;
           this._sectionTargetIds(section).forEach(id => ids.add(id));
         }
       });
@@ -5024,6 +5092,9 @@ class ColorLightManagerCard extends HTMLElement {
   _buttonStyleForPreset(stack, section, preset) {
     if (!stack) return this._config;
     const isActive = (when) => {
+      // "Button Inactive": the exact opposite of Button Active for this button (used for Button
+      // Builder's OFF look, which is "the entity is off", not "a Light Off button").
+      if (when && when.type === 'button_inactive') return !isActive({ type: 'button_active' });
       if (when && when.type === 'button_active') {
         // Selects-bound buttons use the deterministic all-match signal; others fall back to the
         // color/state/last-pressed logic inside _isPresetActive.
@@ -5073,6 +5144,7 @@ class ColorLightManagerCard extends HTMLElement {
       case 'button_active': return false;
       case 'button_off': return false;
       case 'button_tracker': return false;
+      case 'button_inactive': return false;
       case 'light_on': { const st = this._sectionPrimaryState(section); return !!st && st.state === 'on'; }
       case 'light_off': { const st = this._sectionPrimaryState(section); return !!st && st.state === 'off'; }
       case 'light_unavailable': { const st = this._sectionPrimaryState(section); return !st || st.state === 'unavailable' || st.state === 'unknown'; }
@@ -5539,6 +5611,7 @@ class ColorLightManagerCard extends HTMLElement {
       if (when && when.type === 'button_active') return st.isActive;
       if (when && when.type === 'button_off') return st.isOff;
       if (when && when.type === 'button_tracker') return true;   // this IS a Scene Tracker button
+      if (when && when.type === 'button_inactive') return !st.isActive;
       return this._buttonConditionActive(when, section);
     };
     const cfg = stack ? { ...this._config, ...extractButtonAppearance(flattenButtonStack(stack, isActive)) } : this._config;
@@ -6020,7 +6093,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const missing = [];
     const btnLib = buttonStyleLibraryMap();
     const styleSlug = fixtureRefSlug(section.style_preset);
-    if (styleSlug && !isBuiltinButtonSlug(styleSlug) && !btnLib[styleSlug]) missing.push(`Button Style “${styleSlug}”`);
+    if (styleSlug && !isBuiltinButtonSlug(styleSlug) && !btnLib[styleSlug] && !buttonStyleStack(styleSlug)) missing.push(`Button Style “${styleSlug}”`);
     const fixLib = (typeof fixtureLibraryMap === 'function') ? fixtureLibraryMap((this._config && this._config.fixture_library_scope) || 'system') : {};
     const seen = new Set();
     (presets || []).forEach(p => {
@@ -6095,6 +6168,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
     ensureFixtureLibrary(hass, (this._config && this._config.fixture_library_scope) || 'system', this._libChanged);
     // Load + live-sync the shared Button Appearance preset library so the list reflects it.
     ensureButtonStyleLibrary(hass, this._btnLibChanged);
+    // Button Builder's shared library, read-only — listed in the Button Styles panel and the section
+    // Style Preset picker so its designs can be applied and tested.
+    ensureButtonBuilderLibrary(hass, this._libChanged);
     // Load + live-sync the shared Frame Style library so the Frame Styles panel
     // shows every System frame (incl. those authored in the Easy Entity Styler
     // card) — always, regardless of whether this card references one yet.
@@ -7577,6 +7653,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         if (when.type === 'button_active') return activeType === 'active';
         if (when.type === 'button_off') return activeType === 'off';
         if (when.type === 'button_tracker') return activeType === 'tracker';
+        if (when.type === 'button_inactive') return activeType !== 'active';
         return true;   // section-scoped conditions: show in preview
       };
       return { ...baseCfg, ...extractButtonAppearance(flattenButtonStack(stack, isActive)) };
@@ -8300,6 +8377,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
       .sort((a, b) => (a === openSlug ? 1 : 0) - (b === openSlug ? 1 : 0));   // open one → last
     const rowsData = [...Object.keys(BUILTIN_BUTTON_STYLES).map(bs => ({ slug: bs, entry: builtinButtonStack(bs), builtin: true })),
       ...storedSlugs.map(s => ({ slug: s, entry: lib[s], builtin: false }))];
+    const bbLib = buttonBuilderLibraryMap();
+    const bbRows = Object.keys(bbLib).sort((a, b) => (bbLib[a].name || a).localeCompare(bbLib[b].name || b)).map(sl => ({ slug: BB_SLUG_PREFIX + sl, entry: bbLib[sl] }));
     // Which stacks are referenced by this card's sections (usage badge). A section with no explicit
     // style_preset resolves to Basic Theme, so that counts as "in use" too.
     const usedSlugs = new Set();
@@ -8330,6 +8409,19 @@ class ColorLightManagerCardEditor extends HTMLElement {
               ${builtin ? '' : `<button class="cpce-delete-entity-btn cpce-btnstyle-delete" data-slug="${escapeHtml(s)}" title="Delete preset"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>`}
             </div>${this._btnPreviewSlug === s ? `<div class="cpce-btnstyle-preview-row">${this._renderButtonSampleRow(buttonStyleStack(s) || e, this._config)}</div>` : ''}${open && !builtin ? `<div class="cpce-btnstyle-layers-panel${rowDirty ? ' cpce-panel-unsaved' : ''}" data-slug="${escapeHtml(s)}">${this._renderButtonStackLayers(s, e)}</div>` : ''}`;
           }).join('')}</div>
+      ${bbRows.length ? `<div class="cpce-sub-title" style="margin-top:12px;">Button Builder (read-only)</div>
+      <div class="cpce-hint">Styles saved in the <strong>Button Builder</strong> card. Pick one as a section's Style Preset to try it; edit it in Button Builder and the card follows live. The design's icon, name wrapping and max width are not applied, so each button keeps its own.</div>
+      <div class="cpce-manage-list">${bbRows.map(({ slug: s, entry: e }) => {
+        const nLayers = Array.isArray(e.layers) ? e.layers.length : 0;
+        const meta = ['Button Builder', `${nLayers} layer${nLayers===1?'':'s'}`, e.note ? '📝 ' + e.note : ''].filter(Boolean).join(' · ');
+        return `<div class="cpce-manage-item" data-slug="${escapeHtml(s)}">
+          <ha-icon icon="mdi:link-variant" style="color:var(--primary-color);flex-shrink:0;"></ha-icon>
+          <span class="cpce-ce-name">${escapeHtml(e.name || s)}<span class="cpce-entity-id">${escapeHtml(meta)}</span></span>
+          ${usedSlugs.has(s) ? '<span class="cpce-order-type">in use</span>' : ''}
+          <button class="cpce-icon-btn cpce-btnstyle-preview${this._btnPreviewSlug === s ? ' active' : ''}" data-slug="${escapeHtml(s)}" title="${this._btnPreviewSlug === s ? 'Hide preview' : 'Preview'}"><ha-icon icon="${this._btnPreviewSlug === s ? 'mdi:eye-off' : 'mdi:eye'}"></ha-icon></button>
+          <button class="cpce-icon-btn cpce-bbstyle-export" data-slug="${escapeHtml(s)}" title="Export JSON (Button Builder's entry + how this card reads it)"><ha-icon icon="mdi:download"></ha-icon></button>
+        </div>${this._btnPreviewSlug === s ? `<div class="cpce-btnstyle-preview-row">${this._renderButtonSampleRow(e, this._config)}</div>` : ''}`;
+      }).join('')}</div>` : ''}
     `;
   }
 
@@ -11380,11 +11472,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
                   const entries = [...Object.keys(BUILTIN_BUTTON_STYLES).map(bs => ({ slug: bs, name: BUILTIN_BUTTON_STYLES[bs].name })),
                     ...Object.keys(lib).map(sl => ({ slug: sl, name: lib[sl].name || sl }))];
                   entries.sort((a, b) => a.name.localeCompare(b.name));
-                  const opts = entries.map(e => {
-                    const value = `lib:${escapeHtml(e.slug)}`;
-                    return `<option value="${value}" ${cur === e.slug ? 'selected' : ''}>${escapeHtml(e.name)}</option>`;
-                  }).join('');
-                  const missing = cur && !isBuiltinButtonSlug(cur) && !lib[cur]
+                  const opt = (e) => `<option value="lib:${escapeHtml(e.slug)}" ${cur === e.slug ? 'selected' : ''}>${escapeHtml(e.name)}</option>`;
+                  const bbLib = buttonBuilderLibraryMap();
+                  const bbEntries = Object.keys(bbLib).map(sl => ({ slug: BB_SLUG_PREFIX + sl, name: bbLib[sl].name || sl })).sort((a, b) => a.name.localeCompare(b.name));
+                  const opts = entries.map(opt).join('')
+                    + (bbEntries.length ? `<optgroup label="Button Builder (read-only)">${bbEntries.map(opt).join('')}</optgroup>` : '');
+                  const missing = cur && !isBuiltinButtonSlug(cur) && !lib[cur] && !(isButtonBuilderSlug(cur) && bbLib[cur.slice(BB_SLUG_PREFIX.length)])
                     ? `<option value="lib:${escapeHtml(cur)}" selected>${escapeHtml(cur)} (missing)</option>` : '';
                   return `<div class="cpce-sub-title">Button Style</div>
                     <div class="cpce-row"><label class="lbl">Style Preset</label>
@@ -12679,6 +12772,24 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this.querySelectorAll('.cpce-btnstyle-export').forEach(btn => btn.onclick = () => {
       const e = buttonStyleStack(btn.dataset.slug); if (!e) return;
       this._exportJson(JSON.stringify(flattenButtonStack(e, () => true)), 'Button Appearance JSON — paste into another card via Import.');
+    });
+    // Button Builder rows: export for troubleshooting. Three parts:
+    //   button_builder_entry — the entry exactly as Button Builder stored it;
+    //   as_read_by_card      — the layers this card applies (OFF → Button Inactive, dropped keys removed);
+    //   flattened_active / flattened_inactive — the resolved appearance for an active / inactive button.
+    // Read-only: nothing is written to Button Builder's library.
+    this.querySelectorAll('.cpce-bbstyle-export').forEach(btn => btn.onclick = () => {
+      const e = buttonStyleStack(btn.dataset.slug); if (!e) return;
+      const stack = { layers: e.layers };
+      const payload = {
+        source: 'button_builder_library',
+        slug: btn.dataset.slug.slice(BB_SLUG_PREFIX.length),
+        button_builder_entry: e.raw || null,
+        as_read_by_card: { name: e.name, layers: e.layers, dropped_keys: BB_DROPPED_KEYS },
+        flattened_active: flattenButtonStack(stack, w => !w || !w.type || w.type === 'button_active'),
+        flattened_inactive: flattenButtonStack(stack, w => !w || !w.type || w.type === 'button_inactive'),
+      };
+      this._exportJson(JSON.stringify(payload, null, 2), `Button Builder style “${e.name}” — for troubleshooting (not an importable Button Style).`);
     });
     const bsExportCur = this.querySelector('#cpce-btnstyle-export-current');
     if (bsExportCur) bsExportCur.onclick = () => this._exportJson(JSON.stringify(extractButtonAppearance(this._config)), 'Layer Appearance JSON.');

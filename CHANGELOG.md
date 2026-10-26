@@ -8,6 +8,46 @@ resets. Newest first.
 
 ---
 
+## v2026.10.04.284
+
+- **Fixed: a Button Builder design's OFF look was applied to the wrong buttons.** In Button Builder,
+  OFF means the button's entity is off. The shared library calls that layer `button_off`, the same
+  name this card uses for *Off button only* (a Light Off-mode button). So v283 showed the OFF look
+  only on Light Off buttons, and a colour button that wasn't active kept the base look. The card now
+  reads Button Builder's OFF layer as a new **Button Inactive** condition (the button is not active),
+  so the ON look shows on active buttons and the OFF look on all the others. Button Builder's data is
+  unchanged; this is only how the card reads it.
+- **New layer condition: Button Inactive,** also available for this card's own Button Styles. It's
+  the exact opposite of *Button Active* for each button, and like Button Active it updates as the
+  lights change. In a style's preview, the Off (and Tracker) samples count as inactive.
+- **Export on Button Builder rows,** for troubleshooting. It produces one JSON block with:
+  - `button_builder_entry`: the entry exactly as Button Builder stored it;
+  - `as_read_by_card`: the layers this card applies, after the OFF → Button Inactive mapping and with
+    the icon, wrap and max-width settings removed;
+  - `flattened_active` / `flattened_inactive`: the final appearance an active and an inactive button
+    get.
+  It's for reading, not for re-importing as a Button Style, and nothing is written to Button
+  Builder's library.
+
+## v2026.10.04.283
+
+- **Button Builder styles can be applied to Buttons sections (read-only, for testing).** The card reads
+  the shared library that the [Button Builder](https://github.com/aspenrt78/button-builder) card
+  publishes (`button_builder_library` in Home Assistant's system store) and lists its designs:
+  - in a section's **Style Preset** dropdown, under *Button Builder (read-only)*;
+  - at the bottom of the **Button Styles** panel, with a preview eye for each.
+  A section using one follows edits made in Button Builder live. Its ON / active layer applies through
+  the card's *Button Active* condition, and its OFF layer through *Off button only*.
+- **Read-only by design:** the card never writes to Button Builder's library, so its data can't be
+  changed or lost. There is no edit, duplicate, export or delete for these rows yet; copying one into
+  this card's own styles is planned as a next step once applying them has been tested.
+- **Three settings are not taken from a Button Builder design:** its icon (which here would replace
+  the icon on every button in the section), name wrapping and max width (Button Builder always writes
+  "wrap on" and "no max width"). Each button and section keeps its own. Button Builder designs carry
+  no layout, so the section's layout applies.
+- The card only subscribes to Button Builder's library when a section actually uses one of its
+  styles. The editor always reads it, so the list is available.
+
 ## v2026.10.01.282
 
 - **Scene Tracker: hide the tile when no scene is on.** There's a new checkbox on Scene Tracker
