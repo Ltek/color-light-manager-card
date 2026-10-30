@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.10.04.284
+// Version: v2026.10.30.285
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.10.04.284';
+const BUILD_NUMBER = 'v2026.10.30.285';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -14206,6 +14206,6 @@ if (!customElements.get('color-light-manager-card')) customElements.define('colo
 if (!customElements.get('color-light-manager-card-editor')) customElements.define('color-light-manager-card-editor', ColorLightManagerCardEditor);
 
 window.customCards = window.customCards || [];
-window.customCards.push({ type: 'color-light-manager-card', name: 'Color Light & Scene Manager', description: 'Control colored lights (color temp / RGB / RGBWW) and author Home Assistant scenes — with preset buttons, Fixture Profiles, and Color Entity management.', preview: true });
+window.customCards.push({ type: 'color-light-manager-card', name: 'Color Light & Scene Manager Card (Ltek)', description: 'Control colored lights (color temp / RGB / RGBWW) and author Home Assistant scenes — with preset buttons, Fixture Profiles, and Color Entity management.', preview: true });
 
 console.log(`${LOG_PREFIX} Loaded ${BUILD_NUMBER}`);

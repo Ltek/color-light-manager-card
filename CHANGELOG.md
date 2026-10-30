@@ -8,6 +8,10 @@ resets. Newest first.
 
 ---
 
+## v2026.10.30.285
+
+- **Named "Color Light & Scene Manager Card (Ltek)" in Home Assistant's *Add card* picker**, matching its HACS name, so searching "Ltek" finds it. The card type is unchanged, so existing dashboards are not affected.
+
 ## v2026.10.04.284
 
 - **Fixed: a Button Builder design's OFF look was applied to the wrong buttons.** In Button Builder,

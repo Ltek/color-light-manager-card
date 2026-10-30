@@ -4,7 +4,7 @@ A Home Assistant Dashboard **custom card** for controlling colored lights (color
 
 > The Dashboard resource, card `type:` (`custom:color-light-manager-card`), and JS filename keep their original `color-light-manager-card` names for backward compatibility — only the display name changed.
 
-Current build: **v2026.10.04.284** · full history in [CHANGELOG.md](CHANGELOG.md)
+Current build: **v2026.10.30.285** · full history in [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
