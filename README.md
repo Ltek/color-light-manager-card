@@ -4,6 +4,8 @@ A Home Assistant Dashboard **custom card** for controlling colored lights (color
 
 > The Dashboard resource, card `type:` (`custom:color-light-manager-card`), and JS filename keep their original `color-light-manager-card` names for backward compatibility — only the display name changed.
 
+[![Open your Home Assistant instance and open this repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Ltek&repository=color-light-manager-card&category=plugin)
+
 Full history in [CHANGELOG.md](CHANGELOG.md).
 
 ---
@@ -166,9 +168,7 @@ A scene button that **Follows Lights for Color** shows the live room color only 
 
 ## Installation - HACS
 
-[![Open your Home Assistant instance and open this repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Ltek&repository=color-light-manager-card&category=plugin)
-
-1. Click the button above (or in HACS: **⋮ → Custom repositories**, add `https://github.com/Ltek/color-light-manager-card` as category **Dashboard**).
+1. Click the **Open in HACS** button at the top of this page (or in HACS: **⋮ → Custom repositories**, add `https://github.com/Ltek/color-light-manager-card` as category **Dashboard**).
 2. Open the repository in HACS and click **Download**.
 3. Hard-refresh the browser (Ctrl/Cmd+Shift+R). HACS adds the Dashboard resource automatically.
 4. Add the card to a dashboard: **Add Card → Color Light & Scene Manager Card (Ltek)** (or `type: custom:color-light-manager-card`).
