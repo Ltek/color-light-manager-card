@@ -171,7 +171,7 @@ A scene button that **Follows Lights for Color** shows the live room color only 
 1. Click the button above (or in HACS: **⋮ → Custom repositories**, add `https://github.com/Ltek/color-light-manager-card` as category **Dashboard**).
 2. Open the repository in HACS and click **Download**.
 3. Hard-refresh the browser (Ctrl/Cmd+Shift+R). HACS adds the Dashboard resource automatically.
-4. Add the card to a dashboard: **Add Card → Custom: Color Light & Scene Manager** (or `type: custom:color-light-manager-card`).
+4. Add the card to a dashboard: **Add Card → Color Light & Scene Manager Card (Ltek)** (or `type: custom:color-light-manager-card`).
 
 ---
 
