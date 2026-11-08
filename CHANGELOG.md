@@ -8,6 +8,27 @@ resets. Newest first.
 
 ---
 
+## v2026.11.08.286
+
+- **New button Mode: Light (on / off, dim).** A Light button controls one light, a light group, or
+  several lights, chosen under *Target Lights*.
+  - **Tap** and **Long Press** each choose *Turn on / off*, *Open dimming popup* or *Nothing*
+    (defaults: tap toggles, long press opens the popup).
+  - **Turn on / off:** if any of its lights is on, they all turn off; otherwise they all turn on with
+    no colour sent, so each comes back in its own last colour and brightness.
+  - **Popup:** one row per light, with its colour, state, on/off and a brightness slider. Light
+    groups are listed light by light. An **All** row on top controls everything when the button has
+    more than one light. It updates live, and closes with ×, Esc or a click outside.
+  - **Colour:** the button shows the lights' live colour while on, and their **last known colour**
+    while off. Home Assistant keeps no colour for an off light, so the card remembers it in the
+    browser whenever it sees the light on. For a light it has never seen, it asks Home Assistant's
+    history once at load (last 30 days). A fixed Button Color overrides this, e.g. for plain dimmers.
+  - Counts as **active** while any of its lights is on, so *Button Active* / *Button Inactive*
+    layers style on and off buttons differently.
+  - Optional **"2/3 on"** line for buttons that control several lights.
+- README no longer shows a build number (house rule); the version lives in the code, CHANGELOG and
+  git tag.
+
 ## v2026.10.30.285
 
 - **Named "Color Light & Scene Manager Card (Ltek)" in Home Assistant's *Add card* picker**, matching its HACS name, so searching "Ltek" finds it. The card type is unchanged, so existing dashboards are not affected.

@@ -4,13 +4,14 @@ A Home Assistant Dashboard **custom card** for controlling colored lights (color
 
 > The Dashboard resource, card `type:` (`custom:color-light-manager-card`), and JS filename keep their original `color-light-manager-card` names for backward compatibility — only the display name changed.
 
-Current build: **v2026.10.30.285** · full history in [CHANGELOG.md](CHANGELOG.md)
+Full history in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## Key features at a glance
 
-- **Preset buttons, single-purpose** — each button does one thing by Mode: turn lights **Off**, apply a **Fixture Profile**, activate a **Scene**, set a **Custom Temperature**, set a **Custom Color**, or show a **Scene Tracker** status tile.
+- **Preset buttons, single-purpose** — each button does one thing by Mode: turn lights **Off**, apply a **Fixture Profile**, activate a **Scene**, set a **Custom Temperature**, set a **Custom Color**, show a **Scene Tracker** status tile, or act as a **Light** button.
+- **Light buttons**: a button for a light, a group, or several lights. Tap and long press each pick *turn on / off*, *open a dimming popup*, or *nothing*. Turning on sends no colour, so each light comes back in its own last colour. The button shows the lights' live colour, or their last known colour while off (remembered in the browser, and looked up once in Home Assistant's history when unknown). The popup has on/off and a brightness slider for each light, groups listed light by light, plus an **All** row. Good for a whole-house card with one collapsible section per room.
 - **Scene Groups (input_select)** — bind a button to one or more `input_select` "scene" helpers. Pressing it sets each helper; the button highlights **only when all its bound options currently match** — reliable, single-winner active state that survives reloads and doesn't guess from light state.
 - **Scene Tracker buttons**: read-only tiles that show an area's current scene, with its color and icon. A tile takes its look from the scene button that set that scene. It sits among your other buttons and uses the section's Button Style.
 - **Scene Manager** — create and edit **real HA `scene.*` entities** in the card (lights + switches, fans, covers, climate, media, locks, and more), usable anywhere in Home Assistant.

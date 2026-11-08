@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.10.30.285
+// Version: v2026.11.08.286
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.10.30.285';
+const BUILD_NUMBER = 'v2026.11.08.286';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -566,6 +566,8 @@ function presetMode(preset) {
 //   scene   = scene / orchestration only, applies no color of its own (look_none)
 //   temp    = Custom Temperature (inline color_kelvin)
 //   color   = Custom Color (inline color, any format) — default
+//   light   = Light: tap/hold to toggle its lights or open a popup with per-light dimming. Shows the
+//             lights' live colour, or their last known colour while off (see LIGHT BUTTONS).
 //   tracker = Scene Tracker: a READ-ONLY status tile showing an input_select's current option
 //             (tracker_entity) and, optionally, a representative light (tracker_light). Never pressable.
 // A persisted `preset.mode` (set when the user picks a mode) is authoritative; older presets
@@ -573,7 +575,7 @@ function presetMode(preset) {
 // visibility only — the runtime look is classified by presetMode() on the effective look.
 function buttonMode(preset) {
   if (!preset) return 'color';
-  if (['off', 'profile', 'scene', 'temp', 'color', 'tracker'].includes(preset.mode)) return preset.mode;
+  if (['off', 'profile', 'scene', 'temp', 'color', 'tracker', 'light'].includes(preset.mode)) return preset.mode;
   if (fixtureRefSlug(preset.profile_ref)) return 'profile';
   if (preset.action === 'turn_off') return 'off';
   if (preset.look_none === true) return 'scene';
@@ -590,6 +592,7 @@ const MODE_DEFAULT_ICON = {
   temp: 'mdi:thermometer',
   color: 'mdi:palette-outline',
   tracker: 'mdi:view-grid-outline',
+  light: 'mdi:lightbulb-on-outline',
 };
 function modeDefaultIcon(mode) { return MODE_DEFAULT_ICON[mode] || 'mdi:lightbulb'; }
 // Normalize a user-typed icon: a bare name with no namespace assumes the `mdi:` set (the HA
@@ -790,6 +793,88 @@ function presetTargetSpec(preset) {
   if (tm === 'none') return { useDefault: false, useCustom: false, custom };
   if (tm === 'specific') return { useDefault: false, useCustom: true, custom };
   return { useDefault: true, useCustom: false, custom };   // 'all'
+}
+
+// ---- Light buttons (mode 'light') ----
+// A Light button toggles its target lights, or opens a popup to dim each one, and shows their colour.
+// HA keeps no colour for a light that is off, so the colour a light last had while ON is remembered:
+//   1. in memory + localStorage (LAST_LIGHT_COLORS), recorded whenever the card sees the light on;
+//   2. if a light has no remembered colour (new device, cleared browser), ONE recorder history query
+//      at card load fills it in (fetchLastLightColors), so every device shows the same colour.
+// Light groups (a light entity whose `entity_id` attribute lists member lights) are expanded for
+// the popup rows and for the colour fallback.
+const LAST_LIGHT_COLORS_KEY = 'color_light_manager_last_light_colors';
+const LAST_LIGHT_COLORS = (() => { try { return JSON.parse(safeGetItem(LAST_LIGHT_COLORS_KEY) || '{}') || {}; } catch (e) { return {}; } })();
+let LAST_LIGHT_COLORS_DIRTY = false;
+function lightStateHex(st) {
+  if (!st || st.state !== 'on') return null;
+  const a = st.attributes || {};
+  let rgb = Array.isArray(a.rgb_color) ? a.rgb_color
+    : (Array.isArray(a.xy_color) ? ColorUtils.xyToRgb(a.xy_color[0], a.xy_color[1])
+      : (Array.isArray(a.hs_color) ? ColorUtils.hsToRgb(a.hs_color[0], a.hs_color[1]) : null));
+  if (!rgb) { const k = attrsToKelvin(a); if (k !== undefined) rgb = ColorUtils.kelvinToRgb(k); }
+  return rgb ? ColorUtils.rgbToHex(...rgb) : null;
+}
+function rememberLightColors(hass, ids) {
+  if (!hass || !hass.states) return;
+  ids.forEach(id => {
+    const hex = lightStateHex(hass.states[id]);
+    if (hex && LAST_LIGHT_COLORS[id] !== hex) { LAST_LIGHT_COLORS[id] = hex; LAST_LIGHT_COLORS_DIRTY = true; }
+  });
+  if (LAST_LIGHT_COLORS_DIRTY) { LAST_LIGHT_COLORS_DIRTY = false; safeSetItem(LAST_LIGHT_COLORS_KEY, JSON.stringify(LAST_LIGHT_COLORS)); }
+}
+// A light id plus, for a light group, its member lights.
+function lightMemberIds(hass, id) {
+  const st = hass && hass.states && hass.states[id];
+  const m = st && st.attributes && Array.isArray(st.attributes.entity_id) ? st.attributes.entity_id.filter(x => typeof x === 'string' && x.startsWith('light.')) : [];
+  return m;
+}
+// Every light a Light button controls, groups expanded (deduped, order kept).
+function expandLightIds(hass, ids) {
+  const out = []; const seen = new Set();
+  const push = (x) => { if (!seen.has(x)) { seen.add(x); out.push(x); } };
+  (ids || []).forEach(id => { const m = lightMemberIds(hass, id); if (m.length) m.forEach(push); else push(id); });
+  return out;
+}
+// The status a Light button shows: on = any target on; color = live colour of the first ON target
+// with one, else the last known colour (the targets themselves first, then group members).
+function lightButtonStatus(hass, ids) {
+  const states = (hass && hass.states) || {};
+  const members = expandLightIds(hass, ids);
+  const all = [...ids, ...members.filter(m => !ids.includes(m))];
+  let on = false, onState = null, color = null;
+  for (const id of all) {
+    const st = states[id];
+    if (st && st.state === 'on') { on = true; if (!onState) onState = st; const hex = lightStateHex(st); if (hex && !color) color = hex; }
+  }
+  if (!color) for (const id of all) { if (LAST_LIGHT_COLORS[id]) { color = LAST_LIGHT_COLORS[id]; break; } }
+  const onCount = members.filter(id => states[id] && states[id].state === 'on').length;
+  return { on, onState, color, onCount, total: members.length };
+}
+// One recorder query for the last ON colour of lights with nothing remembered. Looks back 30 days.
+// Resolves to true when anything new was learned. Failure (no recorder, no permission) is harmless.
+const LIGHT_HISTORY_ASKED = new Set();
+function fetchLastLightColors(hass, ids) {
+  const want = (ids || []).filter(id => !LAST_LIGHT_COLORS[id] && !LIGHT_HISTORY_ASKED.has(id));
+  if (!want.length || !hass || typeof hass.callWS !== 'function') return Promise.resolve(false);
+  want.forEach(id => LIGHT_HISTORY_ASKED.add(id));
+  const start = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+  return hass.callWS({ type: 'history/history_during_period', start_time: start, entity_ids: want,
+    minimal_response: false, no_attributes: false, significant_changes_only: false })
+    .then(res => {
+      let learned = false;
+      Object.keys(res || {}).forEach(id => {
+        const rows = Array.isArray(res[id]) ? res[id] : [];
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const r = rows[i] || {};
+          const hex = lightStateHex({ state: r.s !== undefined ? r.s : r.state, attributes: r.a || r.attributes || {} });
+          if (hex) { if (!LAST_LIGHT_COLORS[id]) { LAST_LIGHT_COLORS[id] = hex; learned = true; } break; }
+        }
+      });
+      if (learned) safeSetItem(LAST_LIGHT_COLORS_KEY, JSON.stringify(LAST_LIGHT_COLORS));
+      return learned;
+    })
+    .catch(() => false);
 }
 
 // ---- Sections ----
@@ -3035,6 +3120,14 @@ class ColorLightManagerCard extends HTMLElement {
     }
     // First real paint — only once config is present (renderCard bails without it). Runs with
     // hass available so linked-entity buttons resolve their colors on the very first render.
+    // Light buttons: remember each controlled light's colour while it's on; on first sight, ask the
+    // recorder for any light we have no colour for; keep an open popup live.
+    const lightIds = this._lightButtonIds();
+    if (lightIds.length) {
+      rememberLightColors(hass, lightIds);
+      if (!this._lightHistoryAsked) { this._lightHistoryAsked = true; fetchLastLightColors(hass, lightIds).then(learned => { if (learned && this._rendered) this._scheduleRender(); }); }
+    }
+    if (this._lightPopup) this._refreshLightPopup();
     if (!this._rendered) { if (!this._config) return; this.renderCard(); this._rendered = true; return; }
     // Linked buttons take their color/brightness live from their Color Entity. A button's
     // color/tint is computed at full render (not in updateStates), so when any linked entity's
@@ -3197,6 +3290,7 @@ class ColorLightManagerCard extends HTMLElement {
     if (this._offRowRO) { this._offRowRO.disconnect(); this._offRowRO = null; }
     // Stop library updates re-rendering this (now detached) card. set hass re-adds it on reconnect.
     _offLibListeners(this._libChanged);
+    this._closeLightPopup();
   }
   getCardSize() { return 6; }
   static getConfigElement() { return document.createElement('color-light-manager-card-editor'); }
@@ -3392,6 +3486,7 @@ class ColorLightManagerCard extends HTMLElement {
   // Legacy additive fields (scenes[]/turn_off_entities[]) are preserved in config but NOT fired.
   _applyPreset(rawPreset) {
     if (!rawPreset) return;
+    if (buttonMode(rawPreset) === 'light') { this._toggleLightButton(rawPreset); return; }
 
     // Scene selects: set each bound input_select to its option. Applies to EVERY button kind and
     // runs alongside the button's primary action below (a "Sports" button can set the helper in
@@ -4784,6 +4879,7 @@ class ColorLightManagerCard extends HTMLElement {
 
     this.querySelectorAll('.cpc-preset-btn').forEach(btn => {
       if (btn.classList.contains('cpc-tracker-tile')) return;   // Scene Tracker tiles are read-only
+      if (btn.classList.contains('cpc-light-btn')) { this._wireLightButton(btn); return; }
       btn.onclick = () => {
         const preset = (this._config.presets || []).find(p => p.id === btn.dataset.presetId);
         // Remember the last-pressed preset id so glow/header "active" color mode can follow the
@@ -5095,6 +5191,7 @@ class ColorLightManagerCard extends HTMLElement {
       // "Button Inactive": the exact opposite of Button Active for this button (used for Button
       // Builder's OFF look, which is "the entity is off", not "a Light Off button").
       if (when && when.type === 'button_inactive') return !isActive({ type: 'button_active' });
+      if (when && when.type === 'button_active' && buttonMode(preset) === 'light') return lightButtonStatus(this._hass, this._presetColorIds(preset)).on;
       if (when && when.type === 'button_active') {
         // Selects-bound buttons use the deterministic all-match signal; others fall back to the
         // color/state/last-pressed logic inside _isPresetActive.
@@ -5291,7 +5388,9 @@ class ColorLightManagerCard extends HTMLElement {
         && !(p.tracker_hide_none && !this._editMode && buttonMode(p) === 'tracker' && !this._resolveAreaStatus(this._trackerArea(p)).isActive));
       const btnHtml = (p) => buttonMode(p) === 'tracker'
         ? this._renderTrackerButton(p, section, stack)
-        : this._renderPresetButton(p, this._buttonStyleForPreset(stack, section, p));
+        : (buttonMode(p) === 'light'
+          ? this._renderLightButton(p, this._buttonStyleForPreset(stack, section, p))
+          : this._renderPresetButton(p, this._buttonStyleForPreset(stack, section, p)));
       // Off-button placement: when set, the section's Off-mode buttons are pulled OUT of the main
       // button flow into their own group, positioned as a row (above/below) or column (before/after)
       // relative to the rest. 'inline' (default/unset) leaves everything in one group as before.
@@ -5591,6 +5690,140 @@ class ColorLightManagerCard extends HTMLElement {
     const isActive = !unavailable && !isNoScene;
     return { option, unavailable, color, icon, sub, isOff, isActive, lightSt };
   }
+  // Light button (mode 'light'): drawn through the normal button renderer with the lights' live or
+  // last known colour as its look, and "active" = any target light on (so Button Active / Inactive
+  // layers style on vs off). Class cpc-light-btn opts it out of the normal press handler; it gets
+  // tap / hold handling from _wireLightButton instead.
+  _renderLightButton(preset, bstyle) {
+    const st = lightButtonStatus(this._hass, this._presetColorIds(preset));
+    const fixed = preset.button_style_color && /^#[0-9a-f]{6}$/i.test(preset.button_style_color) ? preset.button_style_color : null;
+    const hex = fixed || st.color;
+    const look = hex ? { rgb_color: ColorUtils.hexToRgb(hex) } : { look_none: true };
+    const sub = preset.light_show_count && st.total > 1 ? `${st.onCount}/${st.total} on` : '';
+    const tile = { ...preset, mode: 'light', ...(sub ? { _sublabel: sub } : {}) };
+    const html = renderPresetButtonHtml(look, tile, bstyle || this._config, st.onState, this._config && this._config.temperature_output_format, null, st.on);
+    return html.replace('<button class="cpc-preset-btn', `<button data-light-sig="${st.on ? 1 : 0}|${hex || ''}|${sub}" class="cpc-preset-btn cpc-light-btn`);
+  }
+  // Tap / long-press (500 ms) for a Light button. Each runs the button's chosen action:
+  //   light_tap  (default 'toggle') / light_hold (default 'popup') ∈ toggle | popup | none.
+  _wireLightButton(btn) {
+    let timer = null, held = false;
+    const preset = () => (this._config.presets || []).find(p => p.id === btn.dataset.presetId);
+    const run = (which) => {
+      const p = preset(); if (!p) return;
+      const act = which === 'hold' ? (p.light_hold || 'popup') : (p.light_tap || 'toggle');
+      if (act === 'toggle') this._toggleLightButton(p);
+      else if (act === 'popup') this._openLightPopup(p);
+    };
+    const start = () => { held = false; clearTimeout(timer); timer = setTimeout(() => { held = true; run('hold'); }, 500); };
+    const cancel = () => { clearTimeout(timer); timer = null; };
+    btn.addEventListener('pointerdown', start);
+    btn.addEventListener('pointerleave', cancel);
+    btn.addEventListener('pointercancel', cancel);
+    btn.addEventListener('contextmenu', (e) => e.preventDefault());   // long-press on mobile opens no menu
+    btn.onclick = (e) => { cancel(); if (held) { held = false; e.preventDefault(); return; } run('tap'); };
+  }
+  // Toggle: any target on → turn them all off; all off → turn them on with NO colour data, so each
+  // light comes back in its own last colour and brightness.
+  _toggleLightButton(preset) {
+    const ids = this._presetColorIds(preset);
+    if (!ids.length || !this._hass) return;
+    const st = lightButtonStatus(this._hass, ids);
+    this._callLightService(st.on ? 'turn_off' : 'turn_on', {}, ids);
+  }
+  // Popup: a dialog with one row per light (groups expanded when the button controls more than one
+  // light), each with its state, colour, on/off and a brightness slider, plus an "All" row on top.
+  // It lives on document.body (so no ancestor transform can clip it) with its own styles, and
+  // refreshes in place on every hass update while open.
+  _openLightPopup(preset) {
+    this._closeLightPopup();
+    const ids = this._presetColorIds(preset);
+    if (!ids.length) return;
+    const rows = expandLightIds(this._hass, ids);
+    const el = document.createElement('div');
+    el.className = 'clm-pop';
+    el.innerHTML = `<style>
+      .clm-pop { position:fixed; inset:0; z-index:9999; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,0.5); font-family:var(--paper-font-body1_-_font-family, inherit); }
+      .clm-pop-box { width:min(420px, calc(100vw - 32px)); max-height:calc(100vh - 64px); overflow:auto; background:var(--ha-card-background, var(--card-background-color, #1c1c1c)); color:var(--primary-text-color, #fff); border-radius:16px; padding:16px; box-shadow:0 8px 32px rgba(0,0,0,0.5); }
+      .clm-pop-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; font-size:16px; font-weight:500; }
+      .clm-pop-x { background:none; border:none; color:inherit; cursor:pointer; font-size:22px; line-height:1; padding:4px 8px; }
+      .clm-pop-row { display:grid; grid-template-columns:18px 1fr auto; align-items:center; gap:4px 10px; padding:8px 0; border-top:1px solid var(--divider-color, #333); }
+      .clm-pop-row.all { border-top:none; padding-top:0; }
+      .clm-pop-dot { width:14px; height:14px; border-radius:50%; border:1px solid rgba(255,255,255,0.3); }
+      .clm-pop-name { font-size:14px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .clm-pop-name small { display:block; color:var(--secondary-text-color, #aaa); font-size:12px; }
+      .clm-pop-tg { min-width:56px; padding:6px 10px; border-radius:8px; border:1px solid var(--divider-color, #444); background:transparent; color:inherit; cursor:pointer; font-size:13px; }
+      .clm-pop-tg.on { background:var(--primary-color, #03a9f4); border-color:var(--primary-color, #03a9f4); color:#fff; }
+      .clm-pop-bri { grid-column:2 / 4; width:100%; accent-color:var(--primary-color, #03a9f4); }
+      .clm-pop-bri:disabled { opacity:0.35; }
+    </style><div class="clm-pop-box" role="dialog" aria-label="${escapeHtml(preset.name || 'Lights')}">
+      <div class="clm-pop-head"><span>${escapeHtml(preset.name || 'Lights')}</span><button class="clm-pop-x" title="Close">×</button></div>
+      <div class="clm-pop-rows"></div></div>`;
+    const list = el.querySelector('.clm-pop-rows');
+    const multi = rows.length > 1;
+    const rowHtml = (key, label) => `<div class="clm-pop-row${key === '__all__' ? ' all' : ''}" data-id="${escapeHtml(key)}">
+      <span class="clm-pop-dot"></span><span class="clm-pop-name">${escapeHtml(label)}<small></small></span>
+      <button class="clm-pop-tg"></button><input class="clm-pop-bri" type="range" min="1" max="100" step="1"></div>`;
+    list.innerHTML = (multi ? rowHtml('__all__', 'All') : '') + rows.map(id => rowHtml(id, friendlyName(this._hass, id))).join('');
+    const targetsOf = (key) => key === '__all__' ? ids : [key];
+    list.querySelectorAll('.clm-pop-row').forEach(r => {
+      const key = r.dataset.id;
+      r.querySelector('.clm-pop-tg').onclick = () => {
+        const on = key === '__all__' ? lightButtonStatus(this._hass, ids).on : (this._hass.states[key] || {}).state === 'on';
+        this._callLightService(on ? 'turn_off' : 'turn_on', {}, targetsOf(key));
+      };
+      const bri = r.querySelector('.clm-pop-bri');
+      bri.addEventListener('input', () => { bri._dragging = true; const s = r.querySelector('small'); if (s) s.textContent = `${bri.value}%`; });
+      bri.addEventListener('change', () => { bri._dragging = false; this._callLightService('turn_on', { brightness_pct: Number(bri.value) }, targetsOf(key)); });
+    });
+    const close = () => this._closeLightPopup();
+    el.addEventListener('click', (e) => { if (e.target === el) close(); });
+    el.querySelector('.clm-pop-x').onclick = close;
+    this._popupKeyHandler = (e) => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', this._popupKeyHandler);
+    document.body.appendChild(el);
+    this._lightPopup = { el, presetId: preset.id, ids, rows };
+    this._refreshLightPopup();
+  }
+  _refreshLightPopup() {
+    const pop = this._lightPopup; if (!pop || !this._hass) return;
+    const states = this._hass.states;
+    pop.el.querySelectorAll('.clm-pop-row').forEach(r => {
+      const key = r.dataset.id;
+      let on, hex, bri, label;
+      if (key === '__all__') {
+        const st = lightButtonStatus(this._hass, pop.ids);
+        const bs = pop.rows.map(id => states[id]).filter(x => x && x.state === 'on' && x.attributes && x.attributes.brightness != null).map(x => x.attributes.brightness);
+        on = st.on; hex = st.color; bri = bs.length ? Math.round(bs.reduce((a, b) => a + b, 0) / bs.length / 2.55) : null;
+        label = `${st.onCount} of ${st.total} on`;
+      } else {
+        const st = states[key];
+        on = !!st && st.state === 'on'; hex = lightStateHex(st) || LAST_LIGHT_COLORS[key] || null;
+        bri = on && st.attributes && st.attributes.brightness != null ? Math.round(st.attributes.brightness / 2.55) : null;
+        label = !st ? 'missing' : (st.state === 'on' ? (bri != null ? `On · ${bri}%` : 'On') : (st.state === 'off' ? 'Off' : st.state));
+      }
+      const dot = r.querySelector('.clm-pop-dot'); dot.style.background = hex || 'transparent';
+      const tg = r.querySelector('.clm-pop-tg'); tg.textContent = on ? 'On' : 'Off'; tg.classList.toggle('on', on);
+      const range = r.querySelector('.clm-pop-bri');
+      if (!range._dragging) { range.value = bri != null ? bri : 0; r.querySelector('small').textContent = label; }
+    });
+  }
+  _closeLightPopup() {
+    if (this._lightPopup && this._lightPopup.el) this._lightPopup.el.remove();
+    this._lightPopup = null;
+    if (this._popupKeyHandler) { document.removeEventListener('keydown', this._popupKeyHandler); this._popupKeyHandler = null; }
+  }
+  // All lights the card's Light buttons control (targets + group members): watched for colour memory.
+  _lightButtonIds() {
+    const out = new Set();
+    ((this._config && this._config.presets) || []).forEach(p => {
+      if (!p || buttonMode(p) !== 'light') return;
+      const ids = this._presetColorIds(p);
+      ids.forEach(id => out.add(id)); expandLightIds(this._hass, ids).forEach(id => out.add(id));
+    });
+    return [...out];
+  }
+
   // A Scene Tracker button (mode 'tracker') as the "area" _resolveAreaStatus reads: its input_select
   // (tracker_entity), optional representative light (tracker_light), and — as the last-resort icon —
   // the button's own icon when the user set one (a mode-default icon doesn't count).
@@ -5742,6 +5975,20 @@ class ColorLightManagerCard extends HTMLElement {
         // Scene Tracker tiles aren't matched against light state here (that would treat them as
         // color buttons); they re-render whole when their input_select / light changes.
         if (buttonMode(preset) === 'tracker') return;
+        // Light buttons: re-render the node only when on/off, colour or count changed (the sig), then
+        // re-wire its tap / hold handlers.
+        if (buttonMode(preset) === 'light') {
+          const sectionEl0 = btn.closest('.cpc-section');
+          const sid0 = sectionEl0 && sectionEl0.dataset.sectionId;
+          const stack0 = sid0 ? stackBySection.get(sid0) : null;
+          const html = this._renderLightButton(preset, stack0 ? this._buttonStyleForPreset(stack0, sectionById.get(sid0), preset) : cfg);
+          const m = html.match(/data-light-sig="([^"]*)"/);
+          if (m && btn.dataset.lightSig === m[1]) return;
+          const tmp = document.createElement('template'); tmp.innerHTML = html.trim();
+          const fresh = tmp.content.firstElementChild;
+          if (fresh) { this._wireLightButton(fresh); btn.replaceWith(fresh); if (fresh.closest('.cpc-off-wrap')) requestAnimationFrame(() => this._matchDetachedSizes()); }
+          return;
+        }
         const sectionEl = btn.closest('.cpc-section');
         const sid = sectionEl && sectionEl.dataset.sectionId;
         const stack = sid ? stackBySection.get(sid) : null;
@@ -7223,6 +7470,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
     return (active && live) ? live : '#424242';
   }
   _presetSwatch(preset) {
+    if (buttonMode(preset) === 'light') {
+      if (preset.button_style_color) return preset.button_style_color;
+      const st = lightButtonStatus(this._hass, this._specTargetIds ? this._specTargetIds(presetTargetSpec(preset)) : (presetTargetSpec(preset).custom || []));
+      return st.color || '#888';
+    }
     // Scene / follow-color buttons: the swatch mirrors the card body color (fixed Style Color →
     // live-when-active → grey), so the editor summary matches what shows.
     if (buttonMode(preset) === 'scene' || (Array.isArray(preset.glow_entities) && preset.glow_entities.length > 0)) {
@@ -9006,13 +9258,14 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const isOff = mode === 'off';
     const isScene = mode === 'scene';
     const isTracker = mode === 'tracker';   // read-only status tile: only its Scene Tracker fields apply
+    const isLight = mode === 'light';       // toggles / popup for its lights; shows their colour
     // A Color-Entity-linked button holds NO color of its own — the entity is the source of
     // truth. So when linked we HIDE the inline look editors entirely and edit the value in the
     // Color Entities panel instead. Only Custom Color/Temp buttons can link.
     const isLinked = (isColor || isTemp) && !!preset.input_color_entity &&
       this._allInputColorEntities.includes(preset.input_color_entity);
     const showLook = (isColor || isTemp) && !isLinked;   // inline look editors live here
-    const showButtonStyle = isScene || isOff;            // custom appearance for color-less buttons
+    const showButtonStyle = isScene || isOff || isLight; // custom appearance for color-less buttons
     const min = Number(this._config.min_kelvin) || 2000;
     const max = Number(this._config.max_kelvin) || 6500;
     const kelvin = clamp(preset.color_kelvin || Math.round((min + max) / 2), min, max);
@@ -9064,8 +9317,17 @@ class ColorLightManagerCardEditor extends HTMLElement {
               <option value="temp" ${isTemp ? 'selected' : ''}>Custom Temperature</option>
               <option value="color" ${isColor ? 'selected' : ''}>Custom Color</option>
               <option value="tracker" ${isTracker ? 'selected' : ''}>Scene Tracker (read-only)</option>
+              <option value="light" ${isLight ? 'selected' : ''}>Light (on / off, dim)</option>
             </select>
           </div>
+          ${isLight ? `<div class="cpce-subgroup"><ha-icon icon="mdi:gesture-tap"></ha-icon>Light Button</div>
+          ${(() => { const opt = (v, cur, l) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${l}</option>`;
+            const tap = preset.light_tap || 'toggle', hold = preset.light_hold || 'popup';
+            const opts = (cur) => opt('toggle', cur, 'Turn on / off') + opt('popup', cur, 'Open dimming popup') + opt('none', cur, 'Nothing');
+            return `<div class="cpce-row"><label class="lbl">Tap</label><select class="cpce-light-tap">${opts(tap)}</select></div>
+            <div class="cpce-row"><label class="lbl">Long Press</label><select class="cpce-light-hold">${opts(hold)}</select></div>
+            <div class="cpce-check"><input type="checkbox" class="cpce-light-count" ${preset.light_show_count ? 'checked' : ''}><label>Show how many lights are on (e.g. 2/3 on) when it controls several</label></div>
+            <div class="cpce-hint">Turning on sends no colour, so each light comes back in its own last colour and brightness. The button shows the lights' live colour, or their last known colour while they're off. The popup has a brightness slider and on/off for each light, plus an <strong>All</strong> row when the button controls more than one light (groups are listed light by light). A fixed Button Color below overrides the colour, e.g. for plain dimmers.</div>`; })()}` : ''}
           ${isTracker ? `<div class="cpce-subgroup"><ha-icon icon="mdi:view-grid-outline"></ha-icon>Scene Tracker</div>${this._renderTrackerFields(preset, index)}` : ''}
           ${isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:palette"></ha-icon>Scene</div>${this._renderPresetScenePicker(preset, index)}` : ''}
           ${isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:lightbulb-on-outline"></ha-icon>Follow Lights for Color</div>${this._renderPresetGlowFollow(preset, index)}` : ''}
@@ -10005,7 +10267,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     return `
       <div class="cpce-preset-actions" data-index="${index}">
         <div class="cpce-action-block">
-          <div class="cpce-hint">Which lights get this button's ${isOff ? 'off command' : mode === 'profile' ? "profile's look" : 'color/temperature'}. Combine the shared Default Entities pool with this button's own lights.</div>
+          <div class="cpce-hint">Which lights ${mode === 'light' ? 'this button turns on / off and dims' : `get this button's ${isOff ? 'off command' : mode === 'profile' ? "profile's look" : 'color/temperature'}`}. Combine the shared Default Entities pool with this button's own lights.</div>
           <div class="cpce-check"><input type="checkbox" class="cpce-cc-use-default" ${spec.useDefault?'checked':''}><label>Use Default Entities${cardEntities.length ? '' : ' — none set'}</label></div>
           ${spec.useDefault && cardEntities.length ? `<div style="margin-left:22px;">${this._renderStaticChips(cardEntities, 'default')}</div>` : ''}
           <div class="cpce-check"><input type="checkbox" class="cpce-cc-use-custom" ${spec.useCustom?'checked':''}><label>Include other Entities</label></div>
@@ -10064,6 +10326,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         delete p.action; ALL_PRESET_COLOR_KEYS.forEach(k => delete p[k]); delete p.color_kelvin;
         delete p.look_none; delete p.profile_ref; delete p.scene_ref; delete p.transition; delete p.effect;
         delete p.tracker_entity; delete p.tracker_light; delete p.tracker_text; delete p.tracker_subtext; delete p.tracker_none_text; delete p.tracker_hide_none;
+        delete p.light_tap; delete p.light_hold; delete p.light_show_count;
         const v = modeEl.value;
         // If the icon isn't a user-customized one (empty or a generic/mode default), follow the
         // new mode's default icon so the button glyph matches its function automatically.
@@ -10073,6 +10336,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
         else if (v === 'scene') { p.look_none = true; delete p.brightness; delete p.input_color_entity; }  // scene_ref set by the picker
         else if (v === 'profile') { delete p.brightness; delete p.input_color_entity; }  // profile_ref set by the picker
         else if (v === 'temp') p.color_kelvin = midKelvin;
+        else if (v === 'light') {
+          // Toggles its own lights; nothing to send. Default to "Include other Entities" so the user
+          // picks the lights this button controls.
+          delete p.brightness; delete p.input_color_entity;
+          if (p.use_default_entities === undefined && p.use_custom_entities === undefined) { p.use_default_entities = false; p.use_custom_entities = true; }
+        }
         else if (v === 'tracker') {
           // Never pressed, so nothing it would send or set applies: drop the press-side fields.
           delete p.brightness; delete p.input_color_entity; delete p.selects; delete p.no_scene_reset;
@@ -10093,6 +10362,22 @@ class ColorLightManagerCardEditor extends HTMLElement {
         this._updateConfig({ presets });
         this._render();
       };
+
+      // Light button settings. Byte-stable: defaults (tap toggle, hold popup, no count) store no key.
+      [['.cpce-light-tap', 'light_tap', 'toggle'], ['.cpce-light-hold', 'light_hold', 'popup']].forEach(([sel, key, def]) => {
+        const el = container.querySelector(sel); if (!el) return;
+        el.addEventListener('change', () => {
+          const presets = [...(this._config.presets || [])]; const p = { ...presets[index] };
+          if (el.value && el.value !== def) p[key] = el.value; else delete p[key];
+          presets[index] = p; this._updateConfig({ presets }); this._render();
+        });
+      });
+      const lightCountEl = container.querySelector('.cpce-light-count');
+      if (lightCountEl) lightCountEl.addEventListener('change', () => {
+        const presets = [...(this._config.presets || [])]; const p = { ...presets[index] };
+        if (lightCountEl.checked) p.light_show_count = true; else delete p.light_show_count;
+        presets[index] = p; this._updateConfig({ presets }); this._render();
+      });
 
       // No icon (text only). Byte-stable: the key exists only while checked.
       const noIconEl = container.querySelector('.cpce-preset-noicon');
