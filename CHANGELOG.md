@@ -8,6 +8,32 @@ resets. Newest first.
 
 ---
 
+## v2026.11.09.287
+
+- **Fixed: button names wrapped in the middle of a word** (e.g. "Mudroo / m Hall"). With *Allow name
+  to wrap* on, names now wrap only between words; a single word is broken only if it can't fit on a
+  line by itself.
+- **New: a Buttons section can open as a popover.** Section settings → **Display**:
+  - *On the card*: as before (inline, or collapsible).
+  - *Popover*: only the section heading shows on the card; tapping it opens the section's buttons in
+    a popup, titled with the section name. Close with ×, Esc or a tap outside.
+  - *Area button*: the section shows as **one styled button**. Area sections that are next to each
+    other in Section order share one grid, and tapping an area button opens that area's buttons in
+    the popup. An optional **Area Icon** per section.
+  Everything inside the popup works as on the card: Light buttons, Off and Scene Tracker layout,
+  live updates. It stays open while lights change.
+- **Card Appearance → Area Buttons** sets how area buttons look:
+  - **Button Style** (any Button Style; default Basic Theme), **Columns** (0 = wrap) and **Gap**.
+  - **Show how many lights are on** (e.g. "2/5 on"), counting the area's Light buttons' lights
+    (groups counted light by light).
+  - **Color the button with the lights' color** while any is on (use a style with a solid or tinted
+    background for the colour to show as a fill).
+  - **On / Off label**, with your own On / Off text.
+  - **Icon shows on / off**, with your own on and off icons; or one fixed icon; or **No icon**.
+  An area button glows (counts as active) while any of its lights is on.
+- Area buttons and popups are new keys only (`display`, `area_icon` per section; `area_*` on the
+  card), so existing cards are unchanged.
+
 ## v2026.11.08.286
 
 - **New button Mode: Light (on / off, dim).** A Light button controls one light, a light group, or
