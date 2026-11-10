@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.11.10.288
+// Version: v2026.11.10.289
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.11.10.288';
+const BUILD_NUMBER = 'v2026.11.10.289';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -5267,7 +5267,8 @@ class ColorLightManagerCard extends HTMLElement {
   _openPopover(sid) {
     this._openPop = sid;
     this.querySelectorAll('.cpc-pop-host').forEach(h => h.classList.toggle('open', h.dataset.popHost === sid));
-    if (!this._popEsc) { this._popEsc = (e) => { if (e.key === 'Escape') this._closePopover(); }; document.addEventListener('keydown', this._popEsc); }
+    // Esc closes only the top-most popup: if a light (dimming) popup is open over this one, leave it to that.
+    if (!this._popEsc) { this._popEsc = (e) => { if (e.key === 'Escape' && !this._lightPopup) this._closePopover(); }; document.addEventListener('keydown', this._popEsc); }
     // The contents were laid out while hidden: size and fit them now that they're visible.
     requestAnimationFrame(() => { this._matchDetachedSizes(); this._fitWrappedOffRows(); });
   }
@@ -5870,13 +5871,18 @@ class ColorLightManagerCard extends HTMLElement {
   // tap / hold handling from _wireLightButton instead.
   _renderLightButton(preset, bstyle) {
     const st = lightButtonStatus(this._hass, this._presetColorIds(preset));
-    const fixed = preset.button_style_color && /^#[0-9a-f]{6}$/i.test(preset.button_style_color) ? preset.button_style_color : null;
+    // Fixed colours may be a hex OR a theme / CSS colour (four-mode control); both apply. The glow
+    // has its own fixed colour (button_glow_style_color), independent of the body.
+    const fixed = preset.button_style_color || null;
+    const fixedGlow = preset.button_glow_style_color || null;
     const hex = fixed || st.color;
-    const look = hex ? { rgb_color: ColorUtils.hexToRgb(hex) } : { look_none: true };
-    const sub = preset.light_show_count && st.total > 1 ? `${st.onCount}/${st.total} on` : '';
+    const look = (hex && /^#[0-9a-f]{6}$/i.test(hex)) ? { rgb_color: ColorUtils.hexToRgb(hex) } : { look_none: true };
+    // Count line: "N/M on" for several lights; for a single light, "On" / "Off".
+    const sub = preset.light_show_count ? (st.total > 1 ? `${st.onCount}/${st.total} on` : (st.on ? 'On' : 'Off')) : '';
     const tile = { ...preset, mode: 'light', ...(sub ? { _sublabel: sub } : {}) };
-    const html = renderPresetButtonHtml(look, tile, bstyle || this._config, st.onState, this._config && this._config.temperature_output_format, null, st.on);
-    return html.replace('<button class="cpc-preset-btn', `<button data-light-sig="${st.on ? 1 : 0}|${hex || ''}|${sub}" class="cpc-preset-btn cpc-light-btn`);
+    const appearance = (fixed || fixedGlow) ? { bodyColor: hex || null, glowColor: fixedGlow || hex || null } : undefined;
+    const html = renderPresetButtonHtml(look, tile, bstyle || this._config, st.onState, this._config && this._config.temperature_output_format, null, st.on, appearance);
+    return html.replace('<button class="cpc-preset-btn', `<button data-light-sig="${st.on ? 1 : 0}|${escapeHtml(hex || '')}|${escapeHtml(fixedGlow || '')}|${sub}" class="cpc-preset-btn cpc-light-btn`);
   }
   // Tap / long-press (500 ms) for a Light button. Each runs the button's chosen action:
   //   light_tap  (default 'toggle') / light_hold (default 'popup') ∈ toggle | popup | none.
@@ -5953,8 +5959,9 @@ class ColorLightManagerCard extends HTMLElement {
     const close = () => this._closeLightPopup();
     el.addEventListener('click', (e) => { if (e.target === el) close(); });
     el.querySelector('.clm-pop-x').onclick = close;
-    this._popupKeyHandler = (e) => { if (e.key === 'Escape') close(); };
-    document.addEventListener('keydown', this._popupKeyHandler);
+    // Capture phase so it runs before (and stops) the area popover's own Esc handler.
+    this._popupKeyHandler = (e) => { if (e.key === 'Escape') { e.stopImmediatePropagation(); close(); } };
+    document.addEventListener('keydown', this._popupKeyHandler, true);
     document.body.appendChild(el);
     this._lightPopup = { el, presetId: preset.id, ids, rows };
     this._refreshLightPopup();
@@ -5985,7 +5992,7 @@ class ColorLightManagerCard extends HTMLElement {
   _closeLightPopup() {
     if (this._lightPopup && this._lightPopup.el) this._lightPopup.el.remove();
     this._lightPopup = null;
-    if (this._popupKeyHandler) { document.removeEventListener('keydown', this._popupKeyHandler); this._popupKeyHandler = null; }
+    if (this._popupKeyHandler) { document.removeEventListener('keydown', this._popupKeyHandler, true); this._popupKeyHandler = null; }
   }
   // All lights the card's Light buttons control (targets + group members): watched for colour memory.
   _lightButtonIds() {
@@ -9503,7 +9510,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
             const opts = (cur) => opt('toggle', cur, 'Turn on / off') + opt('popup', cur, 'Open dimming popup') + opt('none', cur, 'Nothing');
             return `<div class="cpce-row"><label class="lbl">Tap</label><select class="cpce-light-tap">${opts(tap)}</select></div>
             <div class="cpce-row"><label class="lbl">Long Press</label><select class="cpce-light-hold">${opts(hold)}</select></div>
-            <div class="cpce-check"><input type="checkbox" class="cpce-light-count" ${effectiveButtonOpt(this._config, preset, 'light_show_count') ? 'checked' : ''}><label>Show how many lights are on (e.g. 2/3 on) when it controls several</label></div>
+            <div class="cpce-check"><input type="checkbox" class="cpce-light-count" ${effectiveButtonOpt(this._config, preset, 'light_show_count') ? 'checked' : ''}><label>Show how many lights are on (2/3 on), or On / Off for a single light</label></div>
             <div class="cpce-hint">Turning on sends no colour, so each light comes back in its own last colour and brightness. The button shows the lights' live colour, or their last known colour while they're off. The popup has a brightness slider and on/off for each light, plus an <strong>All</strong> row when the button controls more than one light (groups are listed light by light). A fixed Button Color below overrides the colour, e.g. for plain dimmers.</div>`; })()}` : ''}
           ${isTracker ? `<div class="cpce-subgroup"><ha-icon icon="mdi:view-grid-outline"></ha-icon>Scene Tracker</div>${this._renderTrackerFields(preset, index)}` : ''}
           ${isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:palette"></ha-icon>Scene</div>${this._renderPresetScenePicker(preset, index)}` : ''}
@@ -9683,11 +9690,19 @@ class ColorLightManagerCardEditor extends HTMLElement {
     preset = { ...preset, button_style_color: effectiveButtonOpt(this._config, preset, 'button_style_color'), button_glow_style_color: effectiveButtonOpt(this._config, preset, 'button_glow_style_color') };
     const bodyOn = !!preset.button_style_color;
     const glowOn = !!preset.button_glow_style_color;
+    // The section's Button Style decides whether a body colour can show as a fill: with a Theme or
+    // Transparent background it only reaches the match-coloured accents (edge line, glow, icon).
+    const sec = this._sectionForPreset ? this._sectionForPreset(preset) : null;
+    const secSlug = fixtureRefSlug(sec && sec.style_preset);
+    const secStack = (secSlug && buttonStyleStack(secSlug)) || builtinButtonStack(BTN_STYLE_BASIC_SLUG);
+    const bgMode = secStack ? (extractButtonAppearance(flattenButtonStack(secStack, () => false)).button_style || 'solid') : 'solid';
+    const noFill = bgMode === 'theme' || bgMode === 'transparent';
     return `
       <div class="cpce-check"><input type="checkbox" class="cpce-btnstyle-enable" data-index="${index}" ${bodyOn?'checked':''}><label>Fixed button color</label></div>
       ${bodyOn ? `
         <div class="cpce-row"><label class="lbl">Button Color</label>${this._presetColorField(index, 'button_style_color', preset.button_style_color, `<input type="color" class="cpce-btnstyle-color" data-index="${index}" value="${/^#[0-9a-f]{6}$/i.test(preset.button_style_color||'')?preset.button_style_color:'#2196F3'}">`, '#2196F3')}</div>
         <div class="cpce-hint">The button body stays this exact color — independent of the glow.</div>
+        ${noFill ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">This section's Button Style has a <strong>${bgMode === 'theme' ? 'Theme' : 'Transparent'}</strong> background, so this color doesn't fill the button. It only shows in the style's match-colored accents (edge line, glow, icon). Use a style with a Solid or Tinted background to see it as a fill.</div>` : ''}
       ` : ''}
       <div class="cpce-check"><input type="checkbox" class="cpce-btnglow-enable" data-index="${index}" ${glowOn?'checked':''}><label>Fixed glow color</label></div>
       ${glowOn ? `

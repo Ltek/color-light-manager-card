@@ -8,6 +8,24 @@ resets. Newest first.
 
 ---
 
+## v2026.11.10.289
+
+- **Fixed: Fixed glow color did nothing on Light buttons.** The glow always followed the light's
+  colour. It now uses the fixed glow colour, set on the button or in Button Behavior Defaults.
+- **Fixed: a Fixed button color picked as a Theme color or Custom CSS was ignored on Light buttons.**
+  Only plain hex colours worked; all four colour modes now apply.
+- **Fixed: "Show number of lights on" showed nothing on a button with a single light.** It now
+  shows **On** / **Off** for one light, and "2/3 on" for several.
+- **Fixed: Esc closed both popups at once.** With a dimming popup open on top of an area popover,
+  Esc now closes only the top one.
+- **Fixed button color now explains when it can't show as a fill.** When the section's Button Style
+  has a Theme or Transparent background (Neon Lux and copies of it), the colour only reaches the
+  style's match-coloured accents (edge line, glow, icon). The button's editor now says so, under the
+  colour.
+- Checked every Button Behavior setting (Tap, Long Press, light count, fixed button and glow colour,
+  No icon), both set on a button and via the defaults, including inside an area popover and with
+  touch input.
+
 ## v2026.11.10.288
 
 - **New editor panel: Button Behavior Defaults.** Card-level defaults for the settings many buttons
