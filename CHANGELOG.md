@@ -8,6 +8,32 @@ resets. Newest first.
 
 ---
 
+## v2026.11.10.288
+
+- **New editor panel: Button Behavior Defaults.** Card-level defaults for the settings many buttons
+  share: **Tap** and **Long Press** (Light buttons), **Show number of lights on** (Light buttons),
+  **Fixed button color** and **Fixed glow color** (Light, Scene and Light Off buttons) and
+  **No icon** (all buttons).
+  - A button follows the default unless that setting was changed on the button itself. In a
+    button's own settings, picking the same value as the default removes the button's own value, so
+    it follows the default again.
+  - The panel is **locked**: you can see every value but change nothing until you press **Unlock**
+    (unlocking lasts for this editor session). **Every change asks for confirmation**, and
+    cancelling puts the value back.
+  - Each setting shows the **built-in default** next to it when the card's value is different, and
+    how many buttons use their own value.
+  - **Update Value on All Buttons** (per setting) and **Update All Options on All Buttons** (top)
+    remove the buttons' own values so every button uses the defaults. Both confirm first and say how
+    many buttons will change.
+  - Stored as `button_defaults` on the card, only for values that differ from the built-in ones.
+    A button's fixed colour of `''` means "none", overriding a default colour.
+- **Editor: the expand chevron on button and slider-section rows is now a pencil (Edit) icon.** It
+  turns the accent colour while that row is open. Panel headers keep their chevron.
+- **Header: show how many Light buttons are on.** Card Appearance → Header → *Show how many Light
+  buttons are on*: the title reads "Lights - 3", like the Easy Entity Styler card's title count.
+  Hidden when none are on, unless *Also show 0* is ticked. Updates live. Stored as
+  `header_on_count` (and `header_on_count_show_zero`).
+
 ## v2026.11.09.287
 
 - **Fixed: button names wrapped in the middle of a word** (e.g. "Mudroo / m Hall"). With *Allow name

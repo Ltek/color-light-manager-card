@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.11.09.287
+// Version: v2026.11.10.288
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.11.09.287';
+const BUILD_NUMBER = 'v2026.11.10.288';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -793,6 +793,48 @@ function presetTargetSpec(preset) {
   if (tm === 'none') return { useDefault: false, useCustom: false, custom };
   if (tm === 'specific') return { useDefault: false, useCustom: true, custom };
   return { useDefault: true, useCustom: false, custom };   // 'all'
+}
+
+// ---- Button Behavior Defaults (card-level `button_defaults`) ----
+// Settings shared by many buttons. A button without its own value uses the card default, which in
+// turn falls back to the built-in default. A button stores its own key ONLY when it differs from the
+// card default (editor), so "Update on all buttons" = delete that key from every applicable button.
+// For the fixed colours, a button value of '' means "explicitly none" (overrides a card default).
+const BUTTON_DEFAULT_KEYS = [
+  { key: 'light_tap', label: 'Tap', kind: 'select', builtin: 'toggle', modes: ['light'],
+    options: [['toggle', 'Turn on / off'], ['popup', 'Open dimming popup'], ['none', 'Nothing']] },
+  { key: 'light_hold', label: 'Long Press', kind: 'select', builtin: 'popup', modes: ['light'],
+    options: [['toggle', 'Turn on / off'], ['popup', 'Open dimming popup'], ['none', 'Nothing']] },
+  { key: 'light_show_count', label: 'Show number of lights on', kind: 'bool', builtin: false, modes: ['light'] },
+  { key: 'button_style_color', label: 'Fixed button color', kind: 'color', builtin: '', modes: ['light', 'scene', 'off'] },
+  { key: 'button_glow_style_color', label: 'Fixed glow color', kind: 'color', builtin: '', modes: ['light', 'scene', 'off'] },
+  { key: 'hide_icon', label: 'No icon (text only)', kind: 'bool', builtin: false, modes: null },
+];
+function buttonDefaultDef(key) { return BUTTON_DEFAULT_KEYS.find(d => d.key === key); }
+function buttonDefaultApplies(def, preset) { return !def.modes || def.modes.includes(buttonMode(preset)); }
+function cardButtonDefault(cfg, key) {
+  const d = buttonDefaultDef(key); const bd = (cfg && cfg.button_defaults) || {};
+  return bd[key] !== undefined ? bd[key] : d.builtin;
+}
+function effectiveButtonOpt(cfg, preset, key) {
+  return preset && preset[key] !== undefined ? preset[key] : cardButtonDefault(cfg, key);
+}
+// Fill each preset's missing keys from the card defaults (renderer only), so every render path sees
+// the effective values. '' / false / built-in values are dropped so they read as "off".
+function applyButtonDefaults(presets, cfg) {
+  if (!Array.isArray(presets)) return presets;
+  return presets.map(p => {
+    if (!p) return p;
+    let out = p;
+    BUTTON_DEFAULT_KEYS.forEach(d => {
+      if (!buttonDefaultApplies(d, p)) return;
+      const v = effectiveButtonOpt(cfg, p, d.key);
+      const has = out[d.key] !== undefined;
+      if (v === d.builtin || v === '' || v === false) { if (has) { out = out === p ? { ...p } : out; delete out[d.key]; } return; }
+      if (!has || out[d.key] !== v) { out = out === p ? { ...p } : out; out[d.key] = v; }
+    });
+    return out;
+  });
 }
 
 // ---- Light buttons (mode 'light') ----
@@ -3071,7 +3113,7 @@ class ColorLightManagerCard extends HTMLElement {
     this._lastConfigJson = nextRaw;
     this._config = { ...ColorLightManagerCard.getStubConfig(), ...config };
     // Heal any duplicate preset ids from older builds (they broke per-button glow lookups).
-    this._config.presets = dedupePresetIds(this._config.presets);
+    this._config.presets = applyButtonDefaults(dedupePresetIds(this._config.presets), this._config);
     DEBUG = this._config.debug || false;
     // NOTE: the collapsed state is seeded/maintained in renderCard (it checks `this.preview` on
     // every render), NOT here — HA can assign `preview` before or after setConfig.
@@ -4244,7 +4286,7 @@ class ColorLightManagerCard extends HTMLElement {
     ].filter(Boolean).join(' ');
     // Render a header if there's title content, OR if collapsible needs a bar to click.
     const headerHtml = (showTitleText || showTitleIcon || collapsible)
-      ? `<div class="${headerClasses}" id="cpc-header">${showTitleIcon ? `<ha-icon class="cpc-title-icon" id="cpc-title-icon" icon="${escapeHtml(normalizeIcon(cfg.icon))}"></ha-icon>` : ''}${showTitleText ? `<span class="cpc-title-text">${escapeHtml(cfg.title)}</span>` : (collapsible ? '<span class="cpc-title-text"></span>' : '')}${showChevron ? `<ha-icon class="cpc-chevron${expanded ? ' expanded' : ''}" icon="mdi:chevron-down"></ha-icon>` : ''}</div>`
+      ? `<div class="${headerClasses}" id="cpc-header">${showTitleIcon ? `<ha-icon class="cpc-title-icon" id="cpc-title-icon" icon="${escapeHtml(normalizeIcon(cfg.icon))}"></ha-icon>` : ''}${showTitleText ? `<span class="cpc-title-text">${escapeHtml(cfg.title)}${cfg.header_on_count ? `<span class="cpc-title-count" id="cpc-title-count"></span>` : ''}</span>` : (collapsible ? '<span class="cpc-title-text"></span>' : '')}${showChevron ? `<ha-icon class="cpc-chevron${expanded ? ' expanded' : ''}" icon="mdi:chevron-down"></ha-icon>` : ''}</div>`
       : '';
 
     this.innerHTML = `
@@ -4266,6 +4308,7 @@ class ColorLightManagerCard extends HTMLElement {
         /* Minimal bar when collapsible but no title/icon: reserve a small clickable height. */
         .cpc-header-minimal { min-height:calc(20px * ${scale}); margin-bottom:${collapsible && this._cardCollapsed ? '0' : `calc(14px * ${scale})`}; justify-content:flex-end; }
         .cpc-header .cpc-title-text { flex:1; }
+        .cpc-title-count { color:var(--secondary-text-color); font-weight:inherit; }
         .cpc-section-name { margin-bottom:calc(6px * ${scale}); }
         /* Collapsible section title row: clickable, chevron rotates with state. */
         .cpc-section-head { display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; }
@@ -4463,6 +4506,7 @@ class ColorLightManagerCard extends HTMLElement {
     `;
     this._wireEvents();
     if (cfg.show_favorites) this._renderFavoritesBar();
+    this._updateTitleOnCount();
     this._applyCardFrame();
     this._applySectionFrames();
     this._applyHeaderRulesLive();
@@ -5247,6 +5291,17 @@ class ColorLightManagerCard extends HTMLElement {
     });
   }
 
+  // Header "buttons on" count (header_on_count): how many Light buttons have any light on, shown after
+  // the title as "Title - N". Hidden at zero unless header_on_count_show_zero.
+  _updateTitleOnCount() {
+    const el = this.querySelector('#cpc-title-count');
+    if (!el) return;
+    const n = (this._config.presets || []).filter(p => p && !p.hidden && buttonMode(p) === 'light'
+      && lightButtonStatus(this._hass, this._presetColorIds(p)).on).length;
+    const txt = (n || this._config.header_on_count_show_zero) ? ` - ${n}` : '';
+    if (el.textContent !== txt) el.textContent = txt;
+  }
+
   _sectionHeading(section) {
     if (!section.name_show || !section.name) return '';
     const size = Number(section.name_font_size) || 13;
@@ -6023,6 +6078,7 @@ class ColorLightManagerCard extends HTMLElement {
   updateStates() {
     const cfg = this._config;
     this._refreshAreaButtons();
+    this._updateTitleOnCount();
     // Update each slider section from its OWN target's state.
     this._orderedSections().filter(s => s.type === 'sliders').forEach(section => {
       const st = this._sectionPrimaryState(section);
@@ -7591,7 +7647,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
   }
   _presetSwatch(preset) {
     if (buttonMode(preset) === 'light') {
-      if (preset.button_style_color) return preset.button_style_color;
+      const fixedC = effectiveButtonOpt(this._config, preset, 'button_style_color');
+      if (fixedC) return fixedC;
       const st = lightButtonStatus(this._hass, this._specTargetIds ? this._specTargetIds(presetTargetSpec(preset)) : (presetTargetSpec(preset).custom || []));
       return st.color || '#888';
     }
@@ -9405,15 +9462,15 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <button class="cpce-icon-btn cpce-preset-hide" title="${preset.hidden?'Show on card':'Hide from card'}"><ha-icon icon="${preset.hidden?'mdi:eye-off':'mdi:eye'}"></ha-icon></button>
           <button class="cpce-icon-btn cpce-preset-duplicate" title="Duplicate this button"><ha-icon icon="mdi:content-duplicate"></ha-icon></button>
           <button class="cpce-delete-entity-btn cpce-preset-remove" title="Delete this button"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>
-          <ha-icon class="chev" icon="mdi:chevron-down"></ha-icon>
+          <ha-icon class="chev cpce-edit-chev" icon="mdi:pencil" title="Edit"></ha-icon>
         </div>
         <div class="cpce-preset-body">
           <div class="cpce-subgroup"><ha-icon icon="mdi:link-variant"></ha-icon>Button</div>
           <div class="cpce-preset-header">
             <input type="text" class="cpce-preset-name" value="${escapeHtml(preset.name)}" placeholder="Name">
-            <input type="text" class="cpce-preset-icon" value="${escapeHtml(preset.icon && !GENERIC_DEFAULT_ICONS.has(preset.icon) ? preset.icon : '')}" placeholder="${escapeHtml(preset.hide_icon ? 'no icon' : modeDefaultIcon(mode))}" ${preset.hide_icon ? 'disabled' : ''}>
+            <input type="text" class="cpce-preset-icon" value="${escapeHtml(preset.icon && !GENERIC_DEFAULT_ICONS.has(preset.icon) ? preset.icon : '')}" placeholder="${escapeHtml(effectiveButtonOpt(this._config, preset, 'hide_icon') ? 'no icon' : modeDefaultIcon(mode))}" ${effectiveButtonOpt(this._config, preset, 'hide_icon') ? 'disabled' : ''}>
           </div>
-          <div class="cpce-check"><input type="checkbox" class="cpce-preset-noicon" ${preset.hide_icon ? 'checked' : ''}><label>No icon (text only)</label></div>
+          <div class="cpce-check"><input type="checkbox" class="cpce-preset-noicon" ${effectiveButtonOpt(this._config, preset, 'hide_icon') ? 'checked' : ''}><label>No icon (text only)</label></div>
           ${(() => {
             const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
             // A button may be UNASSIGNED (section_id === '__none__'): it's not shown on the card, but a
@@ -9442,11 +9499,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
           </div>
           ${isLight ? `<div class="cpce-subgroup"><ha-icon icon="mdi:gesture-tap"></ha-icon>Light Button</div>
           ${(() => { const opt = (v, cur, l) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${l}</option>`;
-            const tap = preset.light_tap || 'toggle', hold = preset.light_hold || 'popup';
+            const tap = effectiveButtonOpt(this._config, preset, 'light_tap'), hold = effectiveButtonOpt(this._config, preset, 'light_hold');
             const opts = (cur) => opt('toggle', cur, 'Turn on / off') + opt('popup', cur, 'Open dimming popup') + opt('none', cur, 'Nothing');
             return `<div class="cpce-row"><label class="lbl">Tap</label><select class="cpce-light-tap">${opts(tap)}</select></div>
             <div class="cpce-row"><label class="lbl">Long Press</label><select class="cpce-light-hold">${opts(hold)}</select></div>
-            <div class="cpce-check"><input type="checkbox" class="cpce-light-count" ${preset.light_show_count ? 'checked' : ''}><label>Show how many lights are on (e.g. 2/3 on) when it controls several</label></div>
+            <div class="cpce-check"><input type="checkbox" class="cpce-light-count" ${effectiveButtonOpt(this._config, preset, 'light_show_count') ? 'checked' : ''}><label>Show how many lights are on (e.g. 2/3 on) when it controls several</label></div>
             <div class="cpce-hint">Turning on sends no colour, so each light comes back in its own last colour and brightness. The button shows the lights' live colour, or their last known colour while they're off. The popup has a brightness slider and on/off for each light, plus an <strong>All</strong> row when the button controls more than one light (groups are listed light by light). A fixed Button Color below overrides the colour, e.g. for plain dimmers.</div>`; })()}` : ''}
           ${isTracker ? `<div class="cpce-subgroup"><ha-icon icon="mdi:view-grid-outline"></ha-icon>Scene Tracker</div>${this._renderTrackerFields(preset, index)}` : ''}
           ${isScene ? `<div class="cpce-subgroup"><ha-icon icon="mdi:palette"></ha-icon>Scene</div>${this._renderPresetScenePicker(preset, index)}` : ''}
@@ -9544,7 +9601,86 @@ class ColorLightManagerCardEditor extends HTMLElement {
   //     the body does.
   // Either off = that aspect follows the live/look color instead (body follows only when active;
   // glow follows the live color). Presence of the key = enabled (no separate boolean).
+  // Button Behavior Defaults panel. Locked by default (view only); Unlock for this editor session.
+  // Every change asks for confirmation. Each row shows the card default, the built-in default when
+  // different, how many buttons use their own value, and "Update Value on All Buttons".
+  _buttonDefaultLabel(d, v) {
+    if (d.kind === 'bool') return v ? 'On' : 'Off';
+    if (d.kind === 'color') return v ? v : 'None';
+    const o = (d.options || []).find(x => x[0] === v); return o ? o[1] : String(v);
+  }
+  _buttonDefaultOverrides(key) {
+    const d = buttonDefaultDef(key);
+    return (this._config.presets || []).filter(p => p && buttonDefaultApplies(d, p) && p[key] !== undefined);
+  }
+  _renderButtonDefaults() {
+    const locked = !this._bdUnlocked;
+    const dis = locked ? 'disabled' : '';
+    const totalOv = BUTTON_DEFAULT_KEYS.reduce((n, d) => n + this._buttonDefaultOverrides(d.key).length, 0);
+    const modeName = { light: 'Light', scene: 'Scene', off: 'Light Off' };
+    const row = (d) => {
+      const cur = cardButtonDefault(this._config, d.key);
+      const ov = this._buttonDefaultOverrides(d.key).length;
+      let ctl;
+      if (d.kind === 'select') ctl = `<select class="cpce-bd-ctl" data-key="${d.key}" ${dis}>${d.options.map(([v, l]) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+      else if (d.kind === 'bool') ctl = `<input type="checkbox" class="cpce-bd-ctl" data-key="${d.key}" ${cur ? 'checked' : ''} ${dis}>`;
+      else ctl = `<input type="checkbox" class="cpce-bd-coloron" data-key="${d.key}" ${cur ? 'checked' : ''} ${dis}>${cur ? `<input type="color" class="cpce-bd-ctl" data-key="${d.key}" value="${/^#[0-9a-f]{6}$/i.test(cur) ? cur : '#2196f3'}" ${dis}>` : ''}`;
+      const differs = (cur || false) !== (d.builtin || false);
+      return `<div class="cpce-bd-row" data-key="${d.key}">
+        <div class="cpce-row"><label class="lbl">${d.label}</label>${ctl}</div>
+        <div class="cpce-hint">${differs ? `Built-in default: <strong>${escapeHtml(this._buttonDefaultLabel(d, d.builtin))}</strong> · ` : ''}${ov ? `${ov} button${ov === 1 ? ' uses its' : 's use their'} own value` : 'All buttons follow this'}${d.modes ? ` · ${d.modes.map(m => modeName[m]).join(', ')} buttons` : ' · all buttons'}</div>
+        <button class="cpce-mini-btn cpce-bd-apply" data-key="${d.key}" ${locked || !ov ? 'disabled' : ''} title="Remove every button's own value so all use this default"><ha-icon icon="mdi:sync"></ha-icon> Update Value on All Buttons</button>
+      </div>`;
+    };
+    return `<div class="cpce-hint">Defaults for settings that many buttons share. A button uses its own value only where you changed it on that button; otherwise it follows these.${locked ? ' Locked: unlock to edit. Every change asks for confirmation.' : ' Every change asks for confirmation.'}</div>
+      <div class="cpce-row cpce-add-actions" style="gap:8px; margin-bottom:6px;">
+        <button class="cpce-create-preset-btn" id="cpce-bd-lock"><ha-icon icon="${locked ? 'mdi:lock-open-variant-outline' : 'mdi:lock-outline'}"></ha-icon> ${locked ? 'Unlock' : 'Lock'}</button>
+        <button class="cpce-mini-btn" id="cpce-bd-apply-all" ${locked || !totalOv ? 'disabled' : ''}><ha-icon icon="mdi:sync"></ha-icon> Update All Options on All Buttons</button>
+      </div>
+      <div class="cpce-bd-list${locked ? ' cpce-bd-locked' : ''}">${BUTTON_DEFAULT_KEYS.map(row).join('')}</div>`;
+  }
+  _wireButtonDefaults() {
+    const lockBtn = this.querySelector('#cpce-bd-lock');
+    if (lockBtn) lockBtn.onclick = () => { this._bdUnlocked = !this._bdUnlocked; this._render(); };
+    if (!this._bdUnlocked) return;
+    const setDefault = (key, val) => {
+      const d = buttonDefaultDef(key);
+      const from = this._buttonDefaultLabel(d, cardButtonDefault(this._config, key)), to = this._buttonDefaultLabel(d, val);
+      if (from === to) return this._render();
+      if (!window.confirm(`Change the default “${d.label}” from ${from} to ${to}?\n\nButtons that use their own value are not changed.`)) return this._render();
+      const bd = { ...(this._config.button_defaults || {}) };
+      if (val === d.builtin || (d.kind === 'color' && !val)) delete bd[key]; else bd[key] = val;
+      const next = { ...this._config }; if (Object.keys(bd).length) next.button_defaults = bd; else delete next.button_defaults;
+      this._config = next; this._fire(next); this._render();
+    };
+    this.querySelectorAll('.cpce-bd-ctl').forEach(el => el.addEventListener('change', () => {
+      const d = buttonDefaultDef(el.dataset.key);
+      setDefault(d.key, d.kind === 'bool' ? el.checked : el.value);
+    }));
+    this.querySelectorAll('.cpce-bd-coloron').forEach(el => el.addEventListener('change', () => setDefault(el.dataset.key, el.checked ? '#2196f3' : '')));
+    const clearKeys = (keys) => {
+      const presets = (this._config.presets || []).map(p => {
+        if (!p) return p; let np = p;
+        keys.forEach(k => { const d = buttonDefaultDef(k); if (buttonDefaultApplies(d, p) && np[k] !== undefined) { np = np === p ? { ...p } : np; delete np[k]; } });
+        return np;
+      });
+      this._updateConfig({ presets }); this._render();
+    };
+    this.querySelectorAll('.cpce-bd-apply').forEach(btn => btn.onclick = () => {
+      const d = buttonDefaultDef(btn.dataset.key); const n = this._buttonDefaultOverrides(d.key).length;
+      if (!n) return;
+      if (window.confirm(`Set “${d.label}” to the default (${this._buttonDefaultLabel(d, cardButtonDefault(this._config, d.key))}) on all buttons?\n\n${n} button${n === 1 ? '' : 's'} will lose ${n === 1 ? 'its' : 'their'} own value.`)) clearKeys([d.key]);
+    });
+    const all = this.querySelector('#cpce-bd-apply-all');
+    if (all) all.onclick = () => {
+      const n = BUTTON_DEFAULT_KEYS.reduce((c, d) => c + this._buttonDefaultOverrides(d.key).length, 0);
+      if (n && window.confirm(`Apply ALL Button Behavior Defaults to all buttons?\n\n${n} button setting${n === 1 ? '' : 's'} will be reset to the defaults.`)) clearKeys(BUTTON_DEFAULT_KEYS.map(d => d.key));
+    };
+  }
+
   _renderButtonStyling(preset, index) {
+    // Effective values: the button's own, else the card's Button Behavior Default.
+    preset = { ...preset, button_style_color: effectiveButtonOpt(this._config, preset, 'button_style_color'), button_glow_style_color: effectiveButtonOpt(this._config, preset, 'button_glow_style_color') };
     const bodyOn = !!preset.button_style_color;
     const glowOn = !!preset.button_glow_style_color;
     return `
@@ -10484,18 +10620,19 @@ class ColorLightManagerCardEditor extends HTMLElement {
       };
 
       // Light button settings. Byte-stable: defaults (tap toggle, hold popup, no count) store no key.
-      [['.cpce-light-tap', 'light_tap', 'toggle'], ['.cpce-light-hold', 'light_hold', 'popup']].forEach(([sel, key, def]) => {
+      // A value equal to the card's Button Behavior Default stores no key (the button follows it).
+      [['.cpce-light-tap', 'light_tap'], ['.cpce-light-hold', 'light_hold']].forEach(([sel, key]) => {
         const el = container.querySelector(sel); if (!el) return;
         el.addEventListener('change', () => {
           const presets = [...(this._config.presets || [])]; const p = { ...presets[index] };
-          if (el.value && el.value !== def) p[key] = el.value; else delete p[key];
+          if (el.value !== cardButtonDefault(this._config, key)) p[key] = el.value; else delete p[key];
           presets[index] = p; this._updateConfig({ presets }); this._render();
         });
       });
       const lightCountEl = container.querySelector('.cpce-light-count');
       if (lightCountEl) lightCountEl.addEventListener('change', () => {
         const presets = [...(this._config.presets || [])]; const p = { ...presets[index] };
-        if (lightCountEl.checked) p.light_show_count = true; else delete p.light_show_count;
+        if (lightCountEl.checked !== !!cardButtonDefault(this._config, 'light_show_count')) p.light_show_count = lightCountEl.checked; else delete p.light_show_count;
         presets[index] = p; this._updateConfig({ presets }); this._render();
       });
 
@@ -10504,7 +10641,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
       if (noIconEl) noIconEl.addEventListener('change', () => {
         const presets = [...(this._config.presets || [])];
         const p = { ...presets[index] };
-        if (noIconEl.checked) p.hide_icon = true; else delete p.hide_icon;
+        if (noIconEl.checked !== !!cardButtonDefault(this._config, 'hide_icon')) p.hide_icon = noIconEl.checked; else delete p.hide_icon;
         presets[index] = p;
         this._updateConfig({ presets });
         this._render();
@@ -10756,10 +10893,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
       if (styleEnable) styleEnable.addEventListener('change', () => {
         const presets = [...(this._config.presets || [])];
         const p = { ...presets[index] };
+        const def = cardButtonDefault(this._config, 'button_style_color');
         if (styleEnable.checked) {
-          // Seed with the current look-derived color so the picker starts sensibly.
-          p.button_style_color = p.button_style_color || ColorUtils.rgbToHex(...presetColorToRgb(this._effectivePreset(p)));
-        } else delete p.button_style_color;
+          if (def) delete p.button_style_color;
+          else p.button_style_color = p.button_style_color || ColorUtils.rgbToHex(...presetColorToRgb(this._effectivePreset(p)));
+        } else if (def) p.button_style_color = ''; else delete p.button_style_color;
         presets[index] = p;
         this._updateConfig({ presets });
         this._render();
@@ -10775,9 +10913,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
       if (glowEnable) glowEnable.addEventListener('change', () => {
         const presets = [...(this._config.presets || [])];
         const p = { ...presets[index] };
+        const def = cardButtonDefault(this._config, 'button_glow_style_color');
         if (glowEnable.checked) {
-          p.button_glow_style_color = p.button_glow_style_color || p.button_style_color || ColorUtils.rgbToHex(...presetColorToRgb(this._effectivePreset(p)));
-        } else delete p.button_glow_style_color;
+          if (def) delete p.button_glow_style_color;
+          else p.button_glow_style_color = p.button_glow_style_color || p.button_style_color || ColorUtils.rgbToHex(...presetColorToRgb(this._effectivePreset(p)));
+        } else if (def) p.button_glow_style_color = ''; else delete p.button_glow_style_color;
         presets[index] = p;
         this._updateConfig({ presets });
         this._render();
@@ -11470,6 +11610,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-preset-summary { display:flex; align-items:center; gap:var(--ltek-sp-3); padding:10px 12px; cursor:pointer; user-select:none; }
         .cpce-preset-summary .chev { margin-left:auto; transition:transform 0.2s ease; color:var(--secondary-text-color); }
         .cpce-preset-editor.collapsed .cpce-preset-summary .chev { transform:rotate(-90deg); }
+        /* Item rows open for editing: a pencil (no rotation), accent-coloured while open. */
+        .cpce-preset-summary .chev.cpce-edit-chev, .cpce-preset-editor.collapsed .cpce-preset-summary .chev.cpce-edit-chev { transform:none; --mdc-icon-size:18px; }
+        .cpce-preset-editor:not(.collapsed) > .cpce-preset-summary .chev.cpce-edit-chev { color:var(--primary-color); }
         .cpce-preset-editor.collapsed .cpce-preset-body { display:none; }
         .cpce-preset-swatch { width:20px; height:20px; border-radius:50%; border:1px solid var(--divider-color,#333); flex-shrink:0; }
         .cpce-preset-summary-name { color:var(--primary-text-color); font-size:var(--ltek-fs-label); font-weight:var(--ltek-fw-medium); flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -11706,6 +11849,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
         .cpce-esm-field select { font-size:var(--ltek-fs-body); }
         .cpce-ce-name { display:flex; flex-direction:column; flex:1; min-width:0; }
         .cpce-fav-row { gap:var(--ltek-sp-2); }
+        .cpce-bd-row { padding:6px 0 8px; border-top:1px solid var(--divider-color,#333); }
+        .cpce-bd-row:first-child { border-top:none; }
+        .cpce-bd-row .cpce-hint { margin:2px 0 6px; }
+        .cpce-bd-locked .cpce-row { opacity:0.75; }
         .cpce-fav-row .cpce-fav-name { flex:1; min-width:80px; }
         .cpce-fav-row input[type="text"], .cpce-fav-row input[type="number"] { padding:var(--ltek-ctrl-pad); background:var(--secondary-background-color,#2a2a2a); border:1px solid var(--divider-color,#333); border-radius:var(--ltek-r-ctrl); color:var(--primary-text-color); font-size:var(--ltek-fs-label); box-sizing:border-box; }
         .cpce-fav-row .cpce-fav-color { width:32px; height:28px; padding:0; border:none; background:none; flex-shrink:0; cursor:pointer; }
@@ -11779,6 +11926,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
           ${this._subpanel('card-header', 'Header', `
           <div class="cpce-sub-title">Title Text</div>
           <div class="cpce-check"><input type="checkbox" id="cpce-show-title" ${cfg.show_title!==false?'checked':''}><label for="cpce-show-title">Show card title</label></div>
+          <div class="cpce-check"><input type="checkbox" class="cpce-area-opt" data-key="header_on_count" ${cfg.header_on_count?'checked':''}><label>Show how many Light buttons are on (e.g. “Lights - 3”)</label></div>
+          ${cfg.header_on_count ? `<div class="cpce-check" style="margin-left:22px;"><input type="checkbox" class="cpce-area-opt" data-key="header_on_count_show_zero" ${cfg.header_on_count_show_zero?'checked':''}><label>Also show 0 (otherwise hidden when none are on)</label></div>` : ''}
           <div class="cpce-row"><label class="lbl">Card Title</label><input type="text" id="cpce-title" value="${escapeHtml(cfg.title||'')}"></div>
           ${cfg.show_title!==false ? this._textStyleControls('cpce-title', { size: cfg.title_font_size, weight: cfg.title_font_weight, color: cfg.title_color }, 18) : ''}
 
@@ -12070,6 +12219,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
           </div>
         `, 'Select and Order the card sections. Click the section icon to edit the section settings.')}
 
+        ${this._section('mdi:lock-outline', 'Button Behavior Defaults', 'button-defaults', this._renderButtonDefaults())}
+
         ${this._section('mdi:lightbulb-multiple-outline', 'Buttons', 'presets', `
           <div class="cpce-hint">Configure the quick-select buttons. Use the color wheel for precise color selection.</div>
           <div class="cpce-hint">Buttons are grouped by the button section they appear in. Use the arrows to reorder a button within its section — this changes the order on the card.</div>
@@ -12128,7 +12279,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
                 <span class="cpce-preset-summary-name">${escapeHtml(s.name || 'Sliders')}</span>
                 <span class="cpce-order-type">${chips}</span>
                 <button class="cpce-icon-btn cpce-ss-remove" title="Remove section" ${arr.length <= 1 ? 'disabled' : ''}><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>
-                <ha-icon class="chev" icon="mdi:chevron-down"></ha-icon>
+                <ha-icon class="chev cpce-edit-chev" icon="mdi:pencil" title="Edit"></ha-icon>
               </div>
               <div class="cpce-preset-body">
                 <div class="cpce-row"><label class="lbl">Name</label><input type="text" class="cpce-ss-name" value="${escapeHtml(s.name || 'Sliders')}" placeholder="Section name"></div>
@@ -14490,6 +14641,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const addBtnEntity = this.querySelector('#cpce-add-preset-entity');
     if (addBtnEntity) addBtnEntity.onclick = () => this._addNewPreset(true);
     this._wireLocalFavorites();
+    this._wireButtonDefaults();
   }
 
   // Local Favorites panel list: EVERY favorite saved in this browser (from the card's Save Current /
