@@ -8,6 +8,35 @@ resets. Newest first.
 
 ---
 
+## v2026.11.24.290
+
+- **New: On Now.** A Buttons section can now be set to **Content → On Now**, or added with the new
+  **On Now** button in Section Layout.
+  - It collects every Light button that has a light on, from all the other Buttons sections,
+    including ones shown as area buttons or popovers. The list updates live as lights turn on and off.
+  - Each button is labelled with its room first, e.g. "Kitchen · Ceiling" (*Put the room name first*,
+    on by default).
+  - **Tap** and **Long Press** are set on the section: by default tap opens the dimming popup and long
+    press turns the light off. Choices: open dimming popup, turn off, turn on / off, nothing.
+  - An **All Off** button turns off every light listed (on by default).
+  - When nothing is on it shows *All lights are off* (your own text), or the section can be hidden.
+- **Area buttons: filter, sort and size.** Card Appearance → Area Buttons:
+  - **Areas with lights on first**: rooms with a light on move to the front of the grid.
+  - **Show an On / All switch** above the grid, with how many rooms are on; **Start With** picks
+    the initial view (All by default).
+  - **Button Height** and **Font Size** for the area buttons only, so the room grid can be compact
+    while the buttons inside each room keep their size.
+  - The grid re-sorts and re-filters live.
+- **Area popup: All On / All Off.** The room popup's title bar now has All On and All Off buttons for
+  that room's lights. On by default; untick *All On / All Off buttons in the area popup* to remove
+  them.
+- **New Light button action: Turn off** (for Tap or Long Press), alongside Turn on / off, Open
+  dimming popup and Nothing. Also available in Button Behavior Defaults.
+- New keys only (`source: on_now` and `on_now_*` per section; `area_sort_on_first`,
+  `area_filter_toggle`, `area_filter`, `area_button_height`, `area_font_size`,
+  `area_popup_actions` on the card). The only change to existing cards is the All On / All Off pair
+  in area popups.
+
 ## v2026.11.10.289
 
 - **Fixed: Fixed glow color did nothing on Light buttons.** The glow always followed the light's

@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.11.10.289
+// Version: v2026.11.24.290
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.11.10.289';
+const BUILD_NUMBER = 'v2026.11.24.290';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -802,9 +802,9 @@ function presetTargetSpec(preset) {
 // For the fixed colours, a button value of '' means "explicitly none" (overrides a card default).
 const BUTTON_DEFAULT_KEYS = [
   { key: 'light_tap', label: 'Tap', kind: 'select', builtin: 'toggle', modes: ['light'],
-    options: [['toggle', 'Turn on / off'], ['popup', 'Open dimming popup'], ['none', 'Nothing']] },
+    options: [['toggle', 'Turn on / off'], ['off', 'Turn off'], ['popup', 'Open dimming popup'], ['none', 'Nothing']] },
   { key: 'light_hold', label: 'Long Press', kind: 'select', builtin: 'popup', modes: ['light'],
-    options: [['toggle', 'Turn on / off'], ['popup', 'Open dimming popup'], ['none', 'Nothing']] },
+    options: [['toggle', 'Turn on / off'], ['off', 'Turn off'], ['popup', 'Open dimming popup'], ['none', 'Nothing']] },
   { key: 'light_show_count', label: 'Show number of lights on', kind: 'bool', builtin: false, modes: ['light'] },
   { key: 'button_style_color', label: 'Fixed button color', kind: 'color', builtin: '', modes: ['light', 'scene', 'off'] },
   { key: 'button_glow_style_color', label: 'Fixed glow color', kind: 'color', builtin: '', modes: ['light', 'scene', 'off'] },
@@ -3663,7 +3663,7 @@ class ColorLightManagerCard extends HTMLElement {
   // section_id resolves to the FIRST buttons section; unassigned buttons have no section).
   _sectionForPreset(preset) {
     if (!preset || preset.section_id === '__none__') return null;
-    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons' && s.source !== 'on_now');
     if (!buttonsSections.length) return null;
     return buttonsSections.find(s => s.id === preset.section_id) || buttonsSections[0];
   }
@@ -4320,6 +4320,12 @@ class ColorLightManagerCard extends HTMLElement {
         .cpc-pop-x { background:none; border:none; color:inherit; cursor:pointer; font-size:22px; line-height:1; padding:2px 8px; }
         .cpc-pop-box .cpc-section { margin-bottom:0; }
         .cpc-area-grid .cpc-preset-btn { min-width:0; }
+        .cpc-area-filter { display:flex; justify-content:flex-end; gap:4px; margin:0 0 8px; }
+        .cpc-area-fbtn { padding:3px 12px; border-radius:999px; border:1px solid var(--divider-color,#444); background:transparent; color:var(--secondary-text-color); cursor:pointer; font-size:calc(12px * ${scale}); }
+        .cpc-area-fbtn.active { background:var(--primary-color); border-color:var(--primary-color); color:#fff; }
+        .cpc-area-empty, .cpc-onnow-empty { text-align:center; color:var(--secondary-text-color); font-size:calc(13px * ${scale}); padding:6px 0; }
+        .cpc-pop-acts { display:flex; gap:6px; margin-left:auto; margin-right:6px; }
+        .cpc-pop-act { padding:4px 10px; border-radius:8px; border:1px solid var(--divider-color,#444); background:transparent; color:inherit; cursor:pointer; font-size:calc(12px * ${scale}); }
         .cpc-area-grid.cpc-area-cols .cpc-preset-btn { width:100%; max-width:none; }
         .cpc-section-head .cpc-section-head-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .cpc-section-head ha-icon.cpc-section-chevron { color:var(--secondary-text-color); flex-shrink:0; transition:transform 0.25s ease; }
@@ -4920,7 +4926,14 @@ class ColorLightManagerCard extends HTMLElement {
     this.querySelectorAll('[data-pop-open]').forEach(el => { el.onclick = () => this._openPopover(el.dataset.popOpen); });
     this.querySelectorAll('[data-pop-close]').forEach(el => { el.onclick = () => this._closePopover(); });
     this.querySelectorAll('.cpc-pop-host').forEach(host => { host.onclick = (e) => { if (e.target === host) this._closePopover(); }; });
-    this.querySelectorAll('.cpc-area-btn').forEach(btn => this._wireAreaButton(btn));
+    this._wireAreaGrid();
+    this._wireOnNow();
+    this.querySelectorAll('[data-pop-act]').forEach(b => {
+      b.onclick = () => {
+        const sec = this._orderedSections().find(x => x.id === b.dataset.popSid); if (!sec) return;
+        const ids = this._areaLightIds(sec); if (ids.length) this._callLightService(b.dataset.popAct === 'on' ? 'turn_on' : 'turn_off', {}, ids);
+      };
+    });
     if (this._openPop && !this.querySelector(`.cpc-pop-host[data-pop-host="${this._openPop}"]`)) this._closePopover();
     this.querySelectorAll('.cpc-section-head[data-section-head]').forEach(head => {
       head.onclick = () => {
@@ -4939,6 +4952,7 @@ class ColorLightManagerCard extends HTMLElement {
     this.querySelectorAll('.cpc-preset-btn').forEach(btn => {
       if (btn.classList.contains('cpc-tracker-tile')) return;   // Scene Tracker tiles are read-only
       if (btn.classList.contains('cpc-area-btn')) return;       // area buttons open their popover (above)
+      if (btn.classList.contains('cpc-onnow-alloff')) return;   // On Now's All Off (wired in _wireOnNow)
       if (btn.classList.contains('cpc-light-btn')) { this._wireLightButton(btn); return; }
       btn.onclick = () => {
         const preset = (this._config.presets || []).find(p => p.id === btn.dataset.presetId);
@@ -5201,7 +5215,8 @@ class ColorLightManagerCard extends HTMLElement {
   _renderSectionsBody(state) {
     const secs = this._orderedSections();
     let html = ''; let run = [];
-    const flush = () => { if (run.length) { html += this._renderAreaGrid(run); run = []; } };
+    this._areaRuns = [];
+    const flush = () => { if (run.length) { html += this._renderAreaGrid(run, this._areaRuns.push(run.map(x => x.id)) - 1); run = []; } };
     secs.forEach(sec => {
       const d = this._sectionDisplay(sec);
       if (d === 'area_button') { if (!sec.hidden) run.push(sec); return; }
@@ -5222,8 +5237,94 @@ class ColorLightManagerCard extends HTMLElement {
   _renderPopHost(section, state) {
     const inner = this._renderSection({ ...section, collapsible: false, name_show: false, display: '' }, { state });
     return `<div class="cpc-pop-host${this._openPop === section.id ? ' open' : ''}" data-pop-host="${section.id}"><div class="cpc-pop-box" role="dialog" aria-label="${escapeHtml(section.name || 'Buttons')}">
-      <div class="cpc-pop-head"><span>${escapeHtml(section.name || 'Buttons')}</span><button class="cpc-pop-x" data-pop-close="${section.id}" title="Close">×</button></div>${inner}</div></div>`;
+      <div class="cpc-pop-head"><span>${escapeHtml(section.name || 'Buttons')}</span>${this._popActions(section)}<button class="cpc-pop-x" data-pop-close="${section.id}" title="Close">×</button></div>${inner}</div></div>`;
   }
+  // ---- On Now (a Buttons section with source 'on_now') ----
+  // Collects every Light button with a light on, from all other Buttons sections (incl. area and
+  // popover ones), in section order. Each is drawn with its room name first ("Kitchen · Ceiling",
+  // on_now_prefix, default on) and this section's own actions: on_now_tap (default 'popup') and
+  // on_now_hold (default 'off'). Optional All Off button (on_now_all_off, default on) and empty text
+  // (on_now_empty_text) or hide-when-empty (on_now_hide_empty). Membership is re-checked on every
+  // hass update (_refreshOnNow); each button's look is patched by the normal Light-button path.
+  _onNowItems(section) {
+    const out = [];
+    this._orderedSections().forEach(sec => {
+      if (!sec || sec.type !== 'buttons' || sec.source === 'on_now' || sec.hidden) return;
+      this._presetsForSection(sec.id).forEach(p => {
+        if (!p || p.hidden || buttonMode(p) !== 'light') return;
+        if (lightButtonStatus(this._hass, this._presetColorIds(p)).on) out.push({ p, sec });
+      });
+    });
+    return out;
+  }
+  _onNowOpts(section, preset, owner) {
+    const sec = owner || this._sectionForPreset(preset);
+    const prefix = section.on_now_prefix !== false && sec && sec.name;
+    return { name: prefix ? `${sec.name} · ${preset.name || ''}` : (preset.name || ''),
+      tap: section.on_now_tap || 'popup', hold: section.on_now_hold || 'off' };
+  }
+  _renderOnNowBody(section, layoutClass, stack) {
+    const items = this._onNowItems(section);
+    const sig = items.map(x => x.p.id).join(',');
+    let inner;
+    if (!items.length) {
+      inner = `<div class="cpc-onnow-empty">${escapeHtml(section.on_now_empty_text || 'All lights are off')}</div>`;
+    } else {
+      const btns = items.map(({ p, sec }) => this._renderLightButton(p, this._buttonStyleForPreset(stack, section, p), this._onNowOpts(section, p, sec))).join('');
+      const allOff = section.on_now_all_off !== false
+        ? renderPresetButtonHtml({ action: 'turn_off' }, { id: `__alloff__${section.id}`, name: 'All Off', icon: 'mdi:lightbulb-group-off-outline', mode: 'off', action: 'turn_off' }, this._sectionButtonStyle(section), null, this._config.temperature_output_format)
+            .replace('<button class="cpc-preset-btn', `<button data-onnow-alloff="${section.id}" class="cpc-preset-btn cpc-onnow-alloff`)
+        : '';
+      inner = `<div class="cpc-presets ${layoutClass}">${btns}${allOff}</div>`;
+    }
+    return `<div class="cpc-onnow-body" data-onnow-body="${section.id}" data-onnow-sig="${escapeHtml(sig)}">${inner}</div>`;
+  }
+  _wireOnNow(root) {
+    (root || this).querySelectorAll('[data-onnow-alloff]').forEach(btn => {
+      btn.onclick = () => {
+        const sec = this._orderedSections().find(x => x.id === btn.dataset.onnowAlloff); if (!sec) return;
+        const ids = new Set(); this._onNowItems(sec).forEach(({ p }) => this._presetColorIds(p).forEach(id => ids.add(id)));
+        if (ids.size) this._callLightService('turn_off', {}, [...ids]);
+      };
+    });
+  }
+  // Rebuild an On Now body when WHICH buttons are on changed (not on every look change).
+  _refreshOnNow() {
+    this._orderedSections().filter(s => s && s.type === 'buttons' && s.source === 'on_now').forEach(sec => {
+      const body = this.querySelector(`.cpc-onnow-body[data-onnow-body="${sec.id}"]`); if (!body) return;
+      const items = this._onNowItems(sec);
+      const secEl = body.closest('.cpc-onnow-section');
+      if (secEl) secEl.style.display = (sec.on_now_hide_empty && !this._editMode && !items.length) ? 'none' : '';
+      if (body.dataset.onnowSig === items.map(x => x.p.id).join(',')) return;
+      const tmp = document.createElement('template');
+      tmp.innerHTML = this._renderOnNowBody(sec, this._sectionLayoutClass(sec, this._sectionButtonStyle(sec)), this._sectionButtonStack(sec)).trim();
+      const fresh = tmp.content.firstElementChild; if (!fresh) return;
+      fresh.querySelectorAll('.cpc-light-btn').forEach(b => this._wireLightButton(b));
+      this._wireOnNow(fresh);
+      body.replaceWith(fresh);
+    });
+  }
+  // Area grid order / filter: rooms with lights on first (area_sort_on_first), and the On / All
+  // filter (area_filter = initial 'all' | 'on'; area_filter_toggle shows the switch).
+  _areaFilterMode() { return this._areaFilterState || (this._config.area_filter === 'on' ? 'on' : 'all'); }
+  _areaVisible(sections) {
+    const withOn = sections.map((sec, i) => ({ sec, i, on: lightButtonStatus(this._hass, this._areaLightIds(sec)).on }));
+    let list = withOn;
+    if (this._areaFilterMode() === 'on') list = list.filter(x => x.on);
+    if (this._config.area_sort_on_first) list = [...list].sort((a, b) => (b.on - a.on) || (a.i - b.i));
+    return { list: list.map(x => x.sec), onCount: withOn.filter(x => x.on).length };
+  }
+  _wireAreaGrid(root) {
+    (root || this).querySelectorAll('.cpc-area-btn').forEach(btn => this._wireAreaButton(btn));
+    (root || this).querySelectorAll('[data-area-filter]').forEach(b => {
+      b.onclick = () => { this._areaFilterState = b.dataset.areaFilter; this._refreshAreaButtons(true); };
+    });
+  }
+  _popActions(section) {
+    if (this._config.area_popup_actions === false) return '';
+    return `<span class="cpc-pop-acts"><button class="cpc-pop-act" data-pop-act="off" data-pop-sid="${section.id}" title="Turn off every light in ${escapeHtml(section.name || 'this area')}">All Off</button><button class="cpc-pop-act" data-pop-act="on" data-pop-sid="${section.id}" title="Turn on every light in ${escapeHtml(section.name || 'this area')}">All On</button></span>`;
+  }
+
   // The lights an area controls: its Light buttons' targets (or, if it has none, every button's).
   _areaLightIds(section) {
     const ps = this._presetsForSection(section.id).filter(p => !p.hidden);
@@ -5253,7 +5354,7 @@ class ColorLightManagerCard extends HTMLElement {
   }
   // The area-button grid. Style: card-level area_style_preset (a Button Style), else Basic Theme.
   // Layout: area_columns (0 = wrapping row) and area_gap.
-  _renderAreaGrid(sections) {
+  _renderAreaGrid(sections, idx) {
     const cfg = this._config;
     const gs = { id: '__areas__', type: 'buttons', style_preset: cfg.area_style_preset };
     const bstyle = this._sectionButtonStyle(gs);
@@ -5262,7 +5363,19 @@ class ColorLightManagerCard extends HTMLElement {
     const gap = Number.isFinite(Number(cfg.area_gap)) && cfg.area_gap !== undefined ? clamp(Number(cfg.area_gap), 0, 64) : 8;
     const layout = cols ? `display:grid;grid-template-columns:repeat(${cols},minmax(0,1fr));` : 'display:flex;flex-direction:row;flex-wrap:wrap;justify-content:center;';
     this._areaGridStyle = bstyle;
-    return `${css}<div class="cpc-section cpc-area-grid-section" data-section-id="__areas__"><div class="cpc-area-grid${cols ? ' cpc-area-cols' : ''}" style="${layout}gap:${gap}px;">${sections.map(sec => this._renderAreaButton(sec, bstyle)).join('')}</div></div>`;
+    const { list, onCount } = this._areaVisible(sections);
+    const mode = this._areaFilterMode();
+    const order = `${mode}|${list.map(x => x.id).join(',')}`;
+    const scale = Number(cfg.scale) || 1.0;
+    const sel = '.cpc-section[data-section-id="__areas__"] .cpc-area-grid .cpc-preset-btn.cpc-area-btn';
+    const h = Number(cfg.area_button_height) || 0, fs = Number(cfg.area_font_size) || 0;
+    const sizeCss = (h || fs) ? `<style>${h ? `${sel} { padding-top:calc(${h}px * ${scale} / 3.15); padding-bottom:calc(${h}px * ${scale} / 3.15); min-height:0; }` : ''}${fs ? `${sel} { font-size:calc(${fs}px * ${scale}); } ${sel} .cpc-btn-sublabel { font-size:calc(${Math.max(8, fs - 3)}px * ${scale}); }` : ''}</style>` : '';
+    const toggle = cfg.area_filter_toggle
+      ? `<div class="cpc-area-filter"><button class="cpc-area-fbtn${mode === 'on' ? ' active' : ''}" data-area-filter="on">On${onCount ? ` (${onCount})` : ''}</button><button class="cpc-area-fbtn${mode === 'all' ? ' active' : ''}" data-area-filter="all">All</button></div>` : '';
+    const grid = list.length
+      ? `<div class="cpc-area-grid${cols ? ' cpc-area-cols' : ''}" style="${layout}gap:${gap}px;">${list.map(sec => this._renderAreaButton(sec, bstyle)).join('')}</div>`
+      : `<div class="cpc-area-empty">${escapeHtml(cfg.area_empty_text || 'No lights are on')}</div>`;
+    return `${css}${sizeCss}<div class="cpc-section cpc-area-grid-section" data-section-id="__areas__" data-area-grid="${idx}" data-area-order="${escapeHtml(order)}">${toggle}${grid}</div>`;
   }
   _openPopover(sid) {
     this._openPop = sid;
@@ -5279,10 +5392,21 @@ class ColorLightManagerCard extends HTMLElement {
   }
   _wireAreaButton(btn) { btn.onclick = () => this._openPopover(btn.dataset.areaSection); }
   // Keep area buttons live (updateStates): re-render one only when its look changed.
-  _refreshAreaButtons() {
+  _refreshAreaButtons(force) {
+    const byId = new Map(this._orderedSections().map(x => [x.id, x]));
+    // Re-render a whole grid when its order / filter / membership changed; otherwise patch buttons.
+    this.querySelectorAll('.cpc-area-grid-section[data-area-grid]').forEach(gridEl => {
+      const run = ((this._areaRuns || [])[Number(gridEl.dataset.areaGrid)] || []).map(id => byId.get(id)).filter(Boolean);
+      if (!run.length) return;
+      const { list } = this._areaVisible(run);
+      const order = `${this._areaFilterMode()}|${list.map(x => x.id).join(',')}`;
+      if (!force && gridEl.dataset.areaOrder === order) return;
+      const tmp = document.createElement('template'); tmp.innerHTML = this._renderAreaGrid(run, Number(gridEl.dataset.areaGrid)).trim();
+      const fresh = tmp.content.querySelector('.cpc-area-grid-section'); if (!fresh) return;
+      this._wireAreaGrid(fresh); gridEl.replaceWith(fresh);
+    });
     const btns = this.querySelectorAll('.cpc-area-btn');
     if (!btns.length) return;
-    const byId = new Map(this._orderedSections().map(x => [x.id, x]));
     btns.forEach(btn => {
       const sec = byId.get(btn.dataset.areaSection); if (!sec) return;
       const tmp = document.createElement('template'); tmp.innerHTML = this._renderAreaButton(sec, this._areaGridStyle).trim();
@@ -5561,6 +5685,11 @@ class ColorLightManagerCard extends HTMLElement {
       // -none- / unavailable). Edit/preview safe: it still shows while the dashboard is being edited.
       const visiblePresets = this._presetsForSection(section.id).filter(p => !p.hidden
         && !(p.tracker_hide_none && !this._editMode && buttonMode(p) === 'tracker' && !this._resolveAreaStatus(this._trackerArea(p)).isActive));
+      if (section.source === 'on_now') {
+        const body = this._wrapSectionBody(section, this._renderOnNowBody(section, layoutClass, stack));
+        const hide = section.on_now_hide_empty && !this._editMode && !this._onNowItems(section).length;
+        return `${overrideCss}<div class="cpc-section cpc-onnow-section" data-section-id="${section.id}"${hide ? ' style="display:none"' : ''}>${heading}${body}</div>`;
+      }
       const btnHtml = (p) => buttonMode(p) === 'tracker'
         ? this._renderTrackerButton(p, section, stack)
         : (buttonMode(p) === 'light'
@@ -5869,7 +5998,8 @@ class ColorLightManagerCard extends HTMLElement {
   // last known colour as its look, and "active" = any target light on (so Button Active / Inactive
   // layers style on vs off). Class cpc-light-btn opts it out of the normal press handler; it gets
   // tap / hold handling from _wireLightButton instead.
-  _renderLightButton(preset, bstyle) {
+  // `opts` (On Now sections): { name, tap, hold } override the button's name and actions here only.
+  _renderLightButton(preset, bstyle, opts) {
     const st = lightButtonStatus(this._hass, this._presetColorIds(preset));
     // Fixed colours may be a hex OR a theme / CSS colour (four-mode control); both apply. The glow
     // has its own fixed colour (button_glow_style_color), independent of the body.
@@ -5879,10 +6009,11 @@ class ColorLightManagerCard extends HTMLElement {
     const look = (hex && /^#[0-9a-f]{6}$/i.test(hex)) ? { rgb_color: ColorUtils.hexToRgb(hex) } : { look_none: true };
     // Count line: "N/M on" for several lights; for a single light, "On" / "Off".
     const sub = preset.light_show_count ? (st.total > 1 ? `${st.onCount}/${st.total} on` : (st.on ? 'On' : 'Off')) : '';
-    const tile = { ...preset, mode: 'light', ...(sub ? { _sublabel: sub } : {}) };
+    const tile = { ...preset, mode: 'light', ...(opts && opts.name ? { name: opts.name } : {}), ...(sub ? { _sublabel: sub } : {}) };
     const appearance = (fixed || fixedGlow) ? { bodyColor: hex || null, glowColor: fixedGlow || hex || null } : undefined;
     const html = renderPresetButtonHtml(look, tile, bstyle || this._config, st.onState, this._config && this._config.temperature_output_format, null, st.on, appearance);
-    return html.replace('<button class="cpc-preset-btn', `<button data-light-sig="${st.on ? 1 : 0}|${escapeHtml(hex || '')}|${escapeHtml(fixedGlow || '')}|${sub}" class="cpc-preset-btn cpc-light-btn`);
+    const actAttrs = opts ? ` data-light-tap="${opts.tap}" data-light-hold="${opts.hold}"` : '';
+    return html.replace('<button class="cpc-preset-btn', `<button data-light-sig="${st.on ? 1 : 0}|${escapeHtml(hex || '')}|${escapeHtml(fixedGlow || '')}|${sub}|${escapeHtml(tile.name || '')}"${actAttrs} class="cpc-preset-btn cpc-light-btn`);
   }
   // Tap / long-press (500 ms) for a Light button. Each runs the button's chosen action:
   //   light_tap  (default 'toggle') / light_hold (default 'popup') ∈ toggle | popup | none.
@@ -5891,8 +6022,9 @@ class ColorLightManagerCard extends HTMLElement {
     const preset = () => (this._config.presets || []).find(p => p.id === btn.dataset.presetId);
     const run = (which) => {
       const p = preset(); if (!p) return;
-      const act = which === 'hold' ? (p.light_hold || 'popup') : (p.light_tap || 'toggle');
+      const act = which === 'hold' ? (btn.dataset.lightHold || p.light_hold || 'popup') : (btn.dataset.lightTap || p.light_tap || 'toggle');
       if (act === 'toggle') this._toggleLightButton(p);
+      else if (act === 'off') this._callLightService('turn_off', {}, this._presetColorIds(p));
       else if (act === 'popup') this._openLightPopup(p);
     };
     const start = () => { held = false; clearTimeout(timer); timer = setTimeout(() => { held = true; run('hold'); }, 500); };
@@ -6054,7 +6186,7 @@ class ColorLightManagerCard extends HTMLElement {
   // section_id (or a stale one) fall back to the FIRST buttons section so none are orphaned.
   _presetsForSection(sectionId) {
     const presets = this._config.presets || [];
-    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons' && s.source !== 'on_now');
     const firstButtonsId = buttonsSections.length ? buttonsSections[0].id : null;
     const validIds = new Set(buttonsSections.map(s => s.id));
     return presets.filter(p => {
@@ -6085,6 +6217,7 @@ class ColorLightManagerCard extends HTMLElement {
   updateStates() {
     const cfg = this._config;
     this._refreshAreaButtons();
+    this._refreshOnNow();
     this._updateTitleOnCount();
     // Update each slider section from its OWN target's state.
     this._orderedSections().filter(s => s.type === 'sliders').forEach(section => {
@@ -6164,7 +6297,8 @@ class ColorLightManagerCard extends HTMLElement {
           const sectionEl0 = btn.closest('.cpc-section');
           const sid0 = sectionEl0 && sectionEl0.dataset.sectionId;
           const stack0 = sid0 ? stackBySection.get(sid0) : null;
-          const html = this._renderLightButton(preset, stack0 ? this._buttonStyleForPreset(stack0, sectionById.get(sid0), preset) : cfg);
+          const sec0 = sid0 ? sectionById.get(sid0) : null;
+          const html = this._renderLightButton(preset, stack0 ? this._buttonStyleForPreset(stack0, sec0, preset) : cfg, sec0 && sec0.source === 'on_now' ? this._onNowOpts(sec0, preset) : undefined);
           const m = html.match(/data-light-sig="([^"]*)"/);
           if (m && btn.dataset.lightSig === m[1]) return;
           const tmp = document.createElement('template'); tmp.innerHTML = html.trim();
@@ -6349,7 +6483,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // _renderPresetSelects to decide whether the default-scene opt-out applies).
   _sectionForPreset(preset) {
     if (!preset || preset.section_id === '__none__') return null;
-    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons' && s.source !== 'on_now');
     if (!buttonsSections.length) return null;
     return buttonsSections.find(s => s.id === preset.section_id) || buttonsSections[0];
   }
@@ -6363,7 +6497,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
   // The preset buttons that belong to a section id, applying the SAME fallback the card uses (a
   // missing/stale section_id resolves to the first buttons section). Returns [] for non-buttons.
   _presetsBelongingTo(sectionId) {
-    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+    const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons' && s.source !== 'on_now');
     const src = buttonsSections.find(s => s.id === sectionId);
     if (!src) return [];   // non-buttons section (or unknown) → no bundled buttons
     const firstButtonsId = buttonsSections.length ? buttonsSections[0].id : null;
@@ -6551,7 +6685,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     // the card uses), so resolve that here to pick the right ones to clone.
     let presets = this._config.presets || [];
     if (src.type === 'buttons') {
-      const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+      const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons' && s.source !== 'on_now');
       const firstButtonsId = buttonsSections.length ? buttonsSections[0].id : null;
       const validIds = new Set(buttonsSections.map(s => s.id));
       const mine = presets.filter(p => (validIds.has(p.section_id) ? p.section_id : firstButtonsId) === src.id);
@@ -9479,7 +9613,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           </div>
           <div class="cpce-check"><input type="checkbox" class="cpce-preset-noicon" ${effectiveButtonOpt(this._config, preset, 'hide_icon') ? 'checked' : ''}><label>No icon (text only)</label></div>
           ${(() => {
-            const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+            const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons' && s.source !== 'on_now');
             // A button may be UNASSIGNED (section_id === '__none__'): it's not shown on the card, but a
             // Scene button can still define the color/icon a Scene Tracker tile borrows for its option.
             // A missing/blank section_id defaults to the first buttons section (legacy behavior).
@@ -9507,7 +9641,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
           ${isLight ? `<div class="cpce-subgroup"><ha-icon icon="mdi:gesture-tap"></ha-icon>Light Button</div>
           ${(() => { const opt = (v, cur, l) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${l}</option>`;
             const tap = effectiveButtonOpt(this._config, preset, 'light_tap'), hold = effectiveButtonOpt(this._config, preset, 'light_hold');
-            const opts = (cur) => opt('toggle', cur, 'Turn on / off') + opt('popup', cur, 'Open dimming popup') + opt('none', cur, 'Nothing');
+            const opts = (cur) => opt('toggle', cur, 'Turn on / off') + opt('off', cur, 'Turn off') + opt('popup', cur, 'Open dimming popup') + opt('none', cur, 'Nothing');
             return `<div class="cpce-row"><label class="lbl">Tap</label><select class="cpce-light-tap">${opts(tap)}</select></div>
             <div class="cpce-row"><label class="lbl">Long Press</label><select class="cpce-light-hold">${opts(hold)}</select></div>
             <div class="cpce-check"><input type="checkbox" class="cpce-light-count" ${effectiveButtonOpt(this._config, preset, 'light_show_count') ? 'checked' : ''}><label>Show how many lights are on (2/3 on), or On / Off for a single light</label></div>
@@ -11930,6 +12064,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
             <div class="cpce-row"><label class="lbl">Button Style</label><select class="cpce-area-style">${ents.map(e => `<option value="lib:${escapeHtml(e.slug)}" ${cur === e.slug ? 'selected' : ''}>${escapeHtml(e.name)}</option>`).join('')}</select></div>
             <div class="cpce-row"><label class="lbl">Columns</label><input type="number" class="cpce-area-num" data-key="area_columns" min="0" max="12" value="${Number(cfg.area_columns) || 0}"><span class="cpce-hint" style="margin:0 0 0 6px;">0 = wrap</span></div>
             <div class="cpce-row"><label class="lbl">Gap (px)</label><input type="number" class="cpce-area-num" data-key="area_gap" min="0" max="64" value="${cfg.area_gap !== undefined ? Number(cfg.area_gap) : 8}"></div>
+            <div class="cpce-row"><label class="lbl">Button Height</label><input type="number" class="cpce-area-num" data-key="area_button_height" min="0" max="120" value="${Number(cfg.area_button_height) || 0}"><span class="cpce-hint" style="margin:0 0 0 6px;">0 = style's</span></div>
+            <div class="cpce-row"><label class="lbl">Font Size</label><input type="number" class="cpce-area-num" data-key="area_font_size" min="0" max="40" value="${Number(cfg.area_font_size) || 0}"><span class="cpce-hint" style="margin:0 0 0 6px;">0 = style's</span></div>
+            ${ck('area_sort_on_first', 'Areas with lights on first')}
+            ${ck('area_filter_toggle', 'Show an On / All switch above the areas')}
+            <div class="cpce-row"><label class="lbl">Start With</label><select class="cpce-area-filter-def"><option value="" ${cfg.area_filter !== 'on' ? 'selected' : ''}>All areas</option><option value="on" ${cfg.area_filter === 'on' ? 'selected' : ''}>Only areas with lights on</option></select></div>
+            <div class="cpce-check"><input type="checkbox" class="cpce-area-popacts" ${cfg.area_popup_actions !== false ? 'checked' : ''}><label>All On / All Off buttons in the area popup</label></div>
             ${ck('area_show_count', 'Show how many lights are on (e.g. 2/5 on)')}
             ${ck('area_show_color', "Color the button with the lights' color while any is on")}
             ${ck('area_show_state_label', 'Show an On / Off label')}
@@ -12022,6 +12162,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
         ${this._section('mdi:view-grid-outline', 'Section Layout &amp; Config', 'layout', `
           <div class="cpce-row cpce-add-actions" style="gap:8px; margin-bottom:6px; flex-wrap:nowrap;">
             <button class="cpce-create-preset-btn" id="cpce-add-buttons-section" title="Add a Buttons section"><ha-icon icon="mdi:plus"></ha-icon> Buttons</button>
+            <button class="cpce-create-preset-btn" id="cpce-add-onnow-section" title="Add an On Now section: every Light button that is on"><ha-icon icon="mdi:plus"></ha-icon> On Now</button>
             <button class="cpce-create-preset-btn" id="cpce-add-values-section" title="Add a Color Values section"><ha-icon icon="mdi:plus"></ha-icon> Color Values</button>
             <button class="cpce-create-preset-btn" id="cpce-add-divider-section" title="Add a Divider"><ha-icon icon="mdi:plus"></ha-icon> Divider</button>
             <button class="cpce-mini-btn" id="cpce-import-section" title="Import a section (with its buttons) from JSON"><ha-icon icon="mdi:import"></ha-icon> Import</button>
@@ -12115,7 +12256,22 @@ class ColorLightManagerCardEditor extends HTMLElement {
                         ? [['start','Left'],['center','Center'],['end','Right']]
                         : [['start','Top'],['center','Middle'],['end','Bottom']];
                       const curAlign = ['start','center','end'].includes(s.off_button_align) ? s.off_button_align : 'center';
-                      return `<div class="cpce-sub-title">Display</div>
+                      const isOnNow = s.source === 'on_now';
+                      const aopt = (v, cur, l) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${l}</option>`;
+                      const aopts = (cur) => aopt('popup', cur, 'Open dimming popup') + aopt('off', cur, 'Turn off') + aopt('toggle', cur, 'Turn on / off') + aopt('none', cur, 'Nothing');
+                      const content = `<div class="cpce-sub-title">Content</div>
+                    <div class="cpce-row"><select class="cpce-bs-source" data-id="${s.id}">
+                      <option value="" ${!isOnNow ? 'selected' : ''}>Its own buttons</option>
+                      <option value="on_now" ${isOnNow ? 'selected' : ''}>On Now: every Light button that is on, from all sections</option>
+                    </select></div>
+                    ${isOnNow ? `<div class="cpce-hint">Shows the Light buttons that have a light on, from every other Buttons section (including area and popover ones), and updates live. Buttons are not assigned to this section.</div>
+                    <div class="cpce-row"><label class="lbl">Tap</label><select class="cpce-onnow-act" data-key="on_now_tap" data-def="popup" data-id="${s.id}">${aopts(s.on_now_tap || 'popup')}</select></div>
+                    <div class="cpce-row"><label class="lbl">Long Press</label><select class="cpce-onnow-act" data-key="on_now_hold" data-def="off" data-id="${s.id}">${aopts(s.on_now_hold || 'off')}</select></div>
+                    <div class="cpce-check"><input type="checkbox" class="cpce-onnow-flag" data-key="on_now_prefix" data-def="true" data-id="${s.id}" ${s.on_now_prefix !== false ? 'checked' : ''}><label>Put the room name first (Kitchen · Ceiling)</label></div>
+                    <div class="cpce-check"><input type="checkbox" class="cpce-onnow-flag" data-key="on_now_all_off" data-def="true" data-id="${s.id}" ${s.on_now_all_off !== false ? 'checked' : ''}><label>Show an All Off button</label></div>
+                    <div class="cpce-check"><input type="checkbox" class="cpce-onnow-flag" data-key="on_now_hide_empty" data-def="false" data-id="${s.id}" ${s.on_now_hide_empty ? 'checked' : ''}><label>Hide this section when no lights are on</label></div>
+                    ${s.on_now_hide_empty ? '' : `<div class="cpce-row"><label class="lbl">Empty Text</label><input type="text" class="cpce-onnow-empty" data-id="${s.id}" value="${escapeHtml(s.on_now_empty_text || '')}" placeholder="All lights are off"></div>`}` : ''}`;
+                      return `${content}<div class="cpce-sub-title">Display</div>
                     <div class="cpce-row">
                       <select class="cpce-bs-display" data-id="${s.id}">
                         <option value="" ${!s.display ? 'selected' : ''}>On the card (inline / collapsible)</option>
@@ -12258,7 +12414,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
               prev: k > 0 ? list[k - 1].i : null,
               next: k < list.length - 1 ? list[k + 1].i : null,
             })).join('');
-            const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons');
+            const buttonsSections = this._orderedSectionsRaw().filter(s => s.type === 'buttons' && s.source !== 'on_now');
             const firstId = buttonsSections.length ? buttonsSections[0].id : null;
             const validIds = new Set(buttonsSections.map(s => s.id));
             const groupOf = (p) => p.section_id === '__none__' ? '__none__' : (validIds.has(p.section_id) ? p.section_id : firstId);
@@ -12907,6 +13063,13 @@ class ColorLightManagerCardEditor extends HTMLElement {
       }
       // Off-button placement + alignment. Byte-stable: '' clears placement (inline default). Switching
       // row↔column re-renders so the alignment labels relabel; align stored as start|center|end.
+      // Content (own buttons / On Now) and the On Now options. Byte-stable: defaults store no key.
+      const bsSource = panel.querySelector('.cpce-bs-source');
+      if (bsSource) bsSource.addEventListener('change', () => { patchSection(id, { source: bsSource.value || undefined }); this._render(); });
+      panel.querySelectorAll('.cpce-onnow-act').forEach(el => el.addEventListener('change', () => { patchSection(id, { [el.dataset.key]: el.value !== el.dataset.def ? el.value : undefined }); this._render(); }));
+      panel.querySelectorAll('.cpce-onnow-flag').forEach(el => el.addEventListener('change', () => { const def = el.dataset.def === 'true'; patchSection(id, { [el.dataset.key]: el.checked !== def ? el.checked : undefined }); this._render(); }));
+      const onNowEmpty = panel.querySelector('.cpce-onnow-empty');
+      if (onNowEmpty) onNowEmpty.addEventListener('change', () => { patchSection(id, { on_now_empty_text: onNowEmpty.value.trim() || undefined }); this._render(); });
       const bsDisplay = panel.querySelector('.cpce-bs-display');
       if (bsDisplay) bsDisplay.addEventListener('change', () => { patchSection(id, { display: bsDisplay.value || undefined }); this._render(); });
       const bsAreaIcon = panel.querySelector('.cpce-bs-areaicon');
@@ -13199,6 +13362,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
       sections.push({ id: newSectionId('buttons'), type: 'buttons', name: 'Buttons' });
       this._updateSections(sections); this._render();
     };
+    const addOnNowSection = this.querySelector('#cpce-add-onnow-section');
+    if (addOnNowSection) addOnNowSection.onclick = () => {
+      const sections = this._orderedSectionsRaw();
+      sections.unshift({ id: newSectionId('onnow'), type: 'buttons', name: 'On Now', name_show: true, source: 'on_now' });
+      this._updateSections(sections); this._render();
+    };
     const addValuesSection = this.querySelector('#cpce-add-values-section');
     if (addValuesSection) addValuesSection.onclick = () => {
       const sections = this._orderedSectionsRaw();
@@ -13238,6 +13407,10 @@ class ColorLightManagerCardEditor extends HTMLElement {
       const n = Number(el.value); const def = el.dataset.key === 'area_gap' ? 8 : 0;
       areaSet(el.dataset.key, Number.isFinite(n) && n !== def ? n : undefined);
     }));
+    const areaFilterDef = this.querySelector('.cpce-area-filter-def');
+    if (areaFilterDef) areaFilterDef.addEventListener('change', () => areaSet('area_filter', areaFilterDef.value || undefined));
+    const areaPopActs = this.querySelector('.cpce-area-popacts');
+    if (areaPopActs) areaPopActs.addEventListener('change', () => areaSet('area_popup_actions', areaPopActs.checked ? undefined : false));
     const areaStyle = this.querySelector('.cpce-area-style');
     if (areaStyle) areaStyle.addEventListener('change', () => areaSet('area_style_preset', areaStyle.value === `lib:${BTN_STYLE_BASIC_SLUG}` ? undefined : areaStyle.value));
     const collapsibleEl = this.querySelector('#cpce-card-collapsible');
