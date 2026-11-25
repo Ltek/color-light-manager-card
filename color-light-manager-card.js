@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.11.24.290
+// Version: v2026.11.25.291
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.11.24.290';
+const BUILD_NUMBER = 'v2026.11.25.291';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -4286,7 +4286,7 @@ class ColorLightManagerCard extends HTMLElement {
     ].filter(Boolean).join(' ');
     // Render a header if there's title content, OR if collapsible needs a bar to click.
     const headerHtml = (showTitleText || showTitleIcon || collapsible)
-      ? `<div class="${headerClasses}" id="cpc-header">${showTitleIcon ? `<ha-icon class="cpc-title-icon" id="cpc-title-icon" icon="${escapeHtml(normalizeIcon(cfg.icon))}"></ha-icon>` : ''}${showTitleText ? `<span class="cpc-title-text">${escapeHtml(cfg.title)}${cfg.header_on_count ? `<span class="cpc-title-count" id="cpc-title-count"></span>` : ''}</span>` : (collapsible ? '<span class="cpc-title-text"></span>' : '')}${showChevron ? `<ha-icon class="cpc-chevron${expanded ? ' expanded' : ''}" icon="mdi:chevron-down"></ha-icon>` : ''}</div>`
+      ? `<div class="${headerClasses}" id="cpc-header">${showTitleIcon ? `<ha-icon class="cpc-title-icon" id="cpc-title-icon" icon="${escapeHtml(normalizeIcon(cfg.icon))}"></ha-icon>` : ''}${showTitleText ? `<span class="cpc-title-text">${escapeHtml(cfg.title)}${cfg.header_on_count ? `<span class="cpc-title-count" id="cpc-title-count"></span>` : ''}${cfg.header_all_off && cfg.header_all_off_position !== 'right' ? this._hdrAllOffHtml() : ''}</span>` : (collapsible ? '<span class="cpc-title-text"></span>' : '')}${cfg.header_all_off && (cfg.header_all_off_position === 'right' || !showTitleText) ? this._hdrAllOffHtml() : ''}${showChevron ? `<ha-icon class="cpc-chevron${expanded ? ' expanded' : ''}" icon="mdi:chevron-down"></ha-icon>` : ''}</div>`
       : '';
 
     this.innerHTML = `
@@ -4327,6 +4327,15 @@ class ColorLightManagerCard extends HTMLElement {
         .cpc-pop-acts { display:flex; gap:6px; margin-left:auto; margin-right:6px; }
         .cpc-pop-act { padding:4px 10px; border-radius:8px; border:1px solid var(--divider-color,#444); background:transparent; color:inherit; cursor:pointer; font-size:calc(12px * ${scale}); }
         .cpc-area-grid.cpc-area-cols .cpc-preset-btn { width:100%; max-width:none; }
+        /* Equal-size cells (area grid, On Now): every button fills its cell exactly, whatever the
+           Button Style's max width / flex sizing says; names wrap between words, at most 2 lines. */
+        .cpc-eqgrid > .cpc-preset-btn { width:100% !important; max-width:none !important; min-width:0 !important; height:100% !important; margin:0 !important; flex:none !important; box-sizing:border-box; }
+        .cpc-eqgrid > .cpc-preset-btn .cpc-btn-label { white-space:normal !important; overflow-wrap:normal !important; word-break:normal !important; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; text-align:center; }
+        .cpc-eqgrid > .cpc-preset-btn .cpc-btn-labelwrap { align-items:center; text-align:center; min-width:0; }
+        .cpc-eqgrid > .cpc-preset-btn .cpc-btn-sublabel { text-align:center; }
+        .cpc-hdr-alloff { display:inline-flex; align-items:center; gap:4px; margin:0 10px; padding:3px 10px; vertical-align:middle; border-radius:999px; border:1px solid var(--divider-color,#444); background:transparent; color:var(--primary-text-color); cursor:pointer; font-size:calc(12px * ${scale}); font-weight:400; }
+        .cpc-hdr-alloff ha-icon { --mdc-icon-size:calc(16px * ${scale}); }
+        .cpc-hdr-alloff:hover { border-color:var(--primary-color); }
         .cpc-section-head .cpc-section-head-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .cpc-section-head ha-icon.cpc-section-chevron { color:var(--secondary-text-color); flex-shrink:0; transition:transform 0.25s ease; }
         .cpc-section-head ha-icon.cpc-section-chevron.expanded { transform:rotate(180deg); }
@@ -5275,7 +5284,10 @@ class ColorLightManagerCard extends HTMLElement {
         ? renderPresetButtonHtml({ action: 'turn_off' }, { id: `__alloff__${section.id}`, name: 'All Off', icon: 'mdi:lightbulb-group-off-outline', mode: 'off', action: 'turn_off' }, this._sectionButtonStyle(section), null, this._config.temperature_output_format)
             .replace('<button class="cpc-preset-btn', `<button data-onnow-alloff="${section.id}" class="cpc-preset-btn cpc-onnow-alloff`)
         : '';
-      inner = `<div class="cpc-presets ${layoutClass}">${btns}${allOff}</div>`;
+      // Equal-size cells, as many columns of at least on_now_min_width (default 170px) as fit.
+      const minW = clamp(Number(section.on_now_min_width) || 170, 60, 600);
+      const gap = Number.isFinite(Number(section.button_gap)) && section.button_gap !== undefined ? clamp(Number(section.button_gap), 0, 64) : 10;
+      inner = `<div class="cpc-presets cpc-onnow-grid cpc-eqgrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(${minW}px,1fr));grid-auto-rows:1fr;gap:${gap}px;">${btns}${allOff}</div>`;
     }
     return `<div class="cpc-onnow-body" data-onnow-body="${section.id}" data-onnow-sig="${escapeHtml(sig)}">${inner}</div>`;
   }
@@ -5361,7 +5373,9 @@ class ColorLightManagerCard extends HTMLElement {
     const css = this._sectionButtonStyleCss(gs, bstyle);
     const cols = clamp(Number(cfg.area_columns) || 0, 0, 12);
     const gap = Number.isFinite(Number(cfg.area_gap)) && cfg.area_gap !== undefined ? clamp(Number(cfg.area_gap), 0, 64) : 8;
-    const layout = cols ? `display:grid;grid-template-columns:repeat(${cols},minmax(0,1fr));` : 'display:flex;flex-direction:row;flex-wrap:wrap;justify-content:center;';
+    // Equal-size cells: fixed columns, or (0) as many columns of at least area_min_width as fit.
+    const minW = clamp(Number(cfg.area_min_width) || 150, 60, 600);
+    const layout = `display:grid;grid-template-columns:${cols ? `repeat(${cols},minmax(0,1fr))` : `repeat(auto-fill,minmax(${minW}px,1fr))`};grid-auto-rows:1fr;`;
     this._areaGridStyle = bstyle;
     const { list, onCount } = this._areaVisible(sections);
     const mode = this._areaFilterMode();
@@ -5373,7 +5387,7 @@ class ColorLightManagerCard extends HTMLElement {
     const toggle = cfg.area_filter_toggle
       ? `<div class="cpc-area-filter"><button class="cpc-area-fbtn${mode === 'on' ? ' active' : ''}" data-area-filter="on">On${onCount ? ` (${onCount})` : ''}</button><button class="cpc-area-fbtn${mode === 'all' ? ' active' : ''}" data-area-filter="all">All</button></div>` : '';
     const grid = list.length
-      ? `<div class="cpc-area-grid${cols ? ' cpc-area-cols' : ''}" style="${layout}gap:${gap}px;">${list.map(sec => this._renderAreaButton(sec, bstyle)).join('')}</div>`
+      ? `<div class="cpc-area-grid cpc-area-cols cpc-eqgrid" style="${layout}gap:${gap}px;">${list.map(sec => this._renderAreaButton(sec, bstyle)).join('')}</div>`
       : `<div class="cpc-area-empty">${escapeHtml(cfg.area_empty_text || 'No lights are on')}</div>`;
     return `${css}${sizeCss}<div class="cpc-section cpc-area-grid-section" data-section-id="__areas__" data-area-grid="${idx}" data-area-order="${escapeHtml(order)}">${toggle}${grid}</div>`;
   }
@@ -5418,11 +5432,29 @@ class ColorLightManagerCard extends HTMLElement {
 
   // Header "buttons on" count (header_on_count): how many Light buttons have any light on, shown after
   // the title as "Title - N". Hidden at zero unless header_on_count_show_zero.
+  // Header All Off: turns off the lights of every Light button that is on. Hidden while none are on
+  // (always shown while editing the dashboard).
+  _hdrAllOffHtml() { return `<button class="cpc-hdr-alloff" id="cpc-hdr-alloff" title="Turn off every light that is on"><ha-icon icon="mdi:lightbulb-group-off-outline"></ha-icon>All Off</button>`; }
+  _litLightPresets() {
+    return (this._config.presets || []).filter(p => p && !p.hidden && buttonMode(p) === 'light' && lightButtonStatus(this._hass, this._presetColorIds(p)).on);
+  }
   _updateTitleOnCount() {
+    const ao = this.querySelector('#cpc-hdr-alloff');
+    if (ao) {
+      const show = this._editMode || this._litLightPresets().length > 0;
+      if (ao.style.display !== (show ? '' : 'none')) ao.style.display = show ? '' : 'none';
+      if (!ao._wired) {
+        ao._wired = true;
+        ao.addEventListener('click', (e) => {
+          e.stopPropagation();   // don't collapse / expand the card
+          const ids = new Set(); this._litLightPresets().forEach(p => this._presetColorIds(p).forEach(id => ids.add(id)));
+          if (ids.size) this._callLightService('turn_off', {}, [...ids]);
+        });
+      }
+    }
     const el = this.querySelector('#cpc-title-count');
     if (!el) return;
-    const n = (this._config.presets || []).filter(p => p && !p.hidden && buttonMode(p) === 'light'
-      && lightButtonStatus(this._hass, this._presetColorIds(p)).on).length;
+    const n = this._litLightPresets().length;
     const txt = (n || this._config.header_on_count_show_zero) ? ` - ${n}` : '';
     if (el.textContent !== txt) el.textContent = txt;
   }
@@ -12062,7 +12094,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
             const tx = (key, label, ph) => `<div class="cpce-row"><label class="lbl">${label}</label><input type="text" class="cpce-area-txt" data-key="${key}" value="${escapeHtml(cfg[key] || '')}" placeholder="${ph}"></div>`;
             return `<div class="cpce-hint">For Buttons sections set to <strong>Display: Area button</strong>. Each area shows as one button; tapping it opens that area's buttons in a popup.</div>
             <div class="cpce-row"><label class="lbl">Button Style</label><select class="cpce-area-style">${ents.map(e => `<option value="lib:${escapeHtml(e.slug)}" ${cur === e.slug ? 'selected' : ''}>${escapeHtml(e.name)}</option>`).join('')}</select></div>
-            <div class="cpce-row"><label class="lbl">Columns</label><input type="number" class="cpce-area-num" data-key="area_columns" min="0" max="12" value="${Number(cfg.area_columns) || 0}"><span class="cpce-hint" style="margin:0 0 0 6px;">0 = wrap</span></div>
+            <div class="cpce-row"><label class="lbl">Columns</label><input type="number" class="cpce-area-num" data-key="area_columns" min="0" max="12" value="${Number(cfg.area_columns) || 0}"><span class="cpce-hint" style="margin:0 0 0 6px;">0 = as many as fit</span></div>
+            ${!(Number(cfg.area_columns) > 0) ? `<div class="cpce-row"><label class="lbl">Min Width (px)</label><input type="number" class="cpce-area-num" data-key="area_min_width" min="60" max="600" value="${Number(cfg.area_min_width) || 150}"></div>` : ''}
             <div class="cpce-row"><label class="lbl">Gap (px)</label><input type="number" class="cpce-area-num" data-key="area_gap" min="0" max="64" value="${cfg.area_gap !== undefined ? Number(cfg.area_gap) : 8}"></div>
             <div class="cpce-row"><label class="lbl">Button Height</label><input type="number" class="cpce-area-num" data-key="area_button_height" min="0" max="120" value="${Number(cfg.area_button_height) || 0}"><span class="cpce-hint" style="margin:0 0 0 6px;">0 = style's</span></div>
             <div class="cpce-row"><label class="lbl">Font Size</label><input type="number" class="cpce-area-num" data-key="area_font_size" min="0" max="40" value="${Number(cfg.area_font_size) || 0}"><span class="cpce-hint" style="margin:0 0 0 6px;">0 = style's</span></div>
@@ -12082,6 +12115,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-sub-title">Title Text</div>
           <div class="cpce-check"><input type="checkbox" id="cpce-show-title" ${cfg.show_title!==false?'checked':''}><label for="cpce-show-title">Show card title</label></div>
           <div class="cpce-check"><input type="checkbox" class="cpce-area-opt" data-key="header_on_count" ${cfg.header_on_count?'checked':''}><label>Show how many Light buttons are on (e.g. “Lights - 3”)</label></div>
+          <div class="cpce-check"><input type="checkbox" class="cpce-area-opt" data-key="header_all_off" ${cfg.header_all_off?'checked':''}><label>Show an All Off button in the header (turns off every light that's on)</label></div>
+          ${cfg.header_all_off ? `<div class="cpce-row" style="margin-left:22px;"><label class="lbl">Position</label><select class="cpce-hdr-alloff-pos"><option value="" ${cfg.header_all_off_position !== 'right' ? 'selected' : ''}>Left, after the title</option><option value="right" ${cfg.header_all_off_position === 'right' ? 'selected' : ''}>Right end of the header</option></select></div>` : ''}
           ${cfg.header_on_count ? `<div class="cpce-check" style="margin-left:22px;"><input type="checkbox" class="cpce-area-opt" data-key="header_on_count_show_zero" ${cfg.header_on_count_show_zero?'checked':''}><label>Also show 0 (otherwise hidden when none are on)</label></div>` : ''}
           <div class="cpce-row"><label class="lbl">Card Title</label><input type="text" id="cpce-title" value="${escapeHtml(cfg.title||'')}"></div>
           ${cfg.show_title!==false ? this._textStyleControls('cpce-title', { size: cfg.title_font_size, weight: cfg.title_font_weight, color: cfg.title_color }, 18) : ''}
@@ -12268,7 +12303,9 @@ class ColorLightManagerCardEditor extends HTMLElement {
                     <div class="cpce-row"><label class="lbl">Tap</label><select class="cpce-onnow-act" data-key="on_now_tap" data-def="popup" data-id="${s.id}">${aopts(s.on_now_tap || 'popup')}</select></div>
                     <div class="cpce-row"><label class="lbl">Long Press</label><select class="cpce-onnow-act" data-key="on_now_hold" data-def="off" data-id="${s.id}">${aopts(s.on_now_hold || 'off')}</select></div>
                     <div class="cpce-check"><input type="checkbox" class="cpce-onnow-flag" data-key="on_now_prefix" data-def="true" data-id="${s.id}" ${s.on_now_prefix !== false ? 'checked' : ''}><label>Put the room name first (Kitchen · Ceiling)</label></div>
-                    <div class="cpce-check"><input type="checkbox" class="cpce-onnow-flag" data-key="on_now_all_off" data-def="true" data-id="${s.id}" ${s.on_now_all_off !== false ? 'checked' : ''}><label>Show an All Off button</label></div>
+                    <div class="cpce-row"><label class="lbl">Min Width (px)</label><input type="number" class="cpce-onnow-minw" data-id="${s.id}" min="60" max="600" value="${Number(s.on_now_min_width) || 170}"></div>
+                    <div class="cpce-hint">Buttons are equal-size cells: as many columns of at least this width as fit.</div>
+                    <div class="cpce-check"><input type="checkbox" class="cpce-onnow-flag" data-key="on_now_all_off" data-def="true" data-id="${s.id}" ${s.on_now_all_off !== false ? 'checked' : ''}><label>Show an All Off button in this section (or use the header's, in Card Appearance → Header)</label></div>
                     <div class="cpce-check"><input type="checkbox" class="cpce-onnow-flag" data-key="on_now_hide_empty" data-def="false" data-id="${s.id}" ${s.on_now_hide_empty ? 'checked' : ''}><label>Hide this section when no lights are on</label></div>
                     ${s.on_now_hide_empty ? '' : `<div class="cpce-row"><label class="lbl">Empty Text</label><input type="text" class="cpce-onnow-empty" data-id="${s.id}" value="${escapeHtml(s.on_now_empty_text || '')}" placeholder="All lights are off"></div>`}` : ''}`;
                       return `${content}<div class="cpce-sub-title">Display</div>
@@ -13068,6 +13105,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
       if (bsSource) bsSource.addEventListener('change', () => { patchSection(id, { source: bsSource.value || undefined }); this._render(); });
       panel.querySelectorAll('.cpce-onnow-act').forEach(el => el.addEventListener('change', () => { patchSection(id, { [el.dataset.key]: el.value !== el.dataset.def ? el.value : undefined }); this._render(); }));
       panel.querySelectorAll('.cpce-onnow-flag').forEach(el => el.addEventListener('change', () => { const def = el.dataset.def === 'true'; patchSection(id, { [el.dataset.key]: el.checked !== def ? el.checked : undefined }); this._render(); }));
+      const onNowMinW = panel.querySelector('.cpce-onnow-minw');
+      if (onNowMinW) onNowMinW.addEventListener('change', () => { const n = Number(onNowMinW.value); patchSection(id, { on_now_min_width: Number.isFinite(n) && n !== 170 ? clamp(n, 60, 600) : undefined }); this._render(); });
       const onNowEmpty = panel.querySelector('.cpce-onnow-empty');
       if (onNowEmpty) onNowEmpty.addEventListener('change', () => { patchSection(id, { on_now_empty_text: onNowEmpty.value.trim() || undefined }); this._render(); });
       const bsDisplay = panel.querySelector('.cpce-bs-display');
@@ -13404,9 +13443,11 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this.querySelectorAll('.cpce-area-opt').forEach(el => el.addEventListener('change', () => areaSet(el.dataset.key, el.checked || undefined)));
     this.querySelectorAll('.cpce-area-txt').forEach(el => el.addEventListener('change', () => areaSet(el.dataset.key, el.value.trim() ? (/icon/.test(el.dataset.key) ? normalizeIcon(el.value.trim()) : el.value.trim()) : undefined)));
     this.querySelectorAll('.cpce-area-num').forEach(el => el.addEventListener('change', () => {
-      const n = Number(el.value); const def = el.dataset.key === 'area_gap' ? 8 : 0;
+      const n = Number(el.value); const def = el.dataset.key === 'area_gap' ? 8 : (el.dataset.key === 'area_min_width' ? 150 : 0);
       areaSet(el.dataset.key, Number.isFinite(n) && n !== def ? n : undefined);
     }));
+    const hdrAllOffPos = this.querySelector('.cpce-hdr-alloff-pos');
+    if (hdrAllOffPos) hdrAllOffPos.addEventListener('change', () => areaSet('header_all_off_position', hdrAllOffPos.value || undefined));
     const areaFilterDef = this.querySelector('.cpce-area-filter-def');
     if (areaFilterDef) areaFilterDef.addEventListener('change', () => areaSet('area_filter', areaFilterDef.value || undefined));
     const areaPopActs = this.querySelector('.cpce-area-popacts');

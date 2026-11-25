@@ -8,6 +8,24 @@ resets. Newest first.
 
 ---
 
+## v2026.11.25.291
+
+- **Area grid and On Now: equal-size buttons that fill the width.** In a wide view (e.g. a single
+  panel), area buttons used to sit narrow inside wide columns and On Now buttons were squeezed so
+  names broke mid-word. Both now use equal cells: every button is the same width and height and
+  fills its cell, whatever the Button Style's max width says.
+  - Area grid **Columns 0** (the default) now means *as many columns as fit*, each at least
+    **Min Width** (new, default 150px); a fixed column count still works.
+  - On Now gets its own **Min Width** (default 170px) and uses the section's Gap (default 10px).
+  - Names wrap between words, at most two lines; the count line is centred under the name.
+- **New: All Off in the card header.** Card Appearance → Header → *Show an All Off button in the
+  header* turns off every light whose Light button is on. **Position**: left, after the title
+  (default), or the right end of the header. It hides while nothing is on (still shown while
+  editing), and clicking it doesn't collapse the card. On Now's own All Off can be switched off.
+- New keys: `area_min_width`, `on_now_min_width`, `header_all_off`, `header_all_off_position`.
+  Area grids with Columns 0 change from a centred wrapping row to the equal-cell grid; other cards
+  are unchanged.
+
 ## v2026.11.24.290
 
 - **New: On Now.** A Buttons section can now be set to **Content → On Now**, or added with the new
