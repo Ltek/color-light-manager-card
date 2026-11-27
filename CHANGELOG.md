@@ -8,6 +8,16 @@ resets. Newest first.
 
 ---
 
+## v2026.11.27.293
+
+- **Fixed: a collapsed card was taller than Home Assistant's own cards.** It kept the full 16px
+  padding above and below the title, so with a 34px icon it was 68px tall, against 56px for a
+  tile or button card. A collapsed card is now a **56px** bar with the title centred, matching HA's
+  standard card row. It only grows if the title or icon needs more room (e.g. a 48px icon gives
+  58px). Expanding works as before.
+- **Collapsed Height** (Card Appearance, under *Make card collapsible*) sets that height; 0 keeps the
+  previous look. Stored as `card_collapsed_height` only when it isn't 56.
+
 ## v2026.11.27.292
 
 - **Uses your theme's card look by default.** With no Frame Style on the card, or every one switched

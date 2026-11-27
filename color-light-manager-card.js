@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.11.27.292
+// Version: v2026.11.27.293
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.11.27.292';
+const BUILD_NUMBER = 'v2026.11.27.293';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -4341,6 +4341,11 @@ class ColorLightManagerCard extends HTMLElement {
           padding: calc(16px * ${scale});
           box-sizing: border-box;
         }
+        /* Collapsed: a bar the height of HA's standard card row (card_collapsed_height, default 56px,
+           border included, like a tile card), header centred. It only grows if the header is taller.
+           0 = the old look (full padding). */
+        ${(() => { const ch = cfg.card_collapsed_height === 0 ? 0 : (Number(cfg.card_collapsed_height) || 56);
+          return ch ? `.cpc-card.cpc-card-collapsed { min-height:${ch}px; padding-top:4px; padding-bottom:4px; display:flex; flex-direction:column; justify-content:center; }` : ''; })()}
         .cpc-header { display:flex; align-items:center; gap:8px; margin-bottom:calc(14px * ${scale}); color:${titleColor}; font-size:calc(${titleFontSize}px * ${scale}); font-weight:${titleFontWeight}; }
         .cpc-header ha-icon { --mdc-icon-size:calc(${iconSize}px * ${scale}); }
         .cpc-header ha-icon.cpc-title-icon { color:${this._headerIconColorCss(state)}; }
@@ -4551,7 +4556,7 @@ class ColorLightManagerCard extends HTMLElement {
         .cpc-cv-save-fav:hover { color:var(--primary-text-color); border-color:var(--primary-color); }
         .cpc-cv-save-fav ha-icon { --mdc-icon-size:14px; }
       </style>
-      <div class="cpc-card">
+      <div class="cpc-card${collapsible && this._cardCollapsed ? ' cpc-card-collapsed' : ''}">
         ${headerHtml}
         <div class="cpc-body${collapsible && this._cardCollapsed ? ' collapsed' : ''}" id="cpc-body">
         ${this._renderSectionsBody(state)}
@@ -4984,6 +4989,8 @@ class ColorLightManagerCard extends HTMLElement {
           if (body) body.classList.toggle('collapsed', this._cardCollapsed);
           header.classList.toggle('collapsed-state', this._cardCollapsed);
           if (chevron) chevron.classList.toggle('expanded', !this._cardCollapsed);
+          const cardEl = this.querySelector('.cpc-card');
+          if (cardEl) cardEl.classList.toggle('cpc-card-collapsed', this._cardCollapsed);
         };
       }
     }
@@ -12143,6 +12150,8 @@ class ColorLightManagerCardEditor extends HTMLElement {
           <div class="cpce-check"><input type="checkbox" id="cpce-card-collapsible" ${cfg.card_collapsible?'checked':''}><label for="cpce-card-collapsible">Make card collapsible (click title to expand/collapse)</label></div>
           ${cfg.card_collapsible ? `
             <div class="cpce-check"><input type="checkbox" id="cpce-card-start-expanded" ${cfg.card_start_expanded===true?'checked':''}><label for="cpce-card-start-expanded">Default state: expanded</label></div>
+            <div class="cpce-row"><label class="lbl">Collapsed Height (px)</label><input type="number" class="cpce-area-num" data-key="card_collapsed_height" min="0" max="200" value="${cfg.card_collapsed_height === 0 ? 0 : (Number(cfg.card_collapsed_height) || 56)}"></div>
+            <div class="cpce-hint">Height of the collapsed card. 56 matches Home Assistant's standard cards (tile, button); it only grows if the title or icon is taller. 0 keeps the full padding.</div>
             <div class="cpce-check"><input type="checkbox" id="cpce-card-show-chevron" ${cfg.card_show_chevron!==false?'checked':''}><label for="cpce-card-show-chevron">Show chevron in title</label></div>
             ${!cfg.title ? `<div class="cpce-hint" style="color:var(--warning-color,#ff9800);">A Card Title (below) is recommended for the collapsible header.</div>` : `<div class="cpce-hint">The card starts ${cfg.card_start_expanded===true ? 'expanded' : 'collapsed'}; clicking the title ${cfg.card_start_expanded===true ? 'collapses' : 'expands'} it.</div>`}
           ` : ''}
@@ -13504,7 +13513,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     this.querySelectorAll('.cpce-area-opt').forEach(el => el.addEventListener('change', () => areaSet(el.dataset.key, el.checked || undefined)));
     this.querySelectorAll('.cpce-area-txt').forEach(el => el.addEventListener('change', () => areaSet(el.dataset.key, el.value.trim() ? (/icon/.test(el.dataset.key) ? normalizeIcon(el.value.trim()) : el.value.trim()) : undefined)));
     this.querySelectorAll('.cpce-area-num').forEach(el => el.addEventListener('change', () => {
-      const n = Number(el.value); const def = el.dataset.key === 'area_gap' ? 8 : (el.dataset.key === 'area_min_width' ? 150 : 0);
+      const n = Number(el.value); const def = el.dataset.key === 'area_gap' ? 8 : (el.dataset.key === 'area_min_width' ? 150 : (el.dataset.key === 'card_collapsed_height' ? 56 : 0));
       areaSet(el.dataset.key, Number.isFinite(n) && n !== def ? n : undefined);
     }));
     const hdrAllOffPos = this.querySelector('.cpce-hdr-alloff-pos');
