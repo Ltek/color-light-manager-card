@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.11.25.291
+// Version: v2026.11.27.292
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.11.25.291';
+const BUILD_NUMBER = 'v2026.11.27.292';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -1826,6 +1826,18 @@ function normalizeFramePresets(list) {
 // library id so section/card frame refs can point at it like any other.
 // The Frame Library is otherwise System-only (shared HA store) — there is no
 // "Local" (card-only) frame concept.
+// Theme card layer (same as Easy Entity Styler): listed in a frame like any style, it draws the HA
+// theme's own card look from the theme's variables, live. Later styles change only what they set, and
+// their glow / shadow is added to the theme's shadow.
+const THEME_FRAME_ID = 'theme:card';
+const THEME_BORDER_COLOR = 'var(--ha-card-border-color, var(--divider-color, #e0e0e0))';
+function themeFramePreset() { return { id: THEME_FRAME_ID, name: 'Theme card (your HA theme)', _theme: true }; }
+// The Frame Styles a frame ref actually applies (listed and not switched off).
+function enabledFrameIds(fr) {
+  if (!fr || !Array.isArray(fr.presets)) return [];
+  const off = new Set(fr.disabled || []);
+  return fr.presets.filter(id => id && !off.has(id));
+}
 const BUILTIN_FRAME_SLUG = '__builtin__';
 const BUILTIN_FRAME_ID = 'lib:' + BUILTIN_FRAME_SLUG;
 // A clean, neutral starting frame: a thin border that follows the icon color,
@@ -3750,7 +3762,21 @@ class ColorLightManagerCard extends HTMLElement {
     const lib = frameLibraryMap((this._config && this._config.frame_library_scope) || 'system');
     Object.keys(lib).forEach(slug => { map['lib:' + slug] = lib[slug]; });
     if (!map[BUILTIN_FRAME_ID]) map[BUILTIN_FRAME_ID] = builtinFramePreset();
+    map[THEME_FRAME_ID] = themeFramePreset();
     return map;
+  }
+  // The theme's card shadow, read where the card sits (a value, not var(): it is joined with other
+  // shadows, and a theme's "none" would void the whole list). Re-read on every state update.
+  _themeShadowValue(el) {
+    try {
+      const v = getComputedStyle(el || this).getPropertyValue('--ha-card-box-shadow').trim();
+      return (!v || v === 'none') ? '' : v;
+    } catch (e) { return ''; }
+  }
+  // No Frame Style on the card (or all switched off) = the theme's card look, unless turned off.
+  _usesThemeCardStyle() {
+    const c = this._config || {};
+    return c.card_theme_style !== false && enabledFrameIds(c.card_frame).length === 0;
   }
   _usesLibraryRef() {
     const refUsesLib = fr => fr && Array.isArray(fr.presets) &&
@@ -3830,6 +3856,12 @@ class ColorLightManagerCard extends HTMLElement {
     layerIds.forEach(id => {
       const fx = byId[id];
       if (!fx) return;
+      if (fx._theme) {   // the theme's card look as the base layer
+        acc.background = { mode: 'theme' };
+        acc.border = { _theme: true, color: THEME_BORDER_COLOR, sides: ['top', 'bottom', 'left', 'right'] };
+        acc._themeShadow = true; any = true;
+        return;
+      }
       // Skip conditional presets that aren't active — UNLESS this application
       // opted to ignore the condition (then the layer always applies). The
       // per-location override (if any) rebinds the condition here.
@@ -3862,16 +3894,16 @@ class ColorLightManagerCard extends HTMLElement {
     if (sides.right) parts.push(`${offset}px 0 ${blur}px ${spread}px ${color}`);
     return parts.length ? parts.join(', ') : 'none';
   }
-  _resolveFrame(frameRef, section) {
+  _resolveFrame(frameRef, section, el) {
     const acc = this._flattenFrameToBundle(frameRef || {});
     if (!acc) return null;
-    return this._frameBundleToFx(acc, section);
+    return this._frameBundleToFx(acc, section, el);
   }
   // Turn a flattened frame bundle (glow/shadow/border/background/edges) into the resolved fx object
   // (boxShadow / borderVars / background / edge) the appliers use. Split out of _resolveFrame so the
   // Frame Styles library preview can render a single preset's look without going through the
   // id-keyed layer resolver.
-  _frameBundleToFx(acc, section) {
+  _frameBundleToFx(acc, section, el) {
     if (!acc) return null;
     const out = { boxShadow: 'none', borderVars: null, edge: null, background: null };
     const iconCol = this._frameIconColor(section);
@@ -3888,8 +3920,13 @@ class ColorLightManagerCard extends HTMLElement {
       const scolor = acc.shadow.follow_icon ? iconCol : acc.shadow.color;
       parts.push(this._buildDropShadow(scolor, acc.shadow.x, acc.shadow.y, acc.shadow.blur, acc.shadow.spread, acc.shadow.opacity));
     }
+    // The Theme card layer's shadow stays under the glow / shadow added by later styles
+    if (acc._themeShadow) { const ts = this._themeShadowValue(el); if (ts) parts.push(ts); out.themeLayer = true; }
     out.boxShadow = parts.filter(s => s && s !== 'none').join(', ') || 'none';
-    if (acc.border) {
+    if (acc.border && acc.border._theme) {
+      const line = `var(--ha-card-border-width, 1px) solid ${THEME_BORDER_COLOR}`;
+      out.borderVars = { top: line, bottom: line, left: line, right: line, radius: 'var(--ha-card-border-radius, 12px)' };
+    } else if (acc.border) {
       const bc = acc.border.follow_icon ? iconCol : acc.border.color;
       const bw = acc.border.width, br = acc.border.radius;
       const on = side => acc.border.sides.includes(side);
@@ -3925,7 +3962,10 @@ class ColorLightManagerCard extends HTMLElement {
     // custom (hex), theme (var(--…) stored in card_bg_color), css (free text) all render the stored
     // color directly. Legacy 'theme' with no stored color → the HA card-background var.
     if (mode === 'custom' || mode === 'css') return cfg.card_bg_color || '#1c1c1c';
-    if (mode === 'theme') return cfg.card_bg_color || 'var(--ha-card-background, var(--card-background-color, #1c1c1c))';
+    // Theme mode stores a chosen theme colour as var(--…). The stub's '#1c1c1c' (meant for Custom) was
+    // being used here too, so "Theme default" painted a flat dark grey instead of the theme's background.
+    if (mode === 'theme') return (/^var\(/.test(String(cfg.card_bg_color || '').trim()) ? cfg.card_bg_color : '')
+      || 'var(--ha-card-background, var(--card-background-color, #1c1c1c))';
     return 'var(--ha-card-background, var(--card-background-color, #1c1c1c))';
   }
 
@@ -4655,9 +4695,25 @@ class ColorLightManagerCard extends HTMLElement {
   _applyCardFrame() {
     const el = this.querySelector('.cpc-card');
     if (!el) return;
+    const reset = () => {
+      el.style.boxShadow = ''; el.style.borderTop = el.style.borderBottom = el.style.borderLeft = el.style.borderRight = '';
+      el.style.borderRadius = ''; el.style.backgroundColor = ''; el.style.backgroundImage = '';
+      el.style.backgroundSize = el.style.backgroundPosition = el.style.backgroundRepeat = ''; el.style.backdropFilter = '';
+    };
+    // No Frame Style (or every one switched off): the theme's own card look, as HA's cards draw it
+    if (this._usesThemeCardStyle()) {
+      reset();
+      const line = `var(--ha-card-border-width, 1px) solid ${THEME_BORDER_COLOR}`;
+      el.style.borderTop = el.style.borderBottom = el.style.borderLeft = el.style.borderRight = line;
+      el.style.borderRadius = 'var(--ha-card-border-radius, 12px)';
+      el.style.boxShadow = 'var(--ha-card-box-shadow, none)';
+      el.style.backdropFilter = 'var(--ha-card-backdrop-filter, none)';
+      return;
+    }
     const fx = (this._config && this._config.card_frame)
-      ? this._resolveFrame(this._config.card_frame, null) : null;
-    if (!fx) return;   // no frame → leave the card's native styling as-is
+      ? this._resolveFrame(this._config.card_frame, null, el) : null;
+    reset();
+    if (!fx) return;   // only switched-on styles that draw nothing, or card_theme_style: false
     el.style.boxShadow = fx.boxShadow;
     const bv = fx.borderVars;
     if (bv) {
@@ -4674,6 +4730,7 @@ class ColorLightManagerCard extends HTMLElement {
       el.style.backgroundPosition = fx.edge.position;
       el.style.backgroundRepeat = fx.edge.repeat;
     }
+    if (fx.themeLayer) el.style.backdropFilter = 'var(--ha-card-backdrop-filter, none)';
   }
 
   // Apply each section's resolved Frame Style stack (section.frame) to its
@@ -4687,7 +4744,7 @@ class ColorLightManagerCard extends HTMLElement {
       if (!section || !section.id) return;
       const el = this.querySelector(`.cpc-section[data-section-id="${section.id}"]`);
       if (!el) return;
-      const fx = section.frame ? this._resolveFrame(section.frame, section) : null;
+      const fx = section.frame ? this._resolveFrame(section.frame, section, el) : null;
       if (fx) {
         el.style.overflow = 'visible';
         el.style.boxSizing = 'border-box';
@@ -4708,8 +4765,10 @@ class ColorLightManagerCard extends HTMLElement {
         } else {
           el.style.backgroundImage = '';
         }
+        el.style.backdropFilter = fx.themeLayer ? 'var(--ha-card-backdrop-filter, none)' : '';
       } else {
         // No frame → clear any inline overrides a prior apply may have set.
+        el.style.backdropFilter = '';
         el.style.padding = '';
         el.style.boxShadow = '';
         el.style.borderTop = el.style.borderBottom = el.style.borderLeft = el.style.borderRight = '';
@@ -8513,7 +8572,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const ignore = new Set((s.frame && Array.isArray(s.frame.ignore_conditions)) ? s.frame.ignore_conditions : []);
     const disabled = new Set((s.frame && Array.isArray(s.frame.disabled)) ? s.frame.disabled : []);
     const overrides = (s.frame && s.frame.overrides && typeof s.frame.overrides === 'object') ? s.frame.overrides : {};
-    const rows = [{ id: BUILTIN_FRAME_ID, e: builtinFramePreset() }]
+    const rows = [{ id: BUILTIN_FRAME_ID, e: builtinFramePreset() }, { id: THEME_FRAME_ID, e: themeFramePreset() }]
       .concat(slugs.map(sl => ({ id: 'lib:' + sl, e: lib[sl] })));
     const optionEls = rows.map(({ id, e }) => `<option value="${escapeHtml(id)}">${escapeHtml(e.name || id)}</option>`).join('');
     // An entity-conditional preset (not a section-membership kind) can be rebound here.
@@ -8521,7 +8580,7 @@ class ColorLightManagerCardEditor extends HTMLElement {
     return `<div class="cpce-sub-title">Section Frame</div>
       <div class="cpce-hint">Apply reusable <strong>Frame Styles</strong> to just this section. Layered in order — last active wins per property. Add a base style plus <strong>conditional</strong> overlays to change the look when their condition matches. Build or edit styles in the <strong>Frame Styles</strong> library (under Libraries).</div>
       <div class="cpce-manage-list">${applied.map((id, i) => {
-        const e = id === BUILTIN_FRAME_ID ? builtinFramePreset() : (lib[id.slice(4)] || null);
+        const e = id === BUILTIN_FRAME_ID ? builtinFramePreset() : id === THEME_FRAME_ID ? themeFramePreset() : (lib[id.slice(4)] || null);
         const nm = e ? (e.name || id) : `${id} (missing)`;
         const cond = this._frameCondText(e);
         const off = disabled.has(id);
@@ -8555,14 +8614,16 @@ class ColorLightManagerCardEditor extends HTMLElement {
     const ignore = new Set(Array.isArray(cardRef.ignore_conditions) ? cardRef.ignore_conditions : []);
     const disabled = new Set(Array.isArray(cardRef.disabled) ? cardRef.disabled : []);
     const overrides = (cardRef.overrides && typeof cardRef.overrides === 'object') ? cardRef.overrides : {};
-    const rows = [{ id: BUILTIN_FRAME_ID, e: builtinFramePreset() }]
+    const rows = [{ id: BUILTIN_FRAME_ID, e: builtinFramePreset() }, { id: THEME_FRAME_ID, e: themeFramePreset() }]
       .concat(slugs.map(s => ({ id: 'lib:' + s, e: lib[s] })));
     const optionEls = rows.map(({ id, e }) => `<option value="${escapeHtml(id)}">${escapeHtml(e.name || id)}</option>`).join('');
     const hasEntCond = e => !!(e && e.when && !e.when_kind);
     return `
-      <div class="cpce-hint">Apply reusable <strong>Frame Styles</strong> to the whole card (border / glow / shadow / background / gradient border). Layered in order — last wins per property. Build or edit styles in the <strong>Frame Styles</strong> library (under Libraries).</div>
+      <div class="cpce-hint">Apply reusable <strong>Frame Styles</strong> to the whole card (border / glow / shadow / background / gradient border). Layered in order — last wins per property. Build or edit styles in the <strong>Frame Styles</strong> library (under Libraries). Put <strong>Theme card (your HA theme)</strong> first to start from your theme's card look; the styles after it change only what they set, and their glow / shadow is added to the theme's.</div>
+      ${enabledFrameIds(cardRef).length ? '' : `<div class="cpce-check"><input type="checkbox" id="cpce-card-theme-style" ${this._config && this._config.card_theme_style === false ? '' : 'checked'}><label for="cpce-card-theme-style">No Frame Style: use the theme's card style</label></div>
+      <div class="cpce-hint">Until you add a Frame Style, the card uses your theme's card border, corners, shadow and background, like HA's own cards. Untick for no frame at all.</div>`}
       <div class="cpce-manage-list">${applied.map((id, i) => {
-        const e = id === BUILTIN_FRAME_ID ? builtinFramePreset() : (lib[id.slice(4)] || null);
+        const e = id === BUILTIN_FRAME_ID ? builtinFramePreset() : id === THEME_FRAME_ID ? themeFramePreset() : (lib[id.slice(4)] || null);
         const nm = e ? (e.name || id) : `${id} (missing)`;
         const cond = this._frameCondText(e);
         const off = disabled.has(id);
@@ -13697,6 +13758,12 @@ class ColorLightManagerCardEditor extends HTMLElement {
       this._updateConfig({ card_frame: cf });
       this._render();
     };
+    const themeStyleEl = this.querySelector('#cpce-card-theme-style');
+    if (themeStyleEl) themeStyleEl.addEventListener('change', () => {
+      const next = { ...this._config };
+      if (themeStyleEl.checked) delete next.card_theme_style; else next.card_theme_style = false;
+      this._config = next; this._fire(next);
+    });
     const cfAdd = this.querySelector('#cpce-cf-add');
     if (cfAdd) cfAdd.onclick = () => {
       const pick = this.querySelector('#cpce-cf-add-pick'); const id = pick && pick.value; if (!id) return;

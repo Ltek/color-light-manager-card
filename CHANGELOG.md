@@ -8,6 +8,20 @@ resets. Newest first.
 
 ---
 
+## v2026.11.27.292
+
+- **Uses your theme's card look by default.** With no Frame Style on the card, or every one switched
+  off, the card now takes your theme's border, corners, shadow and glass blur
+  (`ha-card-border-*`, `ha-card-box-shadow`, `ha-card-backdrop-filter`), like HA's own cards. Before,
+  it had only a background. To keep the old look, untick *No Frame Style: use the theme's card style*
+  under Card Appearance → Card Frame (`card_theme_style: false`).
+- **Theme card layer.** A built-in Frame Style, **Theme card (your HA theme)** (`theme:card`). Put it
+  first in the Card Frame (or a section frame) to start from your theme's look. The styles after it
+  change only what they set, and their glow and shadow are added to the theme's shadow, so you can add
+  effects for specific states. The same as in Easy Entity Styler.
+- **Fixed:** the *Theme default* background painted a flat dark grey (`#1c1c1c`) instead of your
+  theme's card background.
+
 ## v2026.11.25.291
 
 - **Area grid and On Now: equal-size buttons that fill the width.** In a wide view (e.g. a single

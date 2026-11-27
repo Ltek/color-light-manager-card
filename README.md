@@ -117,6 +117,7 @@ Every option below is fully point-and-click in the visual editor.
 - Card title, icon, collapsible header (starts collapsed, or tick **Default state: expanded**), background, per-side border, glow, and drop shadow.
 - **Glow & header icon color** can follow the light's live color, the last-pressed button's color, or a fixed color.
 - **Header Rules** and **Frame Styles** — state-driven header styling and reusable border/glow/shadow bundles; see **Libraries** below.
+- **Your theme's card look** — with no Frame Style, the card uses your theme's card background, border, corners and shadow, like HA's own cards. Put the built-in **Theme card** style first in the Card Frame to keep that look and add glows or shadows on top for specific states.
 - Compact chips on each button's editor row: link-icon chips for the bound **Color Entity** / **Fixture Profile** / **scene count**, **Unassigned** for a button not shown on the card, and per-light color-mode chips.
 
 ---
