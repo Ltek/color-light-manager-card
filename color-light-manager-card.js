@@ -5,14 +5,14 @@
 // live-linked Color entities, and a full GUI editor. Backed by the Color helper (the `color`
 // domain; legacy `input_color.*` entities are still supported for existing configs).
 //
-// Version: v2026.11.27.293
+// Version: v2026.11.27.294
 //
 // Author:  LTek
 // Card:    https://github.com/Ltek/color-light-manager-card
 //
 // ============================================================================
 
-const BUILD_NUMBER = 'v2026.11.27.293';
+const BUILD_NUMBER = 'v2026.11.27.294';
 const CARD_NAME = 'Color Light & Scene Manager';
 const LOG_PREFIX = '[ColorLightManagerCard]';
 let DEBUG = false;
@@ -3092,16 +3092,22 @@ class ColorLightManagerCard extends HTMLElement {
   // context — a collapsed preview/edit view hides everything the user is changing, and each
   // keystroke re-render would otherwise re-collapse it. Mirrors the Easy Entity Styler card.
   set editMode(v) {
+    const was = this._editMode;
     this._edit = !!v;
     this._editMode = this._edit || this._prev;
     if (this._editMode) this._cardCollapsed = false;
+    // Leaving edit / preview: go back to the configured default (collapsed unless Default state:
+    // expanded). Without this the card stayed expanded after editing, until a manual collapse.
+    if (was && !this._editMode) this._collapseInitialized = false;
     if (this._rendered) this._scheduleRender();
   }
   get editMode() { return this._edit === true; }
   set preview(v) {
+    const was = this._editMode;
     this._prev = !!v;
     this._editMode = this._edit || this._prev;
     if (this._editMode) this._cardCollapsed = false;
+    if (was && !this._editMode) this._collapseInitialized = false;
     if (this._rendered) this._scheduleRender();
   }
   get preview() { return this._prev === true; }

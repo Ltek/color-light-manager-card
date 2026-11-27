@@ -8,6 +8,15 @@ resets. Newest first.
 
 ---
 
+## v2026.11.27.294
+
+- **Fixed: a collapsible card stayed expanded after editing the dashboard.** While the dashboard is
+  in edit mode (or the card is open in its editor) the card is shown expanded on purpose, so you can
+  see what you're changing. But after you pressed *Done* it stayed expanded instead of going back
+  to collapsed. It now returns to its default (collapsed, unless *Default state: expanded* is
+  ticked) as soon as edit mode or the preview ends. Expanding or collapsing it yourself still sticks
+  until the page reloads.
+
 ## v2026.11.27.293
 
 - **Fixed: a collapsed card was taller than Home Assistant's own cards.** It kept the full 16px
